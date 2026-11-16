@@ -213,7 +213,10 @@ async function verify(job, cwd, signal) {
   if (!job.runChecks) return [];
   setStage(job, 'checks', { status: 'running', startedAt: Date.now(), endedAt: null, round: job.round || 0 });
   const results = await runChecks(job, cwd, signal);
-  setStage(job, 'checks', { status: results.every(result => result.code === 0) ? 'done' : 'warning', endedAt: Date.now() });
+  // code null means nothing could be run (no package.json and no project commands), which is "not tested", not a failure.
+  const nothingRan = results.every(result => result.code === null);
+  setStage(job, 'checks', { status: nothingRan ? 'skipped' : results.every(result => result.code === 0 || result.code === null) ? 'done' : 'warning',
+    note: nothingRan ? 'ไม่มีคำสั่งทดสอบ ตั้งได้ในหน้าโปรเจกต์' : '', endedAt: Date.now() });
   return results;
 }
 

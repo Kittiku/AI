@@ -115,6 +115,7 @@ function stagesOf(job) {
   return keys.map(key => {
     const stage = job.stages?.[key] || {};
     let status = stage.status || 'pending';
+    if (status === 'skipped' && stage.note) return { key, ...stage, status, skippedText: 'ไม่ได้ทดสอบ' };
     if (status === 'pending' && stuckStatuses.has(job.status)) status = 'skipped';
     return { key, ...stage, status };
   });
@@ -128,7 +129,7 @@ function Stepper({ job, compact }) {
       <span className="stage-dot" aria-hidden="true">{stage.status === 'done' ? <Check size={14} /> : stage.status === 'failed' ? <X size={14} /> : null}</span>
       <div>
         <strong>{stageNames[stage.key]}</strong>
-        <small>{stage.status === 'skipped' ? 'ไม่ได้ทำ' : stageStatus[stage.status] || stage.status}
+        <small>{stage.status === 'skipped' ? stage.skippedText || 'ไม่ได้ทำ' : stageStatus[stage.status] || stage.status}
           {stage.status === 'waiting' && stage.waitUntil ? ' ถึง ' + time(stage.waitUntil) : ''}
           {stage.provider && stage.status !== 'waiting' ? ' · ' + providerName(stage.provider) : ''}
           {stage.startedAt && stage.status !== 'pending' ? ' · ' + duration((stage.endedAt || now) - stage.startedAt) : ''}
