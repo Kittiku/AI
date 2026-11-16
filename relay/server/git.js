@@ -27,7 +27,9 @@ function validFile(name) {
       !/^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)/i.test(part));
 }
 
-export async function snapshot(cwd) {
+// Files named in `include` (the ones a role must edit) are sent in full up to a larger limit;
+// the rest of the repo fills a smaller budget. `omittedPaths` lists source files left out.
+export async function snapshot(cwd, include = []) {
   const entries = (await git(cwd, 'ls-files', '--stage', '-z')).split('\0').filter(Boolean);
   const files = [];
   const list = entries.flatMap(entry => {
@@ -35,20 +37,53 @@ export async function snapshot(cwd) {
     const name = entry.slice(tab + 1);
     return /^100[67]/.test(entry) && validFile(name) ? [name] : [];
   });
-  const priority = name => /(^|\/)(README\.md|package\.json|AGENTS\.md)$/i.test(name) ? 0 : 1;
+  const wanted = new Set(include.map(name => String(name).replaceAll('\\', '/').replace(/^\.\//, '').toLowerCase()));
+  const priority = name => wanted.has(name.toLowerCase()) ? 0 : /(^|\/)(README\.md|package\.json|AGENTS\.md)$/i.test(name) ? 1 : 2;
   list.sort((a, b) => priority(a) - priority(b));
+  let includeBudget = 1_200_000;
   let budget = 125_000;
+  const omittedPaths = [];
   for (const name of list.slice(0, 400)) {
     if (!sourceFile.test(name) || /(^|\/)(package-lock\.json|pnpm-lock\.yaml)$/i.test(name)) continue;
     const file = await checkedPath(cwd, name);
     const info = await lstat(file).catch(error => error.code === 'ENOENT' ? null : Promise.reject(error));
-    if (!info?.isFile() || info.size > 24_000 || info.size > budget) continue;
+    if (!info?.isFile()) continue;
+    const named = priority(name) === 0;
+    const fits = named ? info.size <= 400_000 && info.size <= includeBudget : info.size <= 24_000 && info.size <= budget;
+    if (!fits) { omittedPaths.push(name); continue; }
     const content = await readFile(file, 'utf8');
     if (content.includes('\0')) continue;
     files.push({ path: name, content });
-    budget -= info.size;
+    if (named) includeBudget -= info.size; else budget -= info.size;
   }
-  return JSON.stringify({ trackedPaths: list.slice(0, 400), files, omitted: list.length - files.length });
+  return JSON.stringify({ trackedPaths: list.slice(0, 400), files, omitted: list.length - files.length, omittedPaths: omittedPaths.slice(0, 100) });
+}
+
+// Find/replace edits let an AI change part of a large file without resending all of it.
+// Each `find` must appear exactly once; with dryRun the files are only checked.
+export async function applyEdits(cwd, edits, { dryRun = false } = {}) {
+  if (!Array.isArray(edits) || edits.length > 60) throw Error('รายการแก้ไขไม่ถูกต้อง');
+  const pending = new Map();
+  for (const edit of edits) {
+    if (typeof edit?.find !== 'string' || !edit.find || typeof edit.replace !== 'string') throw Error('รายการแก้ไขต้องมีข้อความที่จะหาและข้อความแทน');
+    const target = await checkedPath(cwd, edit.path);
+    const key = target.toLowerCase();
+    if (!pending.has(key)) {
+      const content = await readFile(target, 'utf8').catch(() => { throw Error('ไม่พบไฟล์ที่จะแก้: ' + edit.path); });
+      pending.set(key, { target, path: edit.path, content });
+    }
+    const entry = pending.get(key);
+    const crlf = entry.content.includes('\r\n');
+    const find = crlf && !edit.find.includes('\r') ? edit.find.replace(/\n/g, '\r\n') : edit.find;
+    const replace = crlf && !edit.replace.includes('\r') ? edit.replace.replace(/\n/g, '\r\n') : edit.replace;
+    const first = entry.content.indexOf(find);
+    if (first < 0) throw Error('หาข้อความที่จะแก้ไม่เจอใน ' + edit.path + ': ' + edit.find.slice(0, 80));
+    if (entry.content.indexOf(find, first + 1) >= 0) throw Error('ข้อความที่จะแก้ซ้ำหลายจุดใน ' + edit.path + ': ' + edit.find.slice(0, 80));
+    entry.content = entry.content.slice(0, first) + replace + entry.content.slice(first + find.length);
+  }
+  if (dryRun) return;
+  for (const { target, content } of pending.values()) await writeFile(target, content, 'utf8');
+  if (pending.size) await git(cwd, '--literal-pathspecs', 'add', '--', ...[...pending.values()].map(entry => entry.path));
 }
 
 async function checkedPath(root, name) {

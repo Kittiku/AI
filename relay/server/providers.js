@@ -43,10 +43,13 @@ const claudeCodeTools = 'Read,Glob,Grep';
 
 const makeObject = fields => ({ type: 'object', properties: fields, required: Object.keys(fields), additionalProperties: false });
 const string = { type: 'string' };
-export const planSchema = makeObject({ backend: string, frontend: string, contract: string, acceptance: string });
+const paths = { type: 'array', items: string };
+export const planSchema = makeObject({ backend: string, frontend: string, contract: string, acceptance: string, backendFiles: paths, frontendFiles: paths });
 export const editSchema = makeObject({
   summary: string,
-  files: { type: 'array', items: makeObject({ path: string, content: string }) }
+  status: { type: 'string', enum: ['done', 'no_work', 'blocked'] },
+  files: { type: 'array', items: makeObject({ path: string, content: string }) },
+  edits: { type: 'array', items: makeObject({ path: string, find: string, replace: string }) }
 });
 export const reviewSchema = makeObject({
   summary: string,
@@ -427,7 +430,8 @@ export function quota(settings, usage, now = Date.now()) {
 export async function generate(provider, cwd, prompt, schema, jobSignal, onUsage) {
   if (provider === 'gemini' && !geminiCli.updatedAt) await refreshGemini(cwd);
   const useCli = provider === 'gemini' && shouldUseCli();
-  const timeoutMs = (provider === 'claudecode' || useCli) ? 900_000 : 240_000;
+  // Agents that read the repo themselves (Claude Code, Codex, Gemini CLI) get 15 minutes; one-shot API calls get 4.
+  const timeoutMs = (provider === 'claudecode' || provider === 'codex' || useCli) ? 900_000 : 240_000;
   const signal = AbortSignal.any([jobSignal, AbortSignal.timeout(timeoutMs)]);
   let output;
   if (provider === 'claudecode') {

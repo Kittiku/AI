@@ -131,7 +131,8 @@ function Stepper({ job, compact }) {
         <small>{stage.status === 'skipped' ? 'ไม่ได้ทำ' : stageStatus[stage.status] || stage.status}
           {stage.provider ? ' · ' + providerName(stage.provider) : ''}
           {stage.startedAt && stage.status !== 'pending' ? ' · ' + duration((stage.endedAt || now) - stage.startedAt) : ''}
-          {stage.round ? ' · แก้รอบ ' + stage.round : ''}</small>
+          {stage.round ? ' · แก้รอบ ' + stage.round : ''}
+          {stage.note ? ' · ' + stage.note : ''}</small>
       </div>
     </li>)}
   </ol>;
