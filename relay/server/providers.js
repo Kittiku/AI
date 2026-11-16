@@ -4,7 +4,12 @@ import path from 'node:path';
 import { createInterface } from 'node:readline';
 
 export const names = { claudecode: 'Claude Code', gemini: 'Gemini', codex: 'Codex' };
+const desktopCodexBin = process.platform === 'win32' && process.env.PATH?.split(path.delimiter)
+  .filter(folder => /[\\/]WindowsApps[\\/]OpenAI\.Codex_[^\\/]+[\\/]app[\\/]resources[\\/]?$/i.test(folder))
+  .map(folder => path.join(folder, 'codex.exe'))
+  .find(file => existsSync(file));
 const codexBinary = process.env.RELAY_CODEX_BIN || [
+  desktopCodexBin,
   process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'OpenAI', 'Codex', 'bin', 'codex.exe')
 ].find(file => file && existsSync(file)) || 'codex';
 const claudeCodeBinary = process.env.RELAY_CLAUDE_CODE_BIN || [
@@ -126,24 +131,47 @@ async function withCodex(cwd, signal, task) {
   } finally { rpc.close(); }
 }
 
+let lastCodexModel;
 async function codexTurn(cwd, prompt, schema, signal) {
   return withCodex(cwd, signal, async rpc => {
-    const thread = (await rpc.request('thread/start', { cwd, sandbox: 'read-only', approvalPolicy: 'never', ephemeral: true })).thread;
-    let output = '';
-    const completion = new Promise((resolve, reject) => {
-      rpc.events(({ method, params }) => {
-        if (params?.threadId !== thread.id) return;
-        if (method === 'item/completed' && params.item?.type === 'agentMessage') output = params.item.text;
-        if (method === 'turn/completed') {
-          if (params.turn.status === 'completed') resolve(output);
-          else reject(Error(params.turn.error?.message || 'Codex turn: ' + params.turn.status));
-        }
-      }, reject);
-    });
-    completion.catch(() => {});
-    await rpc.request('turn/start', { threadId: thread.id, input: [{ type: 'text', text: prompt }], outputSchema: schema });
-    return completion;
+    const { data: models } = await rpc.request('model/list', { includeHidden: false, limit: 50 });
+    const modelIds = models.map(model => model.model ?? model.id);
+    const recommended = models.find(model => model.isDefault);
+    const candidates = new Set([
+      modelIds.includes(lastCodexModel) && lastCodexModel, recommended?.model ?? recommended?.id, ...modelIds
+    ].filter(Boolean));
+    for (const model of candidates) {
+      signal.throwIfAborted();
+      try {
+        const output = await runCodexModel(rpc, cwd, model, prompt, schema);
+        lastCodexModel = model;
+        return output;
+      } catch (error) {
+        if (!/model_not_found|model.+not supported when using Codex with a ChatGPT account/i.test(error.message)) throw error;
+      }
+    }
+    throw Error('Codex ไม่พบโมเดลที่บัญชีนี้อนุญาตให้ใช้ ตรวจว่า Codex CLI เป็นเวอร์ชันล่าสุดแล้วลองอีกครั้ง');
   });
+}
+
+async function runCodexModel(rpc, cwd, model, prompt, schema) {
+  const { thread } = await rpc.request('thread/start', {
+    cwd, model, sandbox: 'read-only', approvalPolicy: 'never', ephemeral: true
+  });
+  let output = '';
+  const completion = new Promise((resolve, reject) => {
+    rpc.events(({ method, params }) => {
+      if (params?.threadId !== thread.id) return;
+      if (method === 'item/completed' && params.item?.type === 'agentMessage') output = params.item.text;
+      if (method === 'turn/completed') {
+        if (params.turn.status === 'completed') resolve(output);
+        else reject(Error(params.turn.error?.message || 'Codex turn: ' + params.turn.status));
+      }
+    }, reject);
+  });
+  completion.catch(() => {});
+  await rpc.request('turn/start', { threadId: thread.id, input: [{ type: 'text', text: prompt }], outputSchema: schema });
+  return completion;
 }
 
 function runClaudeCode(args, { cwd, input = '', signal }) {
@@ -178,7 +206,7 @@ async function claudeCodeTurn(cwd, prompt, schema, signal) {
   throw error;
 }
 
-function runCliBinary(binary, args, { cwd, env, input = '', signal, notFoundMessage }) {
+function runCliBinary(binary, args, { cwd, env, input = '', signal, notFoundMessage, stopOnResult = false }) {
   return new Promise((resolve, reject) => {
     const child = spawn(binary, args, { cwd, env, signal, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
     let stdout = '';
@@ -188,6 +216,17 @@ function runCliBinary(binary, args, { cwd, env, input = '', signal, notFoundMess
     child.on('error', error => reject(error.code === 'ENOENT' ? Error(notFoundMessage) : error));
     child.stdin.on('error', () => {});
     child.on('close', code => resolve({ code, stdout, stderr }));
+    if (stopOnResult) {
+      const lines = createInterface({ input: child.stdout });
+      lines.on('line', line => {
+        let event;
+        try { event = JSON.parse(line); } catch { return; }
+        if (event.event !== 'result') return;
+        resolve({ code: 0, stdout: line, stderr });
+        lines.close();
+        child.kill();
+      });
+    }
     child.stdin.end(input);
   });
 }
@@ -226,6 +265,17 @@ function parseCliJsonOutput(stdout) {
   return outer;
 }
 
+function parseAgyOutput(stdout) {
+  for (const line of stdout.trimEnd().split('\n').reverse()) {
+    let event;
+    try { event = JSON.parse(line); } catch { continue; }
+    if (event.event !== 'result') continue;
+    if (event.result?.status !== 'SUCCESS') throw Error(event.result?.error || 'Antigravity CLI ไม่ได้ทำงานจนเสร็จ');
+    return parseCliJsonOutput(JSON.stringify(event.result));
+  }
+  throw Error('Antigravity CLI ไม่ส่งผลลัพธ์กลับ');
+}
+
 let geminiCli = { ready: false, backend: null, updatedAt: null, note: 'กำลังตรวจการเชื่อมต่อ Gemini / Antigravity CLI' };
 let geminiCliInFlight;
 
@@ -234,25 +284,30 @@ async function geminiCliTurn(cwd, prompt, schema, signal, onUsage) {
   const binary = backend === 'agy' ? agyBinary : geminiBinary;
   const label = backend === 'agy' ? 'Antigravity CLI (agy)' : 'Gemini CLI';
   const instruction = [
-    'Complete the Relay request provided on stdin.',
-    'All required repository context is already included in CONTEXT on stdin; do not modify files or run shell commands.',
+    'Complete the Relay request below using only the supplied CONTEXT. Do not call tools, read or modify files, or run shell commands.',
     'Return ONLY a single valid JSON object conforming to this exact JSON Schema (no markdown code fences, no explanation):',
     JSON.stringify(schema)
   ].join(' ');
-  const args = ['-p', instruction, '--output-format', 'json'];
-  if (backend === 'agy') args.push('--json-schema', JSON.stringify(schema));
+  const useStream = backend === 'agy';
+  const args = useStream
+    ? ['--input-format', 'stream-json', '--output-format', 'stream-json', '--json-schema', JSON.stringify(schema), '--disable-slash-commands']
+    : ['-p', instruction, '--output-format', 'json'];
+  const input = useStream
+    ? JSON.stringify({ event: 'user', message: { content: instruction + '\n\n' + prompt } }) + '\n'
+    : prompt;
   if (geminiCliModel) args.push('--model', geminiCliModel);
   const { code, stdout, stderr } = await runCliBinary(binary, args, {
     cwd,
     env: backend === 'agy' ? agyCliEnv : process.env,
-    input: prompt,
+    input,
     signal,
+    stopOnResult: useStream,
     notFoundMessage: `ไม่พบคำสั่ง ${backend} ติดตั้ง Antigravity CLI (irm https://antigravity.google/cli/install.ps1 | iex) หรือตั้งค่า GEMINI_API_KEY`
   });
   if (code === 0) onUsage?.();
   try {
-    if (code !== 0 && !stdout.trim()) throw Error(stderr.trim() || `exit ${code}`);
-    return parseCliJsonOutput(stdout);
+    if (code !== 0) throw Error(stderr.trim() || `exit ${code}`);
+    return useStream ? parseAgyOutput(stdout) : parseCliJsonOutput(stdout);
   } catch (parseError) {
     const detail = String(stderr || stdout || parseError.message || `exit ${code}`).trim();
     if (/auth|login|credential|unauthenticated|sign in|no longer supported/i.test(detail)) {

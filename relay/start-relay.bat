@@ -22,6 +22,14 @@ if not exist "dist\index.html" (
   if errorlevel 1 goto :failed
 )
 
+set "RELAY_CODEX_BIN_CONFIGURED="
+if exist ".env" for /f "usebackq tokens=1 delims==" %%A in (".env") do if /i "%%A"=="RELAY_CODEX_BIN" set "RELAY_CODEX_BIN_CONFIGURED=1"
+if not defined RELAY_CODEX_BIN if not defined RELAY_CODEX_BIN_CONFIGURED (
+  for /f "usebackq delims=" %%I in (`powershell.exe -NoProfile -Command "(Get-AppxPackage -Name OpenAI.Codex).InstallLocation"`) do (
+    if exist "%%I\app\resources\codex.exe" set "RELAY_CODEX_BIN=%%I\app\resources\codex.exe"
+  )
+)
+
 set "PORT=4782"
 if defined RELAY_PORT set "PORT=%RELAY_PORT%"
 if exist ".env" for /f "usebackq tokens=1,* delims==" %%A in (".env") do if /i "%%A"=="RELAY_PORT" set "PORT=%%B"
