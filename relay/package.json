@@ -1,0 +1,19 @@
+{
+  "dependencies": {
+    "@fontsource-variable/inter": "^5.3.0",
+    "@fontsource-variable/noto-sans-thai": "^5.3.0",
+    "cross-spawn": "^7.0.6",
+    "express": "^5.3.0",
+    "lucide-react": "^1.73.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "vite": "^8.3.8"
+  },
+  "name": "relay-local",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "start": "node --env-file-if-exists=.env server/index.js"
+  }
+}
