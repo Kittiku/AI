@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client';
 import '@fontsource-variable/inter';
 import '@fontsource-variable/noto-sans-thai';
 import {
-  ArrowRight, ChartPie, Check, ChevronLeft, ClipboardList, CodeXml, Copy, FlaskConical, FolderOpen,
+  ArrowRight, ChartPie, Check, ChevronLeft, ClipboardList, CodeXml, Copy, FlaskConical, FolderGit2, FolderOpen, FolderPlus,
   GitBranch, Layers, Plus, RefreshCw, RotateCcw, Settings, Sparkle, Terminal, Trash, X
 } from 'lucide-react';
 import './style.css';
@@ -14,7 +14,7 @@ const providers = {
   codex: { name: 'Codex', company: 'OpenAI', icon: CodeXml }
 };
 const pages = [
-  ['queue', 'คิวงาน', Layers], ['quota', 'โควตา AI', ChartPie], ['settings', 'ตั้งค่า', Settings]
+  ['queue', 'คิวงาน', Layers], ['projects', 'โปรเจกต์', FolderGit2], ['quota', 'โควตา AI', ChartPie], ['settings', 'ตั้งค่า', Settings]
 ];
 const statusLabels = {
   queued: 'รอเริ่ม', running: 'กำลังดำเนินการ', stopping: 'กำลังหยุด', complete: 'พร้อมตรวจผล',
@@ -43,6 +43,7 @@ function duration(ms) {
 }
 const jobDuration = job => job.startedAt ? duration((job.finishedAt || Date.now()) - job.startedAt) : '';
 const repoName = repo => repo.split(/[\\/]/).filter(Boolean).at(-1) || repo;
+const samePath = (a, b) => Boolean(a && b) && a.replaceAll('/', '\\').replace(/\\+$/, '').toLowerCase() === b.replaceAll('/', '\\').replace(/\\+$/, '').toLowerCase();
 const providerName = id => id === 'reused' ? 'แผนเดิม' : providers[id]?.name || id;
 const quote = value => '"' + value.replaceAll('"', '\\"') + '"';
 
@@ -58,7 +59,7 @@ async function api(url, method = 'GET', body) {
     method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body ?? {})
   });
   const result = await response.json();
-  if (!response.ok) throw Error(result.error || 'เชื่อมต่อเซิร์ฟเวอร์ไม่สำเร็จ');
+  if (!response.ok) throw Object.assign(Error(result.error || 'เชื่อมต่อเซิร์ฟเวอร์ไม่สำเร็จ'), { data: result, status: response.status });
   return result;
 }
 
@@ -170,7 +171,7 @@ function jobProviders(job) {
   return [...new Set(Object.values(job.stages || {}).map(stage => stage.provider).filter(id => providers[id]))];
 }
 
-function Queue({ jobs, filter, setFilter, select, create }) {
+function Queue({ jobs, filter, setFilter, select, create, hasProjects, addProject }) {
   const filters = [['all', 'ทั้งหมด'], ['running', 'กำลังทำ'], ['queued', 'รอเริ่ม'], ['done', 'เสร็จแล้ว'], ['stuck', 'ติดขัด']];
   const match = job => filter === 'all' || (filter === 'running' && (job.status === 'running' || job.status === 'stopping')) ||
     job.status === filter || (filter === 'done' && doneStatuses.has(job.status)) || (filter === 'stuck' && stuckStatuses.has(job.status));
@@ -191,7 +192,8 @@ function Queue({ jobs, filter, setFilter, select, create }) {
     </li>)}</ul> : <div className="empty">
       <span className="terminal"><Terminal size={48} strokeWidth={1.75} aria-hidden="true" /></span>
       <h3>{filter === 'all' ? 'ยังไม่มีงานในคิว' : 'ไม่มีงานในสถานะนี้'}</h3>
-      {filter === 'all' ? <><p>สร้างงานใหม่เพื่อเริ่มให้ AI ดำเนินการ</p><Button icon={Plus} primary onClick={create}>สร้างงาน</Button></> : null}
+      {filter === 'all' ? <><p>{hasProjects ? 'สร้างงานใหม่เพื่อเริ่มให้ AI ดำเนินการ' : 'เริ่มจากเพิ่มโฟลเดอร์งานที่มีอยู่ หรือสร้างงานด้วยพาธของ repo'}</p>
+        <div className="action-row center">{hasProjects ? null : <Button icon={FolderPlus} onClick={addProject}>เพิ่มโปรเจกต์</Button>}<Button icon={Plus} primary onClick={create}>สร้างงาน</Button></div></> : null}
     </div>}
   </section>;
 }
@@ -217,10 +219,10 @@ function RouteTable({ routes, onChange, quotas, label }) {
 const updateRoutes = (routes, role, index, value) => ({ ...routes, [role]: routes[role].map((item, i) => i === index ? value : item) });
 const hasDuplicate = routes => Object.values(routes).some(route => route[0] === route[1]);
 
-function NewJob({ close, created, previous, jobs, settings, quotas }) {
+function NewJob({ close, created, previous, jobs, projects, settings, quotas }) {
   const initial = useMemo(() => {
     const draft = previous?.title ? null : readStorage(draftKey);
-    const source = previous?.title ? previous : draft || {};
+    const source = previous?.title ? previous : { ...draft, ...(previous?.repo ? { repo: previous.repo } : {}) };
     return { title: source.title || '', repo: source.repo || '', prompt: source.prompt || '', runChecks: Boolean(source.runChecks) };
   }, [previous]);
   const [form, setForm] = useState(initial);
@@ -229,7 +231,9 @@ function NewJob({ close, created, previous, jobs, settings, quotas }) {
   const [repoInfo, setRepoInfo] = useState(null);
   const [error, setError] = useState('');
   const [pending, setPending] = useState(false);
-  const recentRepos = [...new Set([...jobs].reverse().map(job => job.repo))].slice(0, 8);
+  const recentRepos = [...new Set([...jobs].reverse().map(job => job.repo))]
+    .filter(repo => !projects.some(project => samePath(project.path, repo))).slice(0, 8);
+  const chosenProject = projects.find(project => samePath(project.path, form.repo.trim()));
   const set = (key, value) => setForm(current => ({ ...current, [key]: value }));
 
   useEffect(() => { if (!previous?.title) writeStorage(draftKey, form); }, [form, previous]);
@@ -267,6 +271,13 @@ function NewJob({ close, created, previous, jobs, settings, quotas }) {
         <button title="ปิด" aria-label="ปิด" className="icon-button" type="button" onClick={close} disabled={pending}><X size={22} /></button>
       </header>
       <label>ชื่องาน<input autoFocus required name="title" maxLength={100} placeholder="เพิ่มระบบจองคิว" value={form.title} onChange={event => set('title', event.target.value)} /></label>
+      {projects.length ? <label>โปรเจกต์<select value={chosenProject?.id || ''} onChange={event => {
+        const project = projects.find(item => item.id === event.target.value);
+        set('repo', project ? project.path : '');
+      }}>
+        <option value="">พาธอื่น (พิมพ์เอง)</option>
+        {projects.map(project => <option key={project.id} value={project.id}>{project.name}</option>)}
+      </select></label> : null}
       <label>พาธ Git repo<input required name="repo" maxLength={500} list="recent-repos" placeholder={'D:\\Projects\\my-app'} value={form.repo} onChange={event => set('repo', event.target.value)} /></label>
       <datalist id="recent-repos">{recentRepos.map(repo => <option key={repo} value={repo} />)}</datalist>
       {repoInfo?.ok ? <p className="repo-info"><GitBranch size={15} aria-hidden="true" /> {repoInfo.branch} · <code>{repoInfo.base}</code> {repoInfo.subject}
@@ -474,6 +485,130 @@ function JobDetail({ job, back, retry, updated, removed }) {
   </>;
 }
 
+function ProjectCard({ project, info, jobs, createJob, removed, select }) {
+  const [error, setError] = useState('');
+  const projectJobs = jobs.filter(job => samePath(job.repo, project.path));
+  const latest = projectJobs.at(-1);
+  const running = projectJobs.some(job => busyStatuses.has(job.status));
+  async function open() {
+    setError('');
+    try { await api('/projects/' + project.id + '/open', 'POST'); } catch (error) { setError(error.message); }
+  }
+  async function remove() {
+    if (!confirm('เอา "' + project.name + '" ออกจากรายการ? ไฟล์และ Git repo ในโฟลเดอร์จะไม่ถูกลบ')) return;
+    try { await api('/projects/' + project.id, 'DELETE', {}); removed(project.id); } catch (error) { setError(error.message); }
+  }
+  return <article className="card project">
+    <header className="project-head">
+      <span className="provider-icon project-icon"><FolderGit2 size={24} aria-hidden="true" /></span>
+      <div><h2>{project.name}</h2><p>{project.path}</p></div>
+    </header>
+    {info?.ok ? <p className="repo-info"><GitBranch size={15} aria-hidden="true" /> {info.branch} · <code>{info.base}</code> {info.subject}
+      {info.uncommitted ? <span className="warn-text"> · ยังไม่ commit {info.uncommitted} ไฟล์</span> : null}</p> :
+      info ? <p className="repo-info bad">{info.error}</p> : <p className="muted">กำลังตรวจ repo…</p>}
+    <p className="project-jobs">{projectJobs.length ? <>
+      งานทั้งหมด {projectJobs.length} · ล่าสุด <button type="button" className="link" onClick={() => select(latest.id)}>{latest.title}</button>
+      <span className={'status ' + latest.status}>{statusLabels[latest.status]}</span></> : 'ยังไม่มีงานในโปรเจกต์นี้'}</p>
+    {error ? <p role="alert" className="error">{error}</p> : null}
+    <div className="action-row">
+      <Button primary icon={Plus} onClick={() => createJob(project.path)} disabled={info && !info.ok}>สร้างงาน</Button>
+      <Button icon={FolderOpen} onClick={open}>เปิดโฟลเดอร์</Button>
+      <Button danger icon={Trash} onClick={remove} disabled={running} title={running ? 'มีงานที่กำลังทำอยู่' : undefined}>เอาออก</Button>
+    </div>
+  </article>;
+}
+
+function ProjectsPage({ projects, jobs, createJob, added, removed, select }) {
+  const [folder, setFolder] = useState('');
+  const [name, setName] = useState('');
+  const [pending, setPending] = useState(false);
+  const [picking, setPicking] = useState(false);
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+  const [needsInit, setNeedsInit] = useState(null);
+  const [statuses, setStatuses] = useState({});
+  const ids = projects.map(project => project.id + project.path).join('|');
+  async function loadStatuses() {
+    const entries = await Promise.all(projects.map(async project => {
+      try { return [project.id, { ok: true, ...(await api('/repo/check', 'POST', { repo: project.path })) }]; }
+      catch (error) { return [project.id, { ok: false, error: error.message }]; }
+    }));
+    setStatuses(Object.fromEntries(entries));
+  }
+  useEffect(() => { void loadStatuses(); }, [ids]);
+  async function pick() {
+    setPicking(true); setError('');
+    try { const { path } = await api('/projects/pick', 'POST'); if (path) { setFolder(path); setNeedsInit(null); } }
+    catch (error) { setError(error.message); }
+    finally { setPicking(false); }
+  }
+  async function add(event) {
+    event.preventDefault();
+    setPending(true); setError(''); setNotice(''); setNeedsInit(null);
+    try {
+      const project = await api('/projects', 'POST', { path: folder, name });
+      added(project);
+      setNotice('เพิ่ม "' + project.name + '" แล้ว' + (samePath(project.path, folder) ? '' : ' (ใช้ root ของ repo: ' + project.path + ')'));
+      setFolder(''); setName('');
+    } catch (error) {
+      if (error.data?.needsInit) setNeedsInit(error.data); else setError(error.message);
+    } finally { setPending(false); }
+  }
+  async function useParent() {
+    setPending(true); setError('');
+    try {
+      const project = await api('/projects', 'POST', { path: needsInit.folder, name, useParent: true });
+      added(project);
+      setNotice('เพิ่ม "' + project.name + '" แล้ว (ใช้ repo ที่ ' + project.path + ')');
+      setNeedsInit(null); setFolder(''); setName('');
+    } catch (error) { setError(error.message); }
+    finally { setPending(false); }
+  }
+  async function init() {
+    setPending(true); setError('');
+    try {
+      const project = await api('/projects/init', 'POST', { path: needsInit.folder, name });
+      added(project);
+      setNotice('สร้าง Git repo และ commit แรก ' + project.committed + ' ไฟล์แล้ว' + (project.createdIgnore ? ' พร้อมไฟล์ .gitignore' : '') + ' · เพิ่ม "' + project.name + '" แล้ว');
+      setNeedsInit(null); setFolder(''); setName('');
+    } catch (error) { setError(error.message); }
+    finally { setPending(false); }
+  }
+  return <>
+    <div className="heading"><h1>โปรเจกต์</h1><p>บันทึกโฟลเดอร์งานที่ใช้บ่อย แล้วสร้างงานจากโปรเจกต์ได้ทันที</p></div>
+    <form className="card add-project" onSubmit={add}>
+      <h2>เพิ่มโปรเจกต์</h2>
+      <div className="add-row">
+        <label>โฟลเดอร์ของโปรเจกต์<input required value={folder} maxLength={500} placeholder={'D:\\Projects\\my-app'} onChange={event => { setFolder(event.target.value); setNeedsInit(null); }} /></label>
+        <Button icon={FolderOpen} onClick={pick} disabled={picking || pending}>{picking ? 'รอเลือกโฟลเดอร์…' : 'เลือกโฟลเดอร์'}</Button>
+      </div>
+      <label>ชื่อที่แสดง (ไม่ใส่ก็ได้)<input value={name} maxLength={80} placeholder="ใช้ชื่อโฟลเดอร์" onChange={event => setName(event.target.value)} /></label>
+      {picking ? <p className="muted">หน้าต่างเลือกโฟลเดอร์ของ Windows เปิดอยู่ ถ้าไม่เห็น ให้ดูที่แถบงาน</p> : null}
+      {needsInit ? <div className="init-panel" role="alert">
+        <strong>{needsInit.error}</strong>
+        {needsInit.kind === 'parent' ? <p>{needsInit.parentUsable ?
+          'เลือกได้ว่าจะใช้ repo ที่ใหญ่กว่านั้นทั้งก้อน หรือสร้าง Git repo แยกเฉพาะโฟลเดอร์นี้' :
+          'repo นั้นเป็นโฟลเดอร์ผู้ใช้หรือ root ของไดรฟ์ Relay จะไม่ใช้ repo นั้น ให้สร้าง Git repo แยกเฉพาะโฟลเดอร์นี้แทน'}</p> : null}
+        <p>Relay ต้องใช้ Git repo ที่มี commit อย่างน้อย 1 ครั้ง ปุ่มสร้างจะ{needsInit.kind === 'empty' ? '' : 'สร้าง Git repo ในโฟลเดอร์นี้ แล้ว '}commit ไฟล์ทั้งหมดในโฟลเดอร์ ({needsInit.entries} รายการที่ระดับบนสุด) เป็น commit แรก</p>
+        <p>{needsInit.hasGitignore ? 'ไฟล์ที่อยู่ใน .gitignore จะไม่ถูก commit' : 'โฟลเดอร์นี้ยังไม่มี .gitignore Relay จะสร้างให้ เพื่อไม่ให้ commit node_modules, dist และไฟล์ลับอย่าง .env หรือ *.key'}</p>
+        <div className="action-row"><Button primary icon={FolderPlus} onClick={init} disabled={pending}>{needsInit.kind === 'empty' ? 'สร้าง commit แรก' : 'สร้าง Git repo และ commit แรก'}</Button>
+          {needsInit.parentUsable ? <Button icon={GitBranch} onClick={useParent} disabled={pending}>ใช้ repo ที่ใหญ่กว่า</Button> : null}
+          <Button onClick={() => setNeedsInit(null)} disabled={pending}>ยกเลิก</Button></div>
+      </div> : null}
+      {error ? <p role="alert" className="error">{error}</p> : null}
+      {notice ? <p role="status" className="success">{notice}</p> : null}
+      <div className="form-actions"><button type="submit" className="button primary" disabled={pending || !folder.trim()}><FolderPlus size={18} aria-hidden="true" />เพิ่มโปรเจกต์</button></div>
+    </form>
+    {projects.length ? <>
+      <div className="section-head"><h2>โปรเจกต์ของคุณ ({projects.length})</h2><Button icon={RefreshCw} onClick={loadStatuses}>ตรวจสถานะใหม่</Button></div>
+      <div className="projects">{projects.map(project => <ProjectCard key={project.id} project={project} info={statuses[project.id]} jobs={jobs} createJob={createJob} removed={removed} select={select} />)}</div>
+    </> : <section className="card empty">
+      <span className="terminal"><FolderGit2 size={48} strokeWidth={1.75} aria-hidden="true" /></span>
+      <h3>ยังไม่มีโปรเจกต์</h3><p>เพิ่มโฟลเดอร์งานที่มีอยู่แล้วด้านบน เพื่อให้ AI เข้าไปทำงานต่อได้</p>
+    </section>}
+  </>;
+}
+
 function useJobAlerts(jobs) {
   const previous = useRef(null);
   const [unseen, setUnseen] = useState(0);
@@ -553,6 +688,9 @@ function App() {
     finally { setRefreshing(false); }
   }
   const jobs = data?.jobs ?? [];
+  const projects = data?.projects ?? [];
+  const addProject = project => setData(previous => ({ ...previous, projects: [...previous.projects.filter(item => item.id !== project.id), project] }));
+  const removeProject = id => setData(previous => ({ ...previous, projects: previous.projects.filter(item => item.id !== id) }));
   const job = jobs.find(item => item.id === selection);
   const runningCount = jobs.filter(item => item.status === 'running' || item.status === 'stopping').length;
   const queuedCount = jobs.filter(item => item.status === 'queued').length;
@@ -575,15 +713,16 @@ function App() {
         {job ? <JobDetail key={job.id} job={job} back={() => setSelection(null)} retry={setDialog} updated={updateJob} removed={removeJob} /> :
           page === 'settings' ? <><div className="heading"><h1>ตั้งค่า</h1><p>เลือก AI ที่จะรับผิดชอบแต่ละขั้น</p></div>
             {data ? <SettingsForm initial={data.settings} quotas={data.quotas} onDirty={setSettingsDirty} changed={settings => setData(previous => ({ ...previous, settings }))} /> : null}</> :
+          page === 'projects' ? <ProjectsPage projects={projects} jobs={jobs} createJob={repo => setDialog({ repo })} added={addProject} removed={removeProject} select={select} /> :
           page === 'quota' ? <><div className="heading"><h1>โควตา AI</h1><p>ดูโควตาคงเหลือ เวลารีเซ็ต และระดับที่กันไว้ของแต่ละผู้ให้บริการ</p></div>{cards(true)}</> :
           <>
             <div className="heading"><h1>คิวงาน AI</h1><p>สั่งงาน ติดตามผล และจัดสรรโควตาจากที่เดียว</p></div>
             {cards(false)}
-            <div className="dashboard-grid"><Queue jobs={jobs} filter={filter} setFilter={setFilter} select={select} create={() => setDialog({})} /><SidePanel jobs={jobs} select={select} /></div>
+            <div className="dashboard-grid"><Queue jobs={jobs} filter={filter} setFilter={setFilter} select={select} create={() => setDialog({})} hasProjects={projects.length > 0} addProject={() => open('projects')} /><SidePanel jobs={jobs} select={select} /></div>
           </>}
       </main>
     </div>
-    {dialog ? <NewJob previous={dialog} jobs={jobs} settings={data.settings} quotas={data.quotas} close={() => setDialog(null)} created={created => {
+    {dialog ? <NewJob previous={dialog} jobs={jobs} projects={projects} settings={data.settings} quotas={data.quotas} close={() => setDialog(null)} created={created => {
       updateJob(created); setPage('queue'); setSelection(created.id); setDialog(null);
     }} /> : null}
   </div>;

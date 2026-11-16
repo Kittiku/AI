@@ -2,7 +2,8 @@ import express from 'express';
 import spawn from 'cross-spawn';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { realpath } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { applyFiles, checkpoint, git, repository, snapshot } from './git.js';
 import { editSchema, generate, names, pacificDay, planSchema, quota, refreshClaudeCode, refreshCodex, reviewSchema } from './providers.js';
@@ -29,6 +30,7 @@ function migrateSettings(settings) {
   settings.reserve = { ...defaults.reserve, ...reserve };
 }
 migrateSettings(state.settings);
+state.projects ??= [];
 for (const job of state.jobs) if (job.status === 'queued') migrateSettings(job.settings);
 for (const job of state.jobs) {
   if (['running', 'stopping'].includes(job.status)) {
@@ -284,6 +286,7 @@ app.post('/api/jobs', async (req, res) => {
   if (![title, prompt, repo].every(value => typeof value === 'string' && value.trim()) ||
     title.length > 100 || prompt.length > 8000 || repo.length > 500) throw Error('กรอกชื่องาน โจทย์ และพาธ Git repo ให้ครบ');
   const { root: repoRoot, base } = await repository(repo.trim());
+  if (unsafeRoot(repoRoot)) throw Error('Git repo นี้อยู่ที่ ' + repoRoot + ' ซึ่งเป็นโฟลเดอร์ผู้ใช้หรือ root ของไดรฟ์ เพิ่มโฟลเดอร์งานในหน้าโปรเจกต์เพื่อสร้าง repo แยก');
   const id = randomUUID();
   const settings = structuredClone(state.settings);
   if (routes) settings.routes = readRoutes(routes);
@@ -317,6 +320,101 @@ app.post('/api/repo/check', async (req, res) => {
   ]);
   res.json({ root: repoRoot, base: base.slice(0, 10), branch, subject, uncommitted: changes ? changes.split('\n').length : 0 });
 });
+// Projects: saved folders the user picks jobs from.
+const defaultGitignore = ['node_modules/', 'dist/', 'build/', '.next/', 'coverage/', '.env', '.env.*', '!.env.example',
+  '*.key', '*.pem', '*.p12', '*.pfx', '.DS_Store', 'Thumbs.db', ''].join('\n');
+async function folderOf(input) {
+  const folder = typeof input === 'string' ? input.trim().replace(/^"(.*)"$/, '$1') : '';
+  if (!folder || folder.length > 500 || !path.isAbsolute(folder) || folder.startsWith('\\\\')) throw Error('ระบุพาธเต็มของโฟลเดอร์บนเครื่อง');
+  const resolved = await realpath(folder).catch(() => { throw Error('ไม่พบโฟลเดอร์นี้'); });
+  if (!statSync(resolved).isDirectory()) throw Error('พาธนี้ไม่ใช่โฟลเดอร์');
+  return resolved;
+}
+async function gitState(folder) {
+  const top = await git(folder, 'rev-parse', '--show-toplevel').catch(() => null);
+  if (!top) return { kind: 'none' };
+  const head = await git(folder, 'rev-parse', '--verify', 'HEAD').catch(() => null);
+  return { kind: head ? 'ready' : 'empty', root: await realpath(top) };
+}
+const sameFolder = (a, b) => a.toLowerCase() === b.toLowerCase();
+// A drive root or the user's home folder is never a project, even if it is a Git repo.
+function unsafeRoot(folder) {
+  const home = process.env.USERPROFILE || process.env.HOME || '';
+  return sameFolder(path.parse(folder).root.replace(/[\\/]+$/, ''), folder.replace(/[\\/]+$/, '')) || Boolean(home && sameFolder(folder, home));
+}
+function saveProject(root, name) {
+  const existing = state.projects.find(item => sameFolder(item.path, root));
+  if (existing) return existing;
+  const project = { id: randomUUID(), name: (typeof name === 'string' && name.trim().slice(0, 80)) || path.basename(root), path: root, addedAt: Date.now() };
+  state.projects.push(project);
+  save();
+  return project;
+}
+app.post('/api/projects', async (req, res) => {
+  const folder = await folderOf(req.body?.path);
+  if (unsafeRoot(folder)) throw Error('เลือกโฟลเดอร์ของโปรเจกต์ ไม่ใช่ root ของไดรฟ์หรือโฟลเดอร์ผู้ใช้');
+  const repo = await gitState(folder);
+  const own = repo.root && sameFolder(repo.root, folder);
+  if (repo.kind === 'ready' && (own || (req.body?.useParent === true && !unsafeRoot(repo.root)))) {
+    return res.status(201).json(saveProject(repo.root, req.body?.name));
+  }
+  const kind = repo.kind === 'none' ? 'none' : own ? 'empty' : 'parent';
+  res.status(409).json({ needsInit: true, kind, folder, parentRoot: kind === 'parent' ? repo.root : null,
+    parentUsable: kind === 'parent' && repo.kind === 'ready' && !unsafeRoot(repo.root),
+    hasGitignore: existsSync(path.join(folder, '.gitignore')), entries: readdirSync(folder).filter(name => name !== '.git').length,
+    error: kind === 'none' ? 'โฟลเดอร์นี้ยังไม่เป็น Git repo' : kind === 'empty' ? 'Git repo นี้ยังไม่มี commit' :
+      'โฟลเดอร์นี้อยู่ใน Git repo ที่ใหญ่กว่า: ' + repo.root });
+});
+app.post('/api/projects/init', async (req, res) => {
+  const folder = await folderOf(req.body?.path);
+  if (unsafeRoot(folder)) throw Error('ไม่สร้าง Git repo ที่ root ของไดรฟ์หรือโฟลเดอร์ผู้ใช้ เลือกโฟลเดอร์ของโปรเจกต์แทน');
+  let repo = await gitState(folder);
+  const own = repo.root && sameFolder(repo.root, folder);
+  if (repo.kind === 'ready' && own) return res.status(201).json(saveProject(repo.root, req.body?.name));
+  // No repo here, or only a parent repo: give this folder its own repo.
+  if (!own) { await git(folder, 'init'); repo = await gitState(folder); }
+  const ignore = path.join(repo.root, '.gitignore');
+  const createdIgnore = !existsSync(ignore);
+  if (createdIgnore) writeFileSync(ignore, defaultGitignore);
+  await git(repo.root, 'add', '-A');
+  const staged = (await git(repo.root, 'diff', '--cached', '--name-only')).split('\n').filter(Boolean);
+  if (!staged.length) throw Error('โฟลเดอร์นี้ไม่มีไฟล์ให้ commit เพิ่มไฟล์อย่างน้อย 1 ไฟล์ก่อน');
+  const identity = await git(repo.root, 'config', 'user.name').catch(() => '') ? [] : ['-c', 'user.name=Relay', '-c', 'user.email=relay@localhost'];
+  await git(repo.root, ...identity, 'commit', '-m', 'Initial commit (Relay)');
+  res.status(201).json({ ...saveProject(repo.root, req.body?.name), committed: staged.length, createdIgnore });
+});
+app.post('/api/projects/pick', async (_req, res) => {
+  if (process.platform !== 'win32') return res.status(501).json({ error: 'เลือกโฟลเดอร์ได้บน Windows เท่านั้น พิมพ์พาธแทน' });
+  // A native folder dialog; the encoded command keeps Thai text intact.
+  const script = `[Console]::OutputEncoding = [Text.Encoding]::UTF8
+Add-Type -AssemblyName System.Windows.Forms
+$dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+$dialog.Description = 'เลือกโฟลเดอร์โปรเจกต์สำหรับ Relay'
+$dialog.ShowNewFolderButton = $false
+$owner = New-Object System.Windows.Forms.Form -Property @{ TopMost = $true; ShowInTaskbar = $false }
+if ($dialog.ShowDialog($owner) -eq 'OK') { [Console]::Out.Write($dialog.SelectedPath) }`;
+  const encoded = Buffer.from(script, 'utf16le').toString('base64');
+  const chosen = await new Promise((resolve, reject) => {
+    const child = spawn('powershell.exe', ['-NoProfile', '-STA', '-NonInteractive', '-EncodedCommand', encoded], { windowsHide: true });
+    let output = '';
+    child.stdout.on('data', chunk => { output += chunk; });
+    child.on('error', reject);
+    child.on('close', () => resolve(output.trim()));
+  });
+  res.json({ path: chosen || null });
+});
+app.post('/api/projects/:id/open', (req, res) => {
+  const project = state.projects.find(item => item.id === req.params.id);
+  if (!project || !existsSync(project.path)) return res.status(404).json({ error: 'ไม่พบโฟลเดอร์ของโปรเจกต์นี้' });
+  spawn(process.platform === 'win32' ? 'explorer.exe' : 'xdg-open', [project.path], { detached: true, stdio: 'ignore' }).unref();
+  res.json({ ok: true });
+});
+app.delete('/api/projects/:id', (req, res) => {
+  state.projects = state.projects.filter(item => item.id !== req.params.id);
+  save();
+  res.json({ ok: true });
+});
+
 const findJob = id => state.jobs.find(item => item.id === id);
 const busy = job => ['queued', 'running', 'stopping'].includes(job.status);
 async function cleanup(job, deleteBranch) {
