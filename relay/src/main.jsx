@@ -22,7 +22,7 @@ const statusLabels = {
 };
 const roleNames = { plan: 'วางแผน', backend: 'Backend', frontend: 'UX/UI', review: 'รีวิว' };
 const stageNames = { plan: 'วางแผน', backend: 'Backend', frontend: 'UX/UI', checks: 'ทดสอบ', review: 'รีวิว' };
-const stageStatus = { pending: 'รอ', running: 'กำลังทำ', done: 'เสร็จ', warning: 'ตรวจเพิ่ม', failed: 'ล้มเหลว', cancelled: 'หยุด' };
+const stageStatus = { pending: 'รอ', running: 'กำลังทำ', done: 'เสร็จ', warning: 'ตรวจเพิ่ม', failed: 'ล้มเหลว', cancelled: 'หยุด', waiting: 'รอโควตา', retrying: 'กำลังลองใหม่' };
 const busyStatuses = new Set(['queued', 'running', 'stopping']);
 const doneStatuses = new Set(['complete', 'needs_review']);
 const stuckStatuses = new Set(['failed', 'cancelled', 'interrupted']);
@@ -44,7 +44,7 @@ function duration(ms) {
 const jobDuration = job => job.startedAt ? duration((job.finishedAt || Date.now()) - job.startedAt) : '';
 const repoName = repo => repo.split(/[\\/]/).filter(Boolean).at(-1) || repo;
 const samePath = (a, b) => Boolean(a && b) && a.replaceAll('/', '\\').replace(/\\+$/, '').toLowerCase() === b.replaceAll('/', '\\').replace(/\\+$/, '').toLowerCase();
-const providerName = id => id === 'reused' ? 'แผนเดิม' : providers[id]?.name || id;
+const providerName = id => id === 'reused' ? 'ใช้ของเดิม' : providers[id]?.name || id;
 const quote = value => '"' + value.replaceAll('"', '\\"') + '"';
 
 function readStorage(key) {
@@ -129,7 +129,8 @@ function Stepper({ job, compact }) {
       <div>
         <strong>{stageNames[stage.key]}</strong>
         <small>{stage.status === 'skipped' ? 'ไม่ได้ทำ' : stageStatus[stage.status] || stage.status}
-          {stage.provider ? ' · ' + providerName(stage.provider) : ''}
+          {stage.status === 'waiting' && stage.waitUntil ? ' ถึง ' + time(stage.waitUntil) : ''}
+          {stage.provider && stage.status !== 'waiting' ? ' · ' + providerName(stage.provider) : ''}
           {stage.startedAt && stage.status !== 'pending' ? ' · ' + duration((stage.endedAt || now) - stage.startedAt) : ''}
           {stage.round ? ' · แก้รอบ ' + stage.round : ''}
           {stage.note ? ' · ' + stage.note : ''}</small>
@@ -266,6 +267,7 @@ function NewJob({ close, created, previous, jobs, projects, settings, quotas }) 
     } catch (error) { setError(error.message); setPending(false); }
   }
   const canReusePlan = previous?.plan && previous.prompt === form.prompt.trim();
+  const resumable = previous?.stages?.backend?.status === 'done' && previous?.stages?.frontend?.status === 'done' && (previous.worktree || previous.branchKept);
   return <div className="overlay">
     <form role="dialog" aria-modal="true" aria-labelledby="create-title" className="card dialog" onSubmit={submit}>
       <header><h2 id="create-title">{previous?.title ? 'สร้างงานจากโจทย์เดิม' : 'สร้างงาน'}</h2>
@@ -275,6 +277,7 @@ function NewJob({ close, created, previous, jobs, projects, settings, quotas }) 
       {projects.length ? <label>โปรเจกต์<select value={chosenProject?.id || ''} onChange={event => {
         const project = projects.find(item => item.id === event.target.value);
         set('repo', project ? project.path : '');
+        if (project?.checks?.length) set('runChecks', true);
       }}>
         <option value="">พาธอื่น (พิมพ์เอง)</option>
         {projects.map(project => <option key={project.id} value={project.id}>{project.name}</option>)}
@@ -287,8 +290,11 @@ function NewJob({ close, created, previous, jobs, projects, settings, quotas }) 
         <small>แอปส่งไฟล์โค้ดจาก commit HEAD และโจทย์ไปยัง AI ที่เลือกตามการตั้งค่า</small>}
       <label>โจทย์และเกณฑ์รับงาน<textarea required name="prompt" maxLength={promptLimit} rows={6} placeholder="ระบุสิ่งที่ต้องการให้ AI ทำและวิธีตรวจว่าเสร็จแล้ว" value={form.prompt} onChange={event => set('prompt', event.target.value)} /></label>
       <small className={'counter' + (form.prompt.length > promptLimit * 0.9 ? ' warn-text' : '')}>{form.prompt.length.toLocaleString()} / {promptLimit.toLocaleString()} ตัวอักษร{previous?.title ? '' : ' · บันทึกร่างอัตโนมัติ'}</small>
-      {canReusePlan ? <p className="repo-info">ใช้แผนจากงานเดิมได้ ถ้า repo ยังอยู่ที่ commit เดิม Relay จะข้ามขั้นวางแผนเพื่อประหยัดโควตา</p> : null}
-      <label className="checkbox"><input type="checkbox" name="runChecks" checked={form.runChecks} onChange={event => set('runChecks', event.target.checked)} />รัน npm test และ build ที่มีใน repo นี้</label>
+      {canReusePlan ? <p className="repo-info">{resumable ?
+        'ทำต่อจากจุดที่ค้างได้ ถ้า repo ยังอยู่ที่ commit เดิม Relay จะใช้แผนและผล Backend / UX/UI เดิม แล้วไปขั้นทดสอบและรีวิวต่อ' :
+        'ใช้แผนจากงานเดิมได้ ถ้า repo ยังอยู่ที่ commit เดิม Relay จะข้ามขั้นวางแผนเพื่อประหยัดโควตา'}</p> : null}
+      <label className="checkbox"><input type="checkbox" name="runChecks" checked={form.runChecks} onChange={event => set('runChecks', event.target.checked)} />
+        {chosenProject?.checks?.length ? 'รันคำสั่งทดสอบของโปรเจกต์ (' + chosenProject.checks.length + ' คำสั่ง) และให้ AI แก้จนผ่าน' : 'รัน npm test และ build ที่มีใน repo นี้ และให้ AI แก้จนผ่าน'}</label>
       <small>เลือกสำหรับ repo ที่คุณไว้วางใจ แอปอาจติดตั้ง dependencies จาก lockfile และรันโค้ดที่เพิ่งแก้บนเครื่อง</small>
       <details className="advanced" open={override} onToggle={event => setOverride(event.currentTarget.open)}>
         <summary>เลือก AI เฉพาะงานนี้</summary>
@@ -306,6 +312,7 @@ function SettingsForm({ initial, changed, quotas, onDirty }) {
   const [saving, setSaving] = useState(false);
   const dirty = JSON.stringify(draft) !== JSON.stringify(initial);
   const duplicate = hasDuplicate(draft.routes);
+  const setAuto = (key, value) => setDraft(current => ({ ...current, auto: { ...current.auto, [key]: value } }));
   useEffect(() => { onDirty(dirty); }, [dirty, onDirty]);
   useEffect(() => () => onDirty(false), [onDirty]);
   async function submit(event) {
@@ -327,7 +334,15 @@ function SettingsForm({ initial, changed, quotas, onDirty }) {
     <div className="settings-grid">
       {Object.entries(providers).map(([id, model]) => <label key={id}>กันโควตา {model.name} (%)<input type="number" required min="0" max="99" value={draft.reserve[id]} onChange={event => setDraft({ ...draft, reserve: { ...draft.reserve, [id]: Number(event.target.value) } })} /></label>)}
       <label>เพดาน Gemini ต่อวัน (0 = ยังไม่ระบุ)<input type="number" required min="0" max="1000000" value={draft.geminiDailyLimit} onChange={event => setDraft({ ...draft, geminiDailyLimit: Number(event.target.value) })} /></label>
-      <label>จำนวนรอบแก้สูงสุด<input type="number" required min="0" max="4" value={draft.maxRounds} onChange={event => setDraft({ ...draft, maxRounds: Number(event.target.value) })} /></label>
+      <label>จำนวนรอบแก้สูงสุด<input type="number" required min="0" max="6" value={draft.maxRounds} onChange={event => setDraft({ ...draft, maxRounds: Number(event.target.value) })} /></label>
+    </div>
+    <h2 className="section-gap">โหมดอัตโนมัติ</h2>
+    <p className="muted">สั่งครั้งเดียวแล้วให้ Relay จัดการจนจบ: ลอง AI ตัวอื่นเมื่อทำไม่ได้ รอโควตาแทนการหยุด ลองขั้นที่ล้มใหม่ และส่ง error จากการทดสอบให้ AI แก้จนผ่านหรือครบจำนวนรอบ ผลงานยังอยู่บน branch ให้คุณตรวจก่อน merge เสมอ</p>
+    <label className="checkbox"><input type="checkbox" checked={draft.auto.allProviders} onChange={event => setAuto('allProviders', event.target.checked)} />ถ้าตัวหลักและตัวสำรองทำไม่ได้ ให้ลอง AI ตัวอื่นที่เชื่อมต่ออยู่</label>
+    <div className="settings-grid">
+      <label>รอโควตากลับมาได้นานสุด (นาที, 0 = ไม่รอ)<input type="number" required min="0" max="600" value={draft.auto.waitMinutes} onChange={event => setAuto('waitMinutes', Number(event.target.value))} /></label>
+      <label>ลองขั้นที่ล้มใหม่ (ครั้ง)<input type="number" required min="0" max="5" value={draft.auto.retries} onChange={event => setAuto('retries', Number(event.target.value))} /></label>
+      <label>เวลาสูงสุดต่องาน (นาที)<input type="number" required min="10" max="1440" value={draft.auto.maxJobMinutes} onChange={event => setAuto('maxJobMinutes', Number(event.target.value))} /></label>
     </div>
     <div className="form-actions"><button className="button primary" type="submit" disabled={saving || !dirty || duplicate}>บันทึกการตั้งค่า</button>
       {dirty ? <Button onClick={() => { setDraft(initial); setNotice(null); }}>ยกเลิกการแก้</Button> : null}
@@ -478,7 +493,7 @@ function JobDetail({ job, back, retry, updated, removed }) {
         {job.checks?.length ? <><h3>ผลทดสอบ</h3>{job.checks.map(check => <details key={check.label}><summary>{check.label} · {check.code === 0 ? 'ผ่าน' : 'ตรวจเพิ่ม'}</summary><pre>{check.output}</pre></details>)}</> : null}
         <div className="action-row">
           {['queued', 'running'].includes(job.status) ? <Button onClick={cancel}>หยุดงาน</Button> : null}
-          {!busy && stuckStatuses.has(job.status) && job.plan ? <Button primary icon={RotateCcw} onClick={() => retry(job)}>ทำต่อจากแผนเดิม</Button> : null}
+          {!busy && stuckStatuses.has(job.status) && job.plan ? <Button primary icon={RotateCcw} onClick={() => retry(job)}>ทำต่อจากจุดที่ค้าง</Button> : null}
           {!busy ? <Button icon={RotateCcw} onClick={() => retry({ ...job, plan: undefined, id: undefined })}>สร้างงานจากโจทย์นี้</Button> : null}
         </div>
       </aside>
@@ -486,7 +501,30 @@ function JobDetail({ job, back, retry, updated, removed }) {
   </>;
 }
 
-function ProjectCard({ project, info, jobs, createJob, removed, select }) {
+function ChecksEditor({ project, updated }) {
+  const [editing, setEditing] = useState(false);
+  const [text, setText] = useState('');
+  const [error, setError] = useState('');
+  const checks = project.checks || [];
+  async function save() {
+    setError('');
+    try { updated(await api('/projects/' + project.id, 'PUT', { checks: text.split('\n') })); setEditing(false); }
+    catch (error) { setError(error.message); }
+  }
+  if (!editing) return <div className="checks-list">
+    <strong>คำสั่งทดสอบ</strong>{checks.length ? checks.map(command => <code key={command}>{command}</code>) :
+      <span> · ยังไม่ได้ตั้ง (ใช้ npm test / build ถ้ามี)</span>}
+    <div><button type="button" className="link" onClick={() => { setText(checks.join('\n')); setEditing(true); }}>{checks.length ? 'แก้คำสั่ง' : 'ตั้งคำสั่งทดสอบ'}</button></div>
+  </div>;
+  return <div className="checks-editor">
+    <label>คำสั่งทดสอบ บรรทัดละ 1 คำสั่ง (รันในโฟลเดอร์งาน ถ้า exit code ไม่ใช่ 0 ถือว่าไม่ผ่าน)
+      <textarea rows={3} value={text} placeholder={'python -m py_compile webapp/app.py\npython -m pytest -q'} onChange={event => setText(event.target.value)} /></label>
+    {error ? <p role="alert" className="error">{error}</p> : null}
+    <div className="action-row"><Button primary onClick={save}>บันทึก</Button><Button onClick={() => setEditing(false)}>ยกเลิก</Button></div>
+  </div>;
+}
+
+function ProjectCard({ project, info, jobs, createJob, removed, select, updated }) {
   const [error, setError] = useState('');
   const projectJobs = jobs.filter(job => samePath(job.repo, project.path));
   const latest = projectJobs.at(-1);
@@ -510,6 +548,7 @@ function ProjectCard({ project, info, jobs, createJob, removed, select }) {
     <p className="project-jobs">{projectJobs.length ? <>
       งานทั้งหมด {projectJobs.length} · ล่าสุด <button type="button" className="link" onClick={() => select(latest.id)}>{latest.title}</button>
       <span className={'status ' + latest.status}>{statusLabels[latest.status]}</span></> : 'ยังไม่มีงานในโปรเจกต์นี้'}</p>
+    <ChecksEditor project={project} updated={updated} />
     {error ? <p role="alert" className="error">{error}</p> : null}
     <div className="action-row">
       <Button primary icon={Plus} onClick={() => createJob(project.path)} disabled={info && !info.ok}>สร้างงาน</Button>
@@ -602,7 +641,7 @@ function ProjectsPage({ projects, jobs, createJob, added, removed, select }) {
     </form>
     {projects.length ? <>
       <div className="section-head"><h2>โปรเจกต์ของคุณ ({projects.length})</h2><Button icon={RefreshCw} onClick={loadStatuses}>ตรวจสถานะใหม่</Button></div>
-      <div className="projects">{projects.map(project => <ProjectCard key={project.id} project={project} info={statuses[project.id]} jobs={jobs} createJob={createJob} removed={removed} select={select} />)}</div>
+      <div className="projects">{projects.map(project => <ProjectCard key={project.id} project={project} info={statuses[project.id]} jobs={jobs} createJob={createJob} removed={removed} select={select} updated={added} />)}</div>
     </> : <section className="card empty">
       <span className="terminal"><FolderGit2 size={48} strokeWidth={1.75} aria-hidden="true" /></span>
       <h3>ยังไม่มีโปรเจกต์</h3><p>เพิ่มโฟลเดอร์งานที่มีอยู่แล้วด้านบน เพื่อให้ AI เข้าไปทำงานต่อได้</p>

@@ -103,6 +103,8 @@ main { max-width: 1560px; margin-inline: auto; padding: 30px 23px 32px; }
 .stage-dot { flex: 0 0 22px; height: 22px; border-radius: 50%; display: grid; place-items: center; border: 2px solid #c3c8d3; background: #fff; color: #fff; margin-top: 1px; }
 .stage.running { background: #f1ecfc; }
 .stage.running .stage-dot { border-color: #7a4fd6; border-top-color: transparent; animation: spin 1s linear infinite; }
+.stage.waiting, .stage.retrying { background: #fff6e5; }
+.stage.waiting .stage-dot, .stage.retrying .stage-dot { border-color: #c97a12; border-top-color: transparent; animation: spin 2.4s linear infinite; }
 .stage.done .stage-dot { background: #17834a; border-color: #17834a; }
 .stage.warning .stage-dot { background: #c97a12; border-color: #c97a12; }
 .stage.failed .stage-dot, .stage.cancelled .stage-dot { background: #c8372d; border-color: #c8372d; }
@@ -161,6 +163,12 @@ input[type="checkbox"] { accent-color: var(--accent); }
 .facts .button { margin-top: 14px; }
 .facts small { color: var(--muted); display: block; overflow-wrap: anywhere; margin-top: 3px; }
 .preline { white-space: pre-wrap; }
+.section-gap { margin-top: 26px; }
+.settings > .checkbox { margin-top: 12px; font-weight: 550; }
+.checks-editor { margin-top: 12px; }
+.checks-editor textarea { font: 13px/1.5 Consolas, monospace; }
+.checks-list { margin-top: 10px; font-size: 13px; color: var(--muted); }
+.checks-list code { display: block; margin-top: 3px; color: var(--ink); overflow-wrap: anywhere; }
 .add-project { padding: 17px 20px 20px; max-width: 900px; }
 .add-project h2, .section-head h2 { font-size: clamp(20px, 1.8vw, 26px); letter-spacing: -.03em; font-weight: 770; }
 .add-project label { margin-top: 13px; }
