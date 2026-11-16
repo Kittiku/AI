@@ -11,11 +11,33 @@ const claudeCodeBinary = process.env.RELAY_CLAUDE_CODE_BIN || [
   process.env.USERPROFILE && path.join(process.env.USERPROFILE, '.local', 'bin', 'claude.exe'),
   process.env.HOME && path.join(process.env.HOME, '.local', 'bin', 'claude')
 ].find(file => file && existsSync(file)) || 'claude';
+const agyBinary = process.env.RELAY_AGY_BIN || [
+  process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'agy', 'bin', 'agy.exe'),
+  process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'agy', 'agy.exe'),
+  process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Programs', 'agy', 'agy.exe'),
+  process.env.USERPROFILE && path.join(process.env.USERPROFILE, '.local', 'bin', 'agy.exe'),
+  process.env.HOME && path.join(process.env.HOME, '.local', 'bin', 'agy')
+].find(file => file && existsSync(file)) || 'agy';
+const geminiBinary = process.env.RELAY_GEMINI_BIN || [
+  process.env.APPDATA && path.join(process.env.APPDATA, 'npm', process.platform === 'win32' ? 'gemini.cmd' : 'gemini'),
+  process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Programs', 'gemini-cli', 'gemini.exe'),
+  process.env.USERPROFILE && path.join(process.env.USERPROFILE, '.local', 'bin', 'gemini.exe'),
+  process.env.HOME && path.join(process.env.HOME, '.local', 'bin', 'gemini')
+].find(file => file && existsSync(file)) || 'gemini';
+
+const geminiMode = (process.env.RELAY_GEMINI_MODE || 'auto').toLowerCase();
 const geminiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
-const geminiModel = process.env.RELAY_GEMINI_MODEL || 'gemini-3.1-flash-lite';
+const geminiApiModel = process.env.RELAY_GEMINI_MODEL || 'gemini-3.8-flash';
+const geminiCliModel = process.env.RELAY_GEMINI_CLI_MODEL ||
+  (process.env.RELAY_GEMINI_MODEL && !/flash-lite/i.test(process.env.RELAY_GEMINI_MODEL) ? process.env.RELAY_GEMINI_MODEL : '');
+const geminiDefaultDailyLimit = Number(process.env.RELAY_GEMINI_DAILY_LIMIT) || 1500;
+
 const codexEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(?:GEMINI_API_KEY|GOOGLE_API_KEY|ANTHROPIC_API_KEY|CODEX_THREAD_ID)$/i.test(key)));
 // Claude Code uses the claude.ai login on this machine, so API keys and nested-session markers are removed.
 const claudeCodeEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
+  !/^(?:GEMINI_API_KEY|GOOGLE_API_KEY|OPENAI_API_KEY|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|CODEX_THREAD_ID|CLAUDECODE|CLAUDE_CODE_ENTRYPOINT)$/i.test(key)));
+// Antigravity CLI (agy) uses the personal Google AI Pro OAuth login when API keys are removed.
+const agyCliEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
   !/^(?:GEMINI_API_KEY|GOOGLE_API_KEY|OPENAI_API_KEY|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|CODEX_THREAD_ID|CLAUDECODE|CLAUDE_CODE_ENTRYPOINT)$/i.test(key)));
 const claudeCodeTools = 'Read,Glob,Grep';
 
@@ -153,6 +175,145 @@ async function claudeCodeTurn(cwd, prompt, schema, signal) {
   throw error;
 }
 
+function runCliBinary(binary, args, { cwd, env, input = '', signal, notFoundMessage }) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(binary, args, { cwd, env, signal, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', chunk => { stdout += chunk; });
+    child.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-2000); });
+    child.on('error', error => reject(error.code === 'ENOENT' ? Error(notFoundMessage) : error));
+    child.stdin.on('error', () => {});
+    child.on('close', code => resolve({ code, stdout, stderr }));
+    child.stdin.end(input);
+  });
+}
+
+function extractJsonObject(raw) {
+  const text = String(raw || '').trim();
+  if (!text) throw Error('ไม่มีข้อมูลตอบกลับ');
+  try { return JSON.parse(text); } catch {}
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced) {
+    try { return JSON.parse(fenced[1].trim()); } catch {}
+  }
+  const first = text.indexOf('{');
+  const last = text.lastIndexOf('}');
+  if (first !== -1 && last > first) {
+    try { return JSON.parse(text.slice(first, last + 1)); } catch {}
+    for (let i = text.lastIndexOf('{', last); i >= first; i = text.lastIndexOf('{', i - 1)) {
+      try { return JSON.parse(text.slice(i, last + 1)); } catch {}
+      if (i === 0) break;
+    }
+  }
+  throw Error('ไม่ได้ส่งผลเป็น JSON ที่ถูกต้อง');
+}
+
+function parseCliJsonOutput(stdout) {
+  const outer = extractJsonObject(stdout);
+  if (outer && typeof outer === 'object') {
+    if (outer.error) {
+      const errMsg = typeof outer.error === 'string' ? outer.error : (outer.error.message || JSON.stringify(outer.error));
+      throw Error(errMsg);
+    }
+    if (outer.structured_output && typeof outer.structured_output === 'object') return outer.structured_output;
+    if (typeof outer.response === 'string') return extractJsonObject(outer.response);
+    if (typeof outer.result === 'string') return extractJsonObject(outer.result);
+  }
+  return outer;
+}
+
+let geminiCli = { ready: false, backend: null, updatedAt: null, note: 'กำลังตรวจการเชื่อมต่อ Gemini / Antigravity CLI' };
+let geminiCliInFlight;
+
+async function geminiCliTurn(cwd, prompt, schema, signal, onUsage) {
+  const backend = geminiCli.backend || 'agy';
+  const binary = backend === 'agy' ? agyBinary : geminiBinary;
+  const label = backend === 'agy' ? 'Antigravity CLI (agy)' : 'Gemini CLI';
+  const instruction = [
+    'Complete the Relay request provided on stdin.',
+    'All required repository context is already included in CONTEXT on stdin; do not modify files or run shell commands.',
+    'Return ONLY a single valid JSON object conforming to this exact JSON Schema (no markdown code fences, no explanation):',
+    JSON.stringify(schema)
+  ].join(' ');
+  const args = ['-p', instruction, '--output-format', 'json'];
+  if (backend === 'agy') args.push('--json-schema', JSON.stringify(schema));
+  if (geminiCliModel) args.push('--model', geminiCliModel);
+  const { code, stdout, stderr } = await runCliBinary(binary, args, {
+    cwd,
+    env: backend === 'agy' ? agyCliEnv : process.env,
+    input: prompt,
+    signal,
+    notFoundMessage: `ไม่พบคำสั่ง ${backend} ติดตั้ง Antigravity CLI (irm https://antigravity.google/cli/install.ps1 | iex) หรือตั้งค่า GEMINI_API_KEY`
+  });
+  if (code === 0) onUsage?.();
+  try {
+    if (code !== 0 && !stdout.trim()) throw Error(stderr.trim() || `exit ${code}`);
+    return parseCliJsonOutput(stdout);
+  } catch (parseError) {
+    const detail = String(stderr || stdout || parseError.message || `exit ${code}`).trim();
+    if (/auth|login|credential|unauthenticated|sign in|no longer supported/i.test(detail)) {
+      geminiCli = {
+        ready: false,
+        backend,
+        updatedAt: Date.now(),
+        note: 'ต้องลงชื่อเข้าใช้ด้วยคำสั่ง agy ใน PowerShell (หรือตั้งค่า GEMINI_API_KEY ใน .env)'
+      };
+    }
+    const error = Error(`${label} (exit ${code}): ${detail.slice(0, 700)}`);
+    if (/usage limit|rate limit|quota|resource_exhausted|overloaded|429/i.test(detail)) error.cooldown = 15 * 60_000;
+    throw error;
+  }
+}
+
+export function refreshGemini(cwd = process.cwd()) {
+  if (geminiMode === 'api') {
+    geminiCli = { ready: Boolean(geminiKey), backend: 'api', updatedAt: Date.now(), note: geminiKey ? '' : 'ต้องตั้งค่า GEMINI_API_KEY' };
+    return Promise.resolve();
+  }
+  geminiCliInFlight ??= (async () => {
+    // 1. Check Antigravity CLI (agy) — Google's official CLI for Google AI Pro OAuth since June 2026
+    const agyCheck = await runCliBinary(agyBinary, ['--version'], {
+      cwd,
+      env: agyCliEnv,
+      signal: AbortSignal.timeout(8_000),
+      notFoundMessage: 'ไม่พบ agy'
+    }).catch(() => ({ code: -1 }));
+    if (agyCheck.code === 0) {
+      geminiCli = { ready: true, backend: 'agy', updatedAt: Date.now(), note: '' };
+      return;
+    }
+    // 2. If GEMINI_API_KEY is set, use direct Gemini API (or Gemini CLI with API key)
+    if (geminiKey) {
+      geminiCli = { ready: true, backend: 'api', updatedAt: Date.now(), note: '' };
+      return;
+    }
+    // 3. Fallback: check standalone gemini CLI
+    const gemCheck = await runCliBinary(geminiBinary, ['--version'], {
+      cwd,
+      env: process.env,
+      signal: AbortSignal.timeout(8_000),
+      notFoundMessage: 'ไม่พบ gemini'
+    }).catch(() => ({ code: -1 }));
+    if (gemCheck.code === 0) {
+      geminiCli = {
+        ready: false,
+        backend: 'gemini',
+        updatedAt: Date.now(),
+        note: 'Gemini CLI ยกเลิกล็อกอินบัญชี AI Pro แล้ว ให้ติดตั้ง Antigravity CLI (agy) หรือใส่ GEMINI_API_KEY ใน .env'
+      };
+      return;
+    }
+    geminiCli = {
+      ready: false,
+      backend: null,
+      updatedAt: Date.now(),
+      note: 'ติดตั้ง Antigravity CLI (irm https://antigravity.google/cli/install.ps1 | iex) หรือใส่ GEMINI_API_KEY ใน .env'
+    };
+  })().finally(() => { geminiCliInFlight = null; });
+  return geminiCliInFlight;
+}
+
 let claudeCode = { ready: false, windows: [], updatedAt: null, note: 'กำลังตรวจการเชื่อมต่อ' };
 let claudeCodeInFlight;
 const claudeCodeLimitLabels = { session: '5 ชม.', weekly_all: '7 วัน' };
@@ -175,6 +336,7 @@ async function readClaudeCodeLimits(cwd) {
 }
 
 export function refreshClaudeCode(cwd) {
+  void refreshGemini(cwd);
   claudeCodeInFlight ??= (async () => {
     const { code, stdout } = await runClaudeCode(['auth', 'status'], { cwd, signal: AbortSignal.timeout(15_000) });
     let status = {};
@@ -210,6 +372,8 @@ export function refreshCodex(cwd) {
   return refreshInFlight;
 }
 
+void refreshGemini();
+
 const quotaDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit', day: '2-digit' });
 export const pacificDay = date => quotaDate.format(date);
 function dailyReset(now) {
@@ -224,31 +388,62 @@ function dailyReset(now) {
   return high;
 }
 
+function shouldUseCli() {
+  if (geminiMode === 'api') return false;
+  if (geminiMode === 'cli' || geminiMode === 'agy') return true;
+  if (geminiCli.backend === 'agy' && geminiCli.ready) return true;
+  if (geminiKey) return false;
+  return geminiCli.ready;
+}
+
 export function quota(settings, usage, now = Date.now()) {
-  const daily = settings.geminiDailyLimit;
+  const useCli = shouldUseCli();
+  const daily = settings.geminiDailyLimit || ((useCli || geminiKey) ? geminiDefaultDailyLimit : 0);
   const used = usage[pacificDay(now)] || 0;
+  const ready = useCli ? geminiCli.ready : Boolean(geminiKey);
+  const mode = useCli
+    ? (geminiCli.backend === 'agy' ? 'Antigravity CLI (Google AI Pro)' : 'Gemini CLI')
+    : 'Gemini API';
+  const note = useCli
+    ? (geminiCli.ready
+      ? (settings.geminiDailyLimit ? 'นับเฉพาะคำขอจาก Relay' : `โควตา AI Pro ${daily} คำขอ/วัน (นับเฉพาะ Relay)`)
+      : geminiCli.note)
+    : (geminiKey ? (settings.geminiDailyLimit ? 'นับเฉพาะคำขอจาก Relay' : `เพดานเริ่มต้น ${daily} คำขอ/วัน (นับเฉพาะ Relay)`) : geminiCli.note || 'ต้องตั้งค่า GEMINI_API_KEY');
   return {
     claudecode: { name: names.claudecode, mode: 'Claude Code CLI', source: 'provider', ...claudeCode },
-    gemini: { name: names.gemini, ready: Boolean(geminiKey), mode: 'Gemini API', source: 'estimate', updatedAt: now,
-      windows: daily ? [{ label: `${used} / ${daily} คำขอต่อวัน`, remaining: Math.max(0, (daily - used) / daily * 100), resetAt: dailyReset(now) }] : [],
-      note: geminiKey ? (daily ? 'นับเฉพาะคำขอจาก Relay' : 'ตั้งเพดานคำขอต่อวันในหน้าตั้งค่า') : 'ต้องตั้งค่า GEMINI_API_KEY' },
+    gemini: {
+      name: names.gemini,
+      ready,
+      mode,
+      source: 'estimate',
+      updatedAt: now,
+      windows: (ready && daily) ? [{ label: `${used} / ${daily} คำขอต่อวัน`, remaining: Math.max(0, (daily - used) / daily * 100), resetAt: dailyReset(now) }] : [],
+      note
+    },
     codex: { name: names.codex, mode: 'Codex App Server', source: 'provider', ...codex }
   };
 }
 
-
 export async function generate(provider, cwd, prompt, schema, jobSignal, onUsage) {
-  const signal = AbortSignal.any([jobSignal, AbortSignal.timeout(provider === 'claudecode' ? 900_000 : 240_000)]);
+  if (provider === 'gemini' && !geminiCli.updatedAt) await refreshGemini(cwd);
+  const useCli = provider === 'gemini' && shouldUseCli();
+  const timeoutMs = (provider === 'claudecode' || useCli) ? 900_000 : 240_000;
+  const signal = AbortSignal.any([jobSignal, AbortSignal.timeout(timeoutMs)]);
   let output;
   if (provider === 'claudecode') {
     const result = await claudeCodeTurn(cwd, prompt, schema, signal);
     if (!validate(result, schema)) throw Error(names[provider] + ' ส่งข้อมูลไม่ตรงกับรูปแบบที่กำหนด');
     return result;
   }
+  if (provider === 'gemini' && useCli) {
+    const result = await geminiCliTurn(cwd, prompt, schema, signal, onUsage);
+    if (!validate(result, schema)) throw Error(names[provider] + ' ส่งข้อมูลไม่ตรงกับรูปแบบที่กำหนด');
+    return result;
+  }
   if (provider === 'codex') {
     output = await codexTurn(cwd, prompt, schema, signal);
   } else {
-    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(geminiModel)}:generateContent`, {
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(geminiApiModel)}:generateContent`, {
       method: 'POST', signal,
       headers: { 'content-type': 'application/json', 'x-goog-api-key': geminiKey },
       body: JSON.stringify({
