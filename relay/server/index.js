@@ -4,7 +4,7 @@ import { execFile, spawn as spawnShell } from 'node:child_process';
 import { promisify } from 'node:util';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { realpath } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { applyEdits, applyFiles, attemptChanges, attemptState, checkpoint, git, isSafePath, repository, restoreAttempt, snapshot } from './git.js';
@@ -370,7 +370,7 @@ const roleLabel = (job, role) => job.single && role === 'backend' ? 'the' : 'onl
 const scopeText = job => job.scope ? '\nScope rule enforced by Relay: change only ' + (job.scope.include?.length ? 'files matching ' + job.scope.include.join(', ') : 'files outside the excluded paths') +
   (job.scope.exclude?.length ? '; never change ' + job.scope.exclude.join(', ') : '') + '. Changes outside this scope are rejected.' : '';
 const agentEditPrompt = (job, role) => `Implement ${roleLabel(job, role)} part of the task; respect the agreed interface.
-Edit the files directly in the current working directory with your file tools. Read what you need first. Do not run shell commands, do not commit, and do not touch files outside this directory or secrets such as .env.
+Edit the files directly in the current working directory with your file tools. Read what you need first. Do not run shell commands, do not commit, and do not touch files outside this directory, dependency folders such as node_modules, or secrets such as .env.
 Then return the schema: summary of what you changed, status "done" (or "no_work" if this part has nothing to do, or "blocked" if you cannot do it safely, with the reason), and empty "files" and "edits" arrays.` + scopeText(job);
 const editPrompt = role => `Implement only the ${role} part of the task; respect the agreed interface.
 To change an existing file, prefer "edits": each item has the file path, a "find" snippet copied exactly from the current file (unique in that file, a few whole lines) and its "replace" text. Use "files" with complete content only for new files or small files you rewrite entirely; never list a file in both.
@@ -557,6 +557,44 @@ async function verify(job, cwd, signal) {
   return results;
 }
 
+const isLink = name => { try { return lstatSync(name).isSymbolicLink(); } catch { return false; } };
+
+// node_modules folders of the user's checkout: at the root and one level down (a package in a subfolder, like relay/).
+function dependencyDirs(repo) {
+  const found = ['node_modules'];
+  let entries = [];
+  try { entries = readdirSync(repo, { withFileTypes: true }); } catch {}
+  for (const entry of entries) {
+    if (entry.isDirectory() && !entry.name.startsWith('.') && entry.name !== 'node_modules' &&
+      existsSync(path.join(repo, entry.name, 'package.json'))) found.push(entry.name + '/node_modules');
+  }
+  return found;
+}
+
+// Link the checkout's installed dependencies into a job worktree so checks and agents can use them without reinstalling.
+// Only folders git ignores are linked, so they never count as changes. Links are junctions on Windows.
+async function linkDependencies(job, cwd) {
+  const linked = [];
+  for (const relative of dependencyDirs(job.repo)) {
+    const source = path.join(job.repo, ...relative.split('/'));
+    const target = path.join(cwd, ...relative.split('/'));
+    if (!existsSync(source) || isLink(source) || existsSync(target) || isLink(target) || !existsSync(path.dirname(target))) continue;
+    // The trailing slash makes git treat the (not yet linked) path as a folder, so 'node_modules/' patterns match.
+    const ignored = await git(cwd, 'check-ignore', '-q', '--', relative + '/').then(() => true, () => false);
+    if (!ignored) continue;
+    try { symlinkSync(source, target, 'junction'); linked.push(relative); } catch {}
+  }
+  return linked;
+}
+
+// Remove the links (never their targets) before a worktree folder is deleted.
+function unlinkDependencies(cwd) {
+  for (const relative of dependencyDirs(cwd)) {
+    const target = path.join(cwd, ...relative.split('/'));
+    if (isLink(target)) { try { rmSync(target, { force: true }); } catch {} }
+  }
+}
+
 async function runChecks(job, cwd, signal) {
   if (job.checkCommands?.length) return runCommands(job, cwd, signal);
   let manifest = readCheckManifest(cwd);
@@ -574,7 +612,10 @@ async function runChecks(job, cwd, signal) {
   if (!manifest) return [{ label: 'package.json', code: null, output: 'ไม่พบ package.json สำหรับทดสอบ และโปรเจกต์นี้ยังไม่ได้ตั้งคำสั่งทดสอบ' }];
   if (!steps.length) return [{ label: 'npm', code: null, output: 'ไม่พบสคริปต์ test หรือ build' }];
   const results = [];
-  if (Object.keys({ ...manifest.dependencies, ...manifest.devDependencies }).length) {
+  const linkedModules = isLink(path.join(cwd, ...(prefix.length ? [prefix[1]] : []), 'node_modules'));
+  // A linked node_modules is the user's own folder: never reinstall into it (npm ci would empty it).
+  if (linkedModules) addEvent(job, 'ทดสอบ', 'ใช้ node_modules จากโปรเจกต์ ไม่ต้องติดตั้งใหม่');
+  else if (Object.keys({ ...manifest.dependencies, ...manifest.devDependencies }).length) {
     addEvent(job, 'ทดสอบ', 'เตรียม dependencies จาก lockfile');
     const install = await npm(cwd, [...prefix, 'ci', '--ignore-scripts', '--no-audit', '--no-fund'], signal);
     if (install.code !== 0) return [install];
@@ -638,6 +679,8 @@ async function work(job, signal) {
   }
   job.worktree = integrated;
   addEvent(job, 'Git worktree', integrated);
+  const linked = await linkDependencies(job, integrated);
+  if (linked.length) addEvent(job, 'Git worktree', 'ลิงก์ dependencies จากโปรเจกต์ (ไม่ติดตั้งใหม่): ' + linked.join(', '));
   const original = await snapshot(integrated);
   signal.throwIfAborted();
   finishStage(job, 'prepare', 'done');
@@ -685,6 +728,7 @@ async function work(job, signal) {
       }
       save();
       for (const role of ['backend', 'frontend']) {
+        unlinkDependencies(path.join(workRoot, role));
         await git(job.repo, 'worktree', 'remove', '--force', path.join(workRoot, role)).catch(() => {});
         await git(job.repo, 'worktree', 'prune').catch(() => {});
         await git(job.repo, 'branch', '-D', job.branch + '-' + role).catch(() => {});
@@ -904,6 +948,7 @@ async function build(job, signal, workRoot, integrated, tracked) {
     try {
       await git(job.repo, 'worktree', 'add', '-b', branch, cwd, job.base);
       created = true;
+      await linkDependencies(job, cwd);
       signal.throwIfAborted();
       const tasks = subtasksFor(job, role);
       if (tasks) return await runTeam(job, role, cwd, branch, tracked, signal, tasks);
@@ -917,6 +962,7 @@ async function build(job, signal, workRoot, integrated, tracked) {
     } finally {
       if (created) {
         // Windows can keep the folder locked briefly after the AI process exits, so retry once.
+        unlinkDependencies(cwd);
         await git(job.repo, 'worktree', 'remove', '--force', cwd)
           .catch(() => new Promise(resolve => setTimeout(resolve, 1500)).then(() => git(job.repo, 'worktree', 'remove', '--force', cwd)))
           .catch(error => addEvent(job, 'Git worktree', error.message.slice(0, 500)));
@@ -1419,7 +1465,9 @@ async function rebuildSelf(job, from, to) {
 const busy = job => ['queued', 'running', 'stopping', 'waiting_approval'].includes(job.status);
 async function cleanup(job, deleteBranch) {
   // Remove every folder for this job (including role worktrees left by a failed removal), then let git forget them.
-  rmSync(path.join(dataDir, 'worktrees', job.id), { recursive: true, force: true, maxRetries: 3, retryDelay: 300 });
+  const jobRoot = path.join(dataDir, 'worktrees', job.id);
+  if (existsSync(jobRoot)) for (const entry of readdirSync(jobRoot)) unlinkDependencies(path.join(jobRoot, entry));
+  rmSync(jobRoot, { recursive: true, force: true, maxRetries: 3, retryDelay: 300 });
   await git(job.repo, 'worktree', 'prune').catch(() => {});
   for (const role of ['backend', 'frontend']) await git(job.repo, 'branch', '-D', job.branch + '-' + role).catch(() => {});
   const hadBranch = Boolean(job.worktree || job.branchKept);
