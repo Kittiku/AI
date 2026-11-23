@@ -56,14 +56,16 @@ function writeStorage(key, value) {
   try { value === null ? localStorage.removeItem(key) : localStorage.setItem(key, JSON.stringify(value)); } catch {}
 }
 
-async function api(url, method = 'GET', body) {
-  const response = await fetch('/api' + url, method === 'GET' ? {} : {
+async function api(url, method = 'GET', body, options) {
+  const response = await fetch('/api' + url, method === 'GET' ? options : {
     method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body ?? {})
   });
   const result = await response.json();
   if (!response.ok) throw Object.assign(Error(result.error || 'เชื่อมต่อเซิร์ฟเวอร์ไม่สำเร็จ'), { data: result, status: response.status });
   return result;
 }
+
+const readState = signal => api('/state', 'GET', undefined, { signal, cache: 'no-store' });
 
 function Button({ children, icon: Icon, primary, danger, ...props }) {
   return <button type="button" className={'button' + (primary ? ' primary' : '') + (danger ? ' danger' : '')} {...props}>
@@ -167,6 +169,8 @@ const monitorConnections = {
   connecting: 'กำลังเชื่อมต่อ', live: 'สด', polling: 'อัปเดตเป็นระยะ', stale: 'ข้อมูลล่าสุดอาจล้าสมัย'
 };
 const approvalLabels = { plan: 'รออนุมัติแผน', budget: 'รออนุมัติงบงาน', daily_budget: 'รออนุมัติงบรายวัน' };
+const sameApproval = (first, second) => Number.isFinite(first?.requestedAt) &&
+  first.kind === second?.kind && first.requestedAt === second?.requestedAt;
 const workKeys = new Set(['backend', 'frontend']);
 const monitorClock = new Intl.DateTimeFormat('th-TH', {
   timeZone: 'Asia/Bangkok', hour: '2-digit', minute: '2-digit', second: '2-digit'
@@ -192,8 +196,10 @@ function useMonitor() {
     let pollTimer;
     let request;
     let live = false;
+    let latestUpdatedAt = -Infinity;
 
     function applySnapshot(snapshot, connection) {
+      latestUpdatedAt = snapshot.updatedAt;
       setMonitor({ snapshot, receivedAt: Date.now(), connection });
     }
 
@@ -214,7 +220,16 @@ function useMonitor() {
         if (!response.ok) throw Error('Monitor unavailable');
         const snapshot = await response.json();
         if (!isMonitorSnapshot(snapshot)) throw Error('Invalid monitor snapshot');
-        if (request === controller && !controller.signal.aborted) applySnapshot(snapshot, 'polling');
+        if (request !== controller || controller.signal.aborted) return;
+        // A fresh, uncached poll can establish a lower baseline after a server restart.
+        // Reopen the stream so frames from the previous connection cannot cross that baseline.
+        if (snapshot.updatedAt < latestUpdatedAt && stream) {
+          stream.close();
+          stream = undefined;
+          clearTimeout(watchdog);
+          reconnectTimer = setTimeout(connect, 0);
+        }
+        applySnapshot(snapshot, 'polling');
       } catch {
         if (request === controller) setMonitor(previous => ({ ...previous, connection: 'stale' }));
       } finally {
@@ -250,7 +265,7 @@ function useMonitor() {
         if (disposed || stream !== source) return;
         let snapshot;
         try { snapshot = JSON.parse(event.data); } catch { return; }
-        if (!isMonitorSnapshot(snapshot)) return;
+        if (!isMonitorSnapshot(snapshot) || snapshot.updatedAt < latestUpdatedAt) return;
         live = true;
         stopPolling();
         watchStream();
@@ -844,14 +859,31 @@ function ApprovalPanel({ job, panelRef }) {
   const [note, setNote] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  const plan = job.approval.kind === 'plan' ? job.plan : null;
+  const verification = useRef(null);
+  const { kind, requestedAt } = job.approval;
+  const plan = kind === 'plan' ? job.plan : null;
+  useEffect(() => () => verification.current?.abort(), []);
   async function decide(decision) {
+    if (busy || verification.current) return;
     if (decision === 'revise' && !note.trim()) { setError('บอกด้วยว่าต้องการให้แก้แผนตรงไหน'); return; }
     if (decision === 'reject' && !confirm('หยุดงานนี้?')) return;
+    const controller = new AbortController();
+    verification.current = controller;
     setBusy(true); setError('');
-    try { await api('/jobs/' + job.id + '/approve', 'POST', { decision, note }); setNote(''); }
-    catch (error) { setError(error.message); }
-    finally { setBusy(false); }
+    try {
+      const { jobs } = await readState(controller.signal);
+      if (controller.signal.aborted) return;
+      const current = jobs.find(item => item.id === job.id);
+      if (current?.status !== 'waiting_approval' || !sameApproval(job.approval, current.approval)) {
+        setError('คำขออนุมัติเปลี่ยนแล้ว รอรายละเอียดล่าสุดก่อนส่งคำตอบ');
+        return;
+      }
+      await api('/jobs/' + job.id + '/approve', 'POST', { decision, note, kind, requestedAt });
+    } catch (error) {
+      if (!controller.signal.aborted) { setError(error.message); setBusy(false); }
+    } finally {
+      verification.current = null;
+    }
   }
   return <section ref={panelRef} tabIndex={-1} className="card approval-panel" aria-label="รออนุมัติ">
     <h2>{plan ? 'ตรวจแผนก่อนลงมือ' : 'ถึงงบที่ตั้งไว้'}</h2>
@@ -885,8 +917,8 @@ function JobDetail({ job, projectName, monitor, approvalRequested, onApproval, o
   const status = liveJob?.status ?? finishedJob?.status ?? job.status;
   const finishedAt = finishedJob?.finishedAt ?? job.finishedAt;
   const busy = busyStatuses.has(status);
-  const showApproval = Boolean(job.approval && (liveJob
-    ? liveJob.approval?.kind === job.approval.kind : !snapshot && job.status === 'waiting_approval'));
+  const showApproval = job.status === 'waiting_approval' && Number.isFinite(job.approval?.requestedAt) &&
+    (job.approval.kind !== 'plan' || Boolean(job.plan)) && (!snapshot || sameApproval(job.approval, liveJob?.approval));
   const hasResult = Boolean(job.worktree || job.branchKept || job.merged);
   useEffect(() => {
     if (!approvalRequested || !showApproval) return;
@@ -918,7 +950,7 @@ function JobDetail({ job, projectName, monitor, approvalRequested, onApproval, o
         <Stepper job={{ ...job, status }} inactive={Boolean(snapshot) || !busy || status === 'queued'} />
       </div>
     </LiveMonitor>
-    {showApproval ? <ApprovalPanel job={job} panelRef={approvalRef} /> : null}
+    {showApproval ? <ApprovalPanel key={job.approval.kind + ':' + job.approval.requestedAt} job={job} panelRef={approvalRef} /> : null}
     <div className="detail-grid">
       <section className="card detail">
         <div className="filters"><button aria-pressed={tab === 'events'} onClick={() => { setTab('events'); setError(''); }}>ประวัติการทำงาน</button>
@@ -1173,19 +1205,25 @@ function App() {
   const [dialog, setDialog] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
   const [settingsDirty, setSettingsDirty] = useState(false);
+  const { snapshot, connection } = monitor;
+  const activeJob = snapshot?.activeJob;
+  const approvalJobId = activeJob?.approval ? activeJob.id : null;
+  const approvalKind = activeJob?.approval?.kind;
+  const approvalRequestedAt = activeJob?.approval?.requestedAt;
   useEffect(() => {
-    let disposed = false;
+    const controller = new AbortController();
+    const { signal } = controller;
     let timer;
     async function poll() {
       try {
-        const next = await api('/state');
-        if (!disposed) { setData(next); setNetworkError(''); }
-      } catch (error) { if (!disposed) setNetworkError(error.message); }
-      if (!disposed) timer = window.setTimeout(poll, 2200);
+        const next = await readState(signal);
+        if (!signal.aborted) { setData(next); setNetworkError(''); }
+      } catch (error) { if (!signal.aborted) setNetworkError(error.message); }
+      if (!signal.aborted) timer = window.setTimeout(poll, 2200);
     }
     void poll();
-    return () => { disposed = true; clearTimeout(timer); };
-  }, []);
+    return () => { controller.abort(); clearTimeout(timer); };
+  }, [approvalJobId, approvalKind, approvalRequestedAt]);
   useEffect(() => {
     if (!settingsDirty) return;
     const warn = event => { event.preventDefault(); event.returnValue = ''; };
@@ -1218,7 +1256,6 @@ function App() {
   const removeProject = id => setData(previous => ({ ...previous, projects: previous.projects.filter(item => item.id !== id) }));
   const job = jobs.find(item => item.id === selection);
   const projectName = job && (projects.find(project => samePath(project.path, job.repo))?.name || repoName(job.repo));
-  const { snapshot, connection } = monitor;
   const currentSnapshot = connection === 'stale' ? null : snapshot;
   const runningCount = currentSnapshot ? Number(Boolean(currentSnapshot.activeJob)) :
     jobs.filter(item => ['running', 'stopping', 'waiting_approval'].includes(item.status)).length;
