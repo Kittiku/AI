@@ -497,32 +497,438 @@ details.fact summary::marker { color: var(--muted); }
 .repo-info.bad { color: var(--bad); background: var(--bad-soft); border-color: var(--bad-line); }
 
 /* ---------- Projects ---------- */
-.add-project { padding: 18px 20px 20px; max-width: 900px; }
-.add-project h2, .section-head h2 { font-size: 16px; font-weight: 720; }
-.add-project label { margin-top: 12px; }
-.add-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: end; }
-.init-panel { margin-top: 14px; padding: 12px 14px; border-radius: 11px; background: #fffaf0; border: 1px solid var(--warn-line); }
-.init-panel p { margin-top: 6px; font-size: 13px; color: var(--ink-2); line-height: 1.5; }
-.section-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin: 24px 0 12px; }
-.projects { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 14px; }
-.project { padding: 16px 18px; min-width: 0; display: flex; flex-direction: column; }
-.project .action-row { margin-top: auto; padding-top: 14px; }
-.project-head { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 12px; align-items: center; }
-.project-head h2 { font-size: 16px; overflow-wrap: anywhere; }
-.project-head p { color: var(--muted); font-size: 12px; margin-top: 2px; overflow-wrap: anywhere; font-family: var(--mono); }
-.project-icon { width: 40px; height: 40px; color: var(--info); background: var(--info-soft); }
-.project-jobs { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); margin-top: 10px; }
-.checks-editor { margin-top: 12px; }
-.checks-editor textarea { font: 12.5px/1.5 var(--mono); }
-.checks-list { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); font-size: 13px; color: var(--muted); }
-.checks-list strong { color: var(--ink-2); font-size: 12.5px; }
-.checks-list code { display: block; margin-top: 3px; color: var(--ink); overflow-wrap: anywhere; font-size: 12px; }
-.notes-text { margin-top: 4px; color: var(--ink-2); font-size: 12.5px; max-height: 8.5em; overflow: auto; }
-.memory { margin-top: 10px; font-size: 12.5px; }
-.memory ul { padding-left: 18px; margin-top: 6px; }
-.memory li { color: var(--muted); margin-top: 4px; }
-.memory li strong { color: var(--ink); }
-.memory li small { display: block; overflow-wrap: anywhere; }
+.projects-page {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+.projects-toolbar {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+.projects-toolbar h2 {
+  font-size: clamp(18px, 2vw, 24px);
+  font-weight: 750;
+  letter-spacing: -.02em;
+  overflow-wrap: anywhere;
+}
+.projects-toolbar-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.projects-search {
+  position: relative;
+  flex: 1 1 220px;
+  min-width: 0;
+  max-width: 420px;
+  margin-inline-end: auto;
+}
+.projects-search > svg {
+  position: absolute;
+  inset-inline-start: 11px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--muted);
+  pointer-events: none;
+}
+.projects-search input {
+  padding-inline-start: 36px;
+  min-height: 38px;
+}
+.projects-page .button,
+.project-modal .button {
+  max-width: 100%;
+  min-width: 0;
+  min-height: 38px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.projects-page .button svg,
+.project-modal .button svg {
+  flex: none;
+}
+
+.projects-split {
+  display: grid;
+  grid-template-columns: minmax(0, 42fr) minmax(0, 58fr);
+  gap: 16px;
+}
+.projects-list-pane,
+.projects-detail-pane {
+  min-width: 0;
+}
+.projects-list {
+  display: grid;
+  gap: 4px;
+  padding: 8px;
+  list-style: none;
+}
+.projects-list > li,
+.project-row-main {
+  min-width: 0;
+}
+.project-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) fit-content(42%);
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 10px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  text-align: start;
+}
+.project-row:hover {
+  border-color: var(--line);
+  background: var(--surface-2);
+}
+.project-row[aria-pressed="true"] {
+  border-color: var(--brand);
+  background: var(--brand-soft);
+  color: var(--brand-ink);
+}
+.project-row:focus-visible {
+  outline-offset: -4px;
+}
+.project-icon {
+  width: 42px;
+  height: 42px;
+  border-radius: var(--radius-sm);
+  background: var(--brand-soft);
+  color: var(--brand);
+}
+.project-row .project-icon {
+  width: 34px;
+  height: 34px;
+}
+.project-row[aria-pressed="true"] .project-icon {
+  background: var(--surface);
+}
+.project-row strong,
+.project-row-path {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.project-row strong {
+  font-weight: 680;
+}
+.project-row-path,
+.project-detail-path {
+  margin-top: 2px;
+  color: var(--muted);
+  font: 12px/1.5 var(--mono);
+}
+.project-row .status,
+.project-jobs .status {
+  justify-self: end;
+  min-width: 0;
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.projects-page .status::before {
+  flex: none;
+}
+
+.projects-detail-pane {
+  padding: clamp(14px, 2vw, 22px);
+  overflow-wrap: anywhere;
+}
+.project-detail-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.project-head {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 12px;
+  flex: 1 1 14rem;
+  min-width: 0;
+}
+.project-head h2 {
+  font-size: clamp(18px, 2vw, 23px);
+}
+.project-detail-actions {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
+  margin-top: 0;
+}
+.project-actions-menu {
+  position: relative;
+  min-width: 0;
+  max-width: 100%;
+  margin-inline-start: auto;
+}
+.project-actions-menu > summary {
+  display: flex;
+  list-style: none;
+}
+.project-actions-menu > summary::-webkit-details-marker {
+  display: none;
+}
+.project-actions-menu[open] > summary {
+  color: var(--brand-ink);
+  border-color: var(--brand);
+  background: var(--brand-soft);
+}
+.project-actions-menu-content {
+  position: absolute;
+  inset-block-start: calc(100% + 6px);
+  inset-inline-end: 0;
+  z-index: 2;
+  width: 12rem;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  box-shadow: var(--shadow-lg);
+}
+.project-actions-menu-content .button {
+  width: 100%;
+  justify-content: flex-start;
+  text-align: start;
+}
+.project-actions-menu-content [aria-disabled="true"] {
+  opacity: .5;
+  cursor: default;
+}
+
+.project-detail-section {
+  margin-top: 14px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+.project-detail-section h3 {
+  font-size: 14px;
+  font-weight: 700;
+}
+.project-git {
+  background: var(--surface-2);
+}
+.project-git-status {
+  gap: 4px 8px;
+}
+.project-git-status svg,
+.project-dirty-warning svg {
+  flex: none;
+}
+.project-commit {
+  margin-top: 8px;
+  color: var(--ink-2);
+  font-size: 13px;
+}
+.project-commit > span {
+  color: var(--muted);
+}
+.project-commit code {
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: var(--brand-soft);
+  color: var(--brand-ink);
+  box-decoration-break: clone;
+}
+.project-dirty-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  margin-top: 8px;
+  padding: 6px 10px;
+  border: 1px solid var(--warn-line);
+  border-radius: var(--radius-sm);
+  background: var(--warn-soft);
+  font-size: 13px;
+}
+.project-jobs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 13px;
+}
+.project-jobs .link {
+  min-width: 0;
+  max-width: 100%;
+  text-align: start;
+  overflow-wrap: anywhere;
+}
+
+.projects-detail-pane .checks-list,
+.projects-detail-pane .checks-editor {
+  min-width: 0;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+.projects-detail-pane .checks-list {
+  color: var(--muted);
+  font-size: 13px;
+}
+.projects-detail-pane .checks-list strong {
+  color: var(--ink-2);
+  font-size: 13.5px;
+}
+.projects-detail-pane .checks-list code {
+  display: block;
+  margin-top: 4px;
+  color: var(--ink);
+  white-space: pre-wrap;
+}
+.projects-detail-pane .checks-list > div {
+  margin-top: 5px;
+}
+.projects-detail-pane .checks-editor textarea {
+  font: 12.5px/1.5 var(--mono);
+}
+.projects-detail-pane .notes-text {
+  margin-top: 4px;
+  color: var(--ink-2);
+  font-size: 12.5px;
+  max-height: 8.5em;
+  overflow: auto;
+}
+.project-collapsible {
+  margin-top: 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+.project-collapsible summary {
+  padding: 9px 11px;
+  border-radius: var(--radius-sm);
+  color: var(--ink-2);
+  font-weight: 650;
+}
+.project-collapsible summary:hover,
+.project-collapsible[open] summary {
+  color: var(--brand-ink);
+}
+.project-collapsible summary::marker {
+  color: var(--brand);
+}
+.project-collapsible > ul {
+  padding: 0 12px 10px 28px;
+}
+.project-collapsible li {
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+.project-collapsible li strong {
+  color: var(--ink);
+}
+.project-collapsible li small {
+  display: block;
+  font-size: inherit;
+}
+.project-collapsible > p {
+  margin: 0;
+  padding: 0 11px 10px;
+}
+.project-empty-state {
+  min-width: 0;
+  min-height: 220px;
+  overflow-wrap: anywhere;
+}
+
+.project-modal-backdrop {
+  --project-modal-gutter: clamp(12px, 3vw, 24px);
+  grid-template-columns: minmax(0, 1fr);
+  padding: var(--project-modal-gutter);
+}
+.project-modal {
+  min-width: 0;
+  max-height: calc(100dvh - 2 * var(--project-modal-gutter));
+  padding: clamp(14px, 4vw, 24px);
+  overscroll-behavior: contain;
+  overflow-wrap: anywhere;
+}
+.project-modal header .icon-button {
+  flex: none;
+}
+.project-modal footer {
+  flex-wrap: wrap;
+}
+.project-modal .add-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 8px;
+  margin-top: 14px;
+}
+.project-modal .add-row label {
+  min-width: 0;
+  margin-top: 0;
+}
+.project-modal .init-panel {
+  margin-top: 14px;
+  padding: 12px;
+  border: 1px solid var(--warn-line);
+  border-radius: var(--radius-sm);
+  background: var(--warn-soft);
+}
+.project-modal .init-panel p {
+  margin-top: 6px;
+  color: var(--ink-2);
+  font-size: 13px;
+}
+.project-modal > .error,
+.project-modal > .success {
+  margin-top: 12px;
+}
+.project-modal > .success {
+  padding: 9px 12px;
+  border: 1px solid var(--ok-line);
+  border-radius: var(--radius-sm);
+  background: var(--ok-soft);
+}
+
+@media (max-width: 760px) {
+  .projects-split {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 12px;
+  }
+  .projects-list {
+    max-height: min(48dvh, 24rem);
+    overflow-y: auto;
+  }
+}
+@media (max-width: 590px) {
+  .projects-search {
+    flex-basis: 100%;
+    max-width: none;
+    margin-inline-end: 0;
+  }
+  .project-row-path {
+    overflow-wrap: anywhere;
+    white-space: normal;
+  }
+  .project-head,
+  .project-detail-actions {
+    flex-basis: 100%;
+  }
+  .project-modal .add-row {
+    grid-template-columns: minmax(0, 1fr);
+    justify-items: start;
+  }
+  .project-modal .add-row label {
+    width: 100%;
+  }
+}
 
 /* ---------- Quota page ---------- */
 .providers { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; align-items: stretch; }
@@ -615,7 +1021,7 @@ details.fact summary::marker { color: var(--muted); }
   .job-tags { justify-content: flex-start; }
   .monitor-summary { grid-template-columns: minmax(0, 1fr); }
   .monitor-summary-right { align-items: center; flex-direction: row; flex-wrap: wrap; gap: 8px 12px; }
-  .settings-grid, .add-row, .projects { grid-template-columns: minmax(0, 1fr); }
+  .settings-grid { grid-template-columns: minmax(0, 1fr); }
   .row-warning { grid-column: 1 / -1; }
   .provider-head { grid-template-columns: auto 1fr auto; }
   .settings { padding: 16px 14px 0; }
