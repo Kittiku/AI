@@ -3,9 +3,10 @@ import { createRoot } from 'react-dom/client';
 import '@fontsource-variable/inter';
 import '@fontsource-variable/noto-sans-thai';
 import {
-  ArrowRight, ChartPie, Check, ChevronLeft, ClipboardList, CodeXml, Copy, FlaskConical, FolderGit2, FolderOpen, FolderPlus,
-  TriangleExclamationPoint, CircleCheck, Clock, GitBranch, Layers, LayoutDashboard, Plus, RefreshCw, RotateCcw, Settings, Sparkle, Terminal, Trash, Wrench, X
+  ArrowRight, ChartPie, Check, ChevronLeft, ClipboardList, CodeXml, Copy, Ellipsis, FlaskConical, FolderGit2, FolderOpen, FolderPlus,
+  TriangleExclamationPoint, CircleCheck, Clock, GitBranch, Layers, LayoutDashboard, Plus, RefreshCw, RotateCcw, Search, Settings, Sparkle, Terminal, Trash, Wrench, X
 } from 'lucide-react';
+import AddProjectModal from './AddProjectModal.jsx';
 import './style.css';
 
 const providers = {
@@ -1400,45 +1401,103 @@ function ChecksEditor({ project, updated }) {
   </div>;
 }
 
-function ProjectCard({ project, info, jobs, createJob, removed, select, updated }) {
+function ProjectDetail({ project, info, projectJobs, createJob, removed, select, updated }) {
   const [error, setError] = useState('');
-  const projectJobs = jobs.filter(job => samePath(job.repo, project.path));
+  const [removing, setRemoving] = useState(false);
+  const detailRef = useRef(null);
   const latest = projectJobs.at(-1);
   const running = projectJobs.some(job => busyStatuses.has(job.status));
+
   async function open() {
     setError('');
-    try { await api('/projects/' + project.id + '/open', 'POST'); } catch (error) { setError(error.message); }
+    try { await api('/projects/' + project.id + '/open', 'POST'); }
+    catch (error) { setError(error.message); }
   }
+
   async function remove() {
+    if (running || removing) return;
     if (!confirm('เอา "' + project.name + '" ออกจากรายการ? ไฟล์และ Git repo ในโฟลเดอร์จะไม่ถูกลบ')) return;
-    try { await api('/projects/' + project.id, 'DELETE', {}); removed(project.id); } catch (error) { setError(error.message); }
+    setError('');
+    setRemoving(true);
+    try {
+      await api('/projects/' + project.id, 'DELETE', {});
+      removed(project.id, detailRef.current?.contains(document.activeElement));
+    } catch (error) {
+      setError(error.message);
+    } finally {
+      setRemoving(false);
+    }
   }
-  return <article className="card project">
-    <header className="project-head">
-      <span className="provider-icon project-icon"><FolderGit2 size={24} aria-hidden="true" /></span>
-      <div><h2>{project.name}</h2><p>{project.path}</p></div>
+
+  return <article ref={detailRef} className="card projects-detail-pane" aria-labelledby="project-detail-title">
+    <header className="project-detail-header">
+      <div className="project-head">
+        <span className="provider-icon project-icon"><FolderGit2 size={24} aria-hidden="true" /></span>
+        <div>
+          <h2 id="project-detail-title">{project.name}</h2>
+          <p className="project-detail-path">{project.path}</p>
+        </div>
+      </div>
+      <div className="action-row project-detail-actions">
+        <Button primary icon={Plus} onClick={() => createJob(project.path)} disabled={removing || Boolean(info && !info.ok)}>สร้างงาน</Button>
+        <Button icon={FolderOpen} onClick={open}>เปิดโฟลเดอร์</Button>
+        <details className="project-actions-menu" onBlur={event => {
+          if (!event.currentTarget.contains(event.relatedTarget)) event.currentTarget.open = false;
+        }} onKeyDown={event => {
+          if (event.key !== 'Escape' || !event.currentTarget.open) return;
+          event.preventDefault();
+          event.currentTarget.open = false;
+          event.currentTarget.querySelector('summary')?.focus();
+        }}>
+          <summary className="button"><Ellipsis size={18} aria-hidden="true" />จัดการ</summary>
+          <div className="project-actions-menu-content">
+            <Button danger icon={Trash} onClick={remove} disabled={running}
+              aria-disabled={removing || undefined} title={running ? 'มีงานที่กำลังทำอยู่' : undefined}>
+              {removing ? 'กำลังเอาออก…' : 'เอาออก'}
+            </Button>
+            {running ? <p className="muted">มีงานที่กำลังทำอยู่</p> : null}
+          </div>
+        </details>
+      </div>
     </header>
-    {info?.ok ? <p className="repo-info"><GitBranch size={15} aria-hidden="true" /> {info.branch} · <code>{info.base}</code> {info.subject}
-      {info.uncommitted ? <span className="warn-text"> · ยังไม่ commit {info.uncommitted} ไฟล์</span> : null}</p> :
-      info ? <p className="repo-info bad">{info.error}</p> : <p className="muted">กำลังตรวจ repo…</p>}
-    <p className="project-jobs">{projectJobs.length ? <>
-      งานทั้งหมด {projectJobs.length} · ล่าสุด <button type="button" className="link" onClick={() => select(latest.id)}>{latest.title}</button>
-      <span className={'status ' + latest.status}>{statusLabels[latest.status]}</span></> : 'ยังไม่มีงานในโปรเจกต์นี้'}</p>
-    <ChecksEditor project={project} updated={updated} />
-    <NotesEditor project={project} updated={updated} />
-    {project.memory?.length ? <details className="memory"><summary>งานล่าสุดที่ AI จำได้ ({project.memory.length})</summary>
-      <ul>{project.memory.slice(0, 5).map(item => <li key={item.jobId}><strong>{item.title}</strong> · {statusLabels[item.status]} · {dateTime(item.at)}
-        {item.summary ? <small>{item.summary}</small> : null}</li>)}</ul></details> : null}
     {error ? <p role="alert" className="error">{error}</p> : null}
-    <div className="action-row">
-      <Button primary icon={Plus} onClick={() => createJob(project.path)} disabled={info && !info.ok}>สร้างงาน</Button>
-      <Button icon={FolderOpen} onClick={open}>เปิดโฟลเดอร์</Button>
-      <Button danger icon={Trash} onClick={remove} disabled={running} title={running ? 'มีงานที่กำลังทำอยู่' : undefined}>เอาออก</Button>
-    </div>
+    <section className="project-detail-section project-git">
+      <h3>สถานะ Git ในเครื่อง</h3>
+      {info?.ok ? <>
+        <p className="repo-info project-git-status"><GitBranch size={15} aria-hidden="true" /> <code>{info.branch}</code>
+          {info.uncommitted === 0 ? <span>ไม่มีไฟล์ที่ยังไม่ commit</span> : null}</p>
+        <p className="project-commit"><span>Commit ล่าสุด</span> <code>{info.base}</code> {info.subject}</p>
+        {info.uncommitted > 0 ? <p className="project-dirty-warning warn-text">
+          <TriangleExclamationPoint size={16} aria-hidden="true" /> ยังไม่ commit {info.uncommitted} ไฟล์
+        </p> : null}
+      </> : info ? <p className="repo-info bad">{info.error}</p> : <p className="muted" role="status">กำลังตรวจ repo…</p>}
+    </section>
+    <section className="project-detail-section">
+      <h3>งานล่าสุด</h3>
+      <p className="project-jobs">{latest ? <>
+        <button type="button" className="link" onClick={() => select(latest.id)}>{latest.title}</button>
+        <span className={'status ' + latest.status}>{statusLabels[latest.status] || latest.status}</span>
+        <span>งานทั้งหมด {projectJobs.length} งาน</span>
+      </> : 'ยังไม่มีงานในโปรเจกต์นี้'}</p>
+    </section>
+    <ChecksEditor project={project} updated={saved => updated(saved, 'checks')} />
+    <NotesEditor project={project} updated={saved => updated(saved, 'notes')} />
+    <details className="memory project-collapsible">
+      <summary>งานล่าสุดที่ AI จำได้ ({project.memory?.length ?? 0})</summary>
+      {project.memory?.length ? <ul>
+        {project.memory.slice(0, 5).map(item => <li key={item.jobId}><strong>{item.title}</strong> · {statusLabels[item.status]} · {dateTime(item.at)}
+          {item.summary ? <small>{item.summary}</small> : null}</li>)}
+      </ul> : <p className="muted">ยังไม่มีงานที่ AI จำไว้</p>}
+    </details>
   </article>;
 }
 
-function ProjectsPage({ projects, jobs, createJob, added, removed, select }) {
+function ProjectsPage({ projects, jobs, createJob, added, removed, select, updated }) {
+  const [searchQuery, setSearchQuery] = useState('');
+  const [selectedProjectId, setSelectedProjectId] = useState(null);
+  const [addOpen, setAddOpen] = useState(false);
+  const addProjectButtonRef = useRef(null);
+  const projectListRef = useRef(null);
   const [folder, setFolder] = useState('');
   const [name, setName] = useState('');
   const [pending, setPending] = useState(false);
@@ -1446,16 +1505,48 @@ function ProjectsPage({ projects, jobs, createJob, added, removed, select }) {
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [needsInit, setNeedsInit] = useState(null);
-  const [statuses, setStatuses] = useState({});
-  const ids = projects.map(project => project.id + project.path).join('|');
-  async function loadStatuses() {
-    const entries = await Promise.all(projects.map(async project => {
-      try { return [project.id, { ok: true, ...(await api('/repo/check', 'POST', { repo: project.path })) }]; }
-      catch (error) { return [project.id, { ok: false, error: error.message }]; }
-    }));
-    setStatuses(Object.fromEntries(entries));
+  const [statusRefresh, setStatusRefresh] = useState(0);
+  const [statusResult, setStatusResult] = useState(null);
+  const repoTargets = JSON.stringify(projects.map(project => [project.id, project.path]).sort());
+  const statuses = statusResult?.targets === repoTargets ? statusResult.entries : {};
+  const refreshing = projects.length > 0 && (statusResult?.targets !== repoTargets || statusResult.refresh !== statusRefresh);
+  const jobsByProject = useMemo(() => new Map(projects.map(project => [
+    project.id, jobs.filter(job => samePath(job.repo, project.path))
+  ])), [projects, jobs]);
+  const query = searchQuery.trim().toLowerCase();
+  const visibleProjects = projects.filter(project => project.name.toLowerCase().includes(query) || project.path.toLowerCase().includes(query));
+  const selectedProject = visibleProjects.find(project => project.id === selectedProjectId) ?? visibleProjects[0];
+
+  useEffect(() => {
+    const targets = JSON.parse(repoTargets);
+    if (!targets.length) return;
+    let current = true;
+    async function loadStatuses() {
+      const entries = await Promise.all(targets.map(async ([id, repo]) => {
+        try { return [id, { ok: true, ...(await api('/repo/check', 'POST', { repo })) }]; }
+        catch (error) { return [id, { ok: false, error: error.message }]; }
+      }));
+      if (current) setStatusResult({ targets: repoTargets, refresh: statusRefresh, entries: Object.fromEntries(entries) });
+    }
+    void loadStatuses();
+    return () => { current = false; };
+  }, [repoTargets, statusRefresh]);
+
+  function projectAdded(project) {
+    added(project);
+    setSelectedProjectId(project.id);
+    setSearchQuery('');
   }
-  useEffect(() => { void loadStatuses(); }, [ids]);
+
+  function projectRemoved(id, restoreFocus) {
+    if (restoreFocus) {
+      const next = projectListRef.current?.querySelector('button[aria-pressed="false"]');
+      (next ?? addProjectButtonRef.current)?.focus();
+    }
+    setSelectedProjectId(current => current === id ? null : current);
+    removed(id);
+  }
+
   async function pick() {
     setPicking(true); setError('');
     try { const { path } = await api('/projects/pick', 'POST'); if (path) { setFolder(path); setNeedsInit(null); } }
@@ -1464,10 +1555,11 @@ function ProjectsPage({ projects, jobs, createJob, added, removed, select }) {
   }
   async function add(event) {
     event.preventDefault();
+    if (pending || picking || !folder.trim()) return;
     setPending(true); setError(''); setNotice(''); setNeedsInit(null);
     try {
       const project = await api('/projects', 'POST', { path: folder, name });
-      added(project);
+      projectAdded(project);
       setNotice('เพิ่ม "' + project.name + '" แล้ว' + (samePath(project.path, folder) ? '' : ' (ใช้ root ของ repo: ' + project.path + ')'));
       setFolder(''); setName('');
     } catch (error) {
@@ -1478,7 +1570,7 @@ function ProjectsPage({ projects, jobs, createJob, added, removed, select }) {
     setPending(true); setError('');
     try {
       const project = await api('/projects', 'POST', { path: needsInit.folder, name, useParent: true });
-      added(project);
+      projectAdded(project);
       setNotice('เพิ่ม "' + project.name + '" แล้ว (ใช้ repo ที่ ' + project.path + ')');
       setNeedsInit(null); setFolder(''); setName('');
     } catch (error) { setError(error.message); }
@@ -1488,44 +1580,70 @@ function ProjectsPage({ projects, jobs, createJob, added, removed, select }) {
     setPending(true); setError('');
     try {
       const project = await api('/projects/init', 'POST', { path: needsInit.folder, name });
-      added(project);
+      projectAdded(project);
       setNotice('สร้าง Git repo และ commit แรก ' + project.committed + ' ไฟล์แล้ว' + (project.createdIgnore ? ' พร้อมไฟล์ .gitignore' : '') + ' · เพิ่ม "' + project.name + '" แล้ว');
       setNeedsInit(null); setFolder(''); setName('');
     } catch (error) { setError(error.message); }
     finally { setPending(false); }
   }
   return <>
-
-    <form className="card add-project" onSubmit={add}>
-      <h2>เพิ่มโปรเจกต์</h2>
-      <div className="add-row">
-        <label>โฟลเดอร์ของโปรเจกต์<input required value={folder} maxLength={500} placeholder={'D:\\Projects\\my-app'} onChange={event => { setFolder(event.target.value); setNeedsInit(null); }} /></label>
-        <Button icon={FolderOpen} onClick={pick} disabled={picking || pending}>{picking ? 'รอเลือกโฟลเดอร์…' : 'เลือกโฟลเดอร์'}</Button>
-      </div>
-      <label>ชื่อที่แสดง (ไม่ใส่ก็ได้)<input value={name} maxLength={80} placeholder="ใช้ชื่อโฟลเดอร์" onChange={event => setName(event.target.value)} /></label>
-      {picking ? <p className="muted">หน้าต่างเลือกโฟลเดอร์ของ Windows เปิดอยู่ ถ้าไม่เห็น ให้ดูที่แถบงาน</p> : null}
-      {needsInit ? <div className="init-panel" role="alert">
-        <strong>{needsInit.error}</strong>
-        {needsInit.kind === 'parent' ? <p>{needsInit.parentUsable ?
-          'เลือกได้ว่าจะใช้ repo ที่ใหญ่กว่านั้นทั้งก้อน หรือสร้าง Git repo แยกเฉพาะโฟลเดอร์นี้' :
-          'repo นั้นเป็นโฟลเดอร์ผู้ใช้หรือ root ของไดรฟ์ Relay จะไม่ใช้ repo นั้น ให้สร้าง Git repo แยกเฉพาะโฟลเดอร์นี้แทน'}</p> : null}
-        <p>Relay ต้องใช้ Git repo ที่มี commit อย่างน้อย 1 ครั้ง ปุ่มสร้างจะ{needsInit.kind === 'empty' ? '' : 'สร้าง Git repo ในโฟลเดอร์นี้ แล้ว '}commit ไฟล์ทั้งหมดในโฟลเดอร์ ({needsInit.entries} รายการที่ระดับบนสุด) เป็น commit แรก</p>
-        <p>{needsInit.hasGitignore ? 'ไฟล์ที่อยู่ใน .gitignore จะไม่ถูก commit' : 'โฟลเดอร์นี้ยังไม่มี .gitignore Relay จะสร้างให้ เพื่อไม่ให้ commit node_modules, dist และไฟล์ลับอย่าง .env หรือ *.key'}</p>
-        <div className="action-row"><Button primary icon={FolderPlus} onClick={init} disabled={pending}>{needsInit.kind === 'empty' ? 'สร้าง commit แรก' : 'สร้าง Git repo และ commit แรก'}</Button>
-          {needsInit.parentUsable ? <Button icon={GitBranch} onClick={useParent} disabled={pending}>ใช้ repo ที่ใหญ่กว่า</Button> : null}
-          <Button onClick={() => setNeedsInit(null)} disabled={pending}>ยกเลิก</Button></div>
-      </div> : null}
-      {error ? <p role="alert" className="error">{error}</p> : null}
-      {notice ? <p role="status" className="success">{notice}</p> : null}
-      <div className="form-actions"><button type="submit" className="button primary" disabled={pending || !folder.trim()}><FolderPlus size={18} aria-hidden="true" />เพิ่มโปรเจกต์</button></div>
-    </form>
-    {projects.length ? <>
-      <div className="section-head"><h2>โปรเจกต์ของคุณ ({projects.length})</h2><Button icon={RefreshCw} onClick={loadStatuses}>ตรวจสถานะใหม่</Button></div>
-      <div className="projects">{projects.map(project => <ProjectCard key={project.id} project={project} info={statuses[project.id]} jobs={jobs} createJob={createJob} removed={removed} select={select} updated={added} />)}</div>
-    </> : <section className="card empty">
-      <span className="terminal"><FolderGit2 size={48} strokeWidth={1.75} aria-hidden="true" /></span>
-      <h3>ยังไม่มีโปรเจกต์</h3><p>เพิ่มโฟลเดอร์งานที่มีอยู่แล้วด้านบน เพื่อให้ AI เข้าไปทำงานต่อได้</p>
-    </section>}
+    <div className="projects-page" inert={addOpen}>
+      <header className="projects-toolbar">
+        <h2 id="projects-list-title">โปรเจกต์ของคุณ ({projects.length})</h2>
+        <div className="projects-toolbar-actions">
+          <div className="projects-search">
+            <Search size={17} aria-hidden="true" />
+            <input type="search" aria-label="ค้นหาโปรเจกต์จากชื่อหรือพาธ" placeholder="ค้นหาชื่อหรือพาธ"
+              value={searchQuery} onChange={event => setSearchQuery(event.target.value)} />
+          </div>
+          <Button ref={addProjectButtonRef} primary icon={FolderPlus} aria-haspopup="dialog"
+            onClick={() => { setNotice(''); setAddOpen(true); }}>เพิ่มโปรเจกต์</Button>
+          <Button icon={RefreshCw} onClick={() => setStatusRefresh(count => count + 1)}
+            disabled={!projects.length || refreshing} aria-busy={refreshing || undefined}>
+            {refreshing ? 'กำลังตรวจสถานะ…' : 'ตรวจสถานะใหม่'}
+          </Button>
+        </div>
+      </header>
+      {visibleProjects.length ? <div className="projects-split">
+        <section className="card projects-list-pane" aria-labelledby="projects-list-title">
+          <ul ref={projectListRef} className="projects-list">
+            {visibleProjects.map(project => {
+              const latest = jobsByProject.get(project.id).at(-1);
+              const pathLabel = project.path.length > 48 ? project.path.slice(0, 16) + '…' + project.path.slice(-28) : project.path;
+              return <li key={project.id}>
+                <button type="button" className="project-row" aria-pressed={project.id === selectedProject.id}
+                  onClick={() => setSelectedProjectId(project.id)}>
+                  <span className="provider-icon project-icon"><FolderGit2 size={19} aria-hidden="true" /></span>
+                  <span className="project-row-main">
+                    <strong>{project.name}</strong>
+                    <span className="project-row-path" title={project.path}>{pathLabel}</span>
+                  </span>
+                  {latest ? <span className={'status ' + latest.status}>{statusLabels[latest.status] || latest.status}</span> : null}
+                </button>
+              </li>;
+            })}
+          </ul>
+        </section>
+        <ProjectDetail key={selectedProject.id} project={selectedProject} info={statuses[selectedProject.id]}
+          projectJobs={jobsByProject.get(selectedProject.id)} createJob={createJob} removed={projectRemoved}
+          select={select} updated={updated} />
+      </div> : <section className="card empty project-empty-state" role="status">
+        <span className="terminal">
+          {projects.length ? <Search aria-hidden="true" /> : <FolderGit2 aria-hidden="true" />}
+        </span>
+        {projects.length ? <>
+          <h3>ไม่พบโปรเจกต์</h3>
+          <p>ลองค้นหาด้วยชื่อหรือพาธอื่น</p>
+        </> : <>
+          <h3>ยังไม่มีโปรเจกต์</h3>
+          <p>เพิ่มโฟลเดอร์งานที่มีอยู่แล้ว เพื่อให้ AI เข้าไปทำงานต่อได้</p>
+        </>}
+      </section>}
+    </div>
+    <AddProjectModal open={addOpen} onClose={() => setAddOpen(false)} returnFocusRef={addProjectButtonRef}
+      folder={folder} name={name} onFolderChange={value => { setFolder(value); setNeedsInit(null); }} onNameChange={setName}
+      onPick={pick} picking={picking} pending={pending} needsInit={needsInit} onInit={init} onUseParent={useParent}
+      onCancelInit={() => setNeedsInit(null)} error={error} notice={notice} onSubmit={add} />
   </>;
 }
 
@@ -1643,6 +1761,9 @@ function App() {
   const jobs = data?.jobs ?? [];
   const projects = data?.projects ?? [];
   const addProject = project => setData(previous => ({ ...previous, projects: [...previous.projects.filter(item => item.id !== project.id), project] }));
+  const updateProject = (saved, field) => setData(previous => ({ ...previous,
+    projects: previous.projects.map(project => project.id === saved.id ? { ...project, [field]: saved[field] } : project)
+  }));
   const removeProject = id => setData(previous => ({ ...previous, projects: previous.projects.filter(item => item.id !== id) }));
   const job = jobs.find(item => item.id === selection);
   const projectName = job && (projects.find(project => samePath(project.path, job.repo))?.name || repoName(job.repo));
@@ -1681,7 +1802,8 @@ function App() {
           retry={setDialog} updated={updateJob} removed={removeJob} /> :
           page === 'settings' ? <>
             {data ? <SettingsForm initial={data.settings} quotas={data.quotas} onDirty={setSettingsDirty} changed={settings => setData(previous => ({ ...previous, settings }))} /> : null}</> :
-          page === 'projects' ? <ProjectsPage projects={projects} jobs={jobs} createJob={repo => setDialog({ repo })} added={addProject} removed={removeProject} select={select} /> :
+          page === 'projects' ? (data ? <ProjectsPage projects={projects} jobs={jobs} createJob={repo => setDialog({ repo })}
+            added={addProject} removed={removeProject} select={select} updated={updateProject} /> : null) :
           page === 'quota' ? <>{cards(true)}</> :
           <>
             <Kpis jobs={jobs} onFilter={setFilter} onApproval={openApproval} />
