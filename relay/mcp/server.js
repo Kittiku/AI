@@ -1,16 +1,17 @@
 #!/usr/bin/env node
-// Relay MCP server (stdio). Lets Claude Desktop or Claude Code send Task Cards to a running Relay
+// Relay MCP server (stdio). Lets Codex and Claude send Task Cards to a running Relay
 // and read job status and results back. It only talks to Relay's local HTTP API.
 // Register with Claude Code:  claude mcp add relay -- node D:\AI\relay\mcp\server.js
 import { createInterface } from 'node:readline';
-import { taskCardSchema } from '../server/cards.js';
+import { taskCardSchema, validateCard } from '../server/cards.js';
 
 const relayUrl = (process.env.RELAY_URL || 'http://127.0.0.1:' + (process.env.RELAY_PORT || 4782)).replace(/\/$/, '');
 
 async function relay(pathname, method = 'GET', body) {
   let response;
   try {
-    response = await fetch(relayUrl + '/api' + pathname, method === 'GET' ? {} : {
+    response = await fetch(relayUrl + '/api' + pathname, method === 'GET' ? { signal: AbortSignal.timeout(20_000) } : {
+      signal: AbortSignal.timeout(20_000),
       method, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body ?? {})
     });
   } catch {
@@ -34,10 +35,12 @@ const tools = [
   {
     name: 'relay_create_task',
     description: 'Queue a Task Card in Relay, which plans, implements, tests and reviews it with several AIs on a separate Git branch. ' +
-      'Call this ONLY after you have shown the complete card to the user and they explicitly confirmed it in this conversation. ' +
+      'Use when the user asks to send or create work in Relay. Follow the scope and decisions already authorized in the conversation. ' +
       'Prefer acceptance items with check "command" whenever a criterion can be verified by a shell command.',
     inputSchema: { type: 'object', properties: { card: taskCardSchema }, required: ['card'], additionalProperties: false },
     run: async ({ card }) => {
+      const problem = validateCard(card);
+      if (problem) throw Error(problem);
       const job = await relay('/cards', 'POST', { card: { ...card, source: card.source || { kind: 'chat' } } });
       return { queued: true, job_id: job.id, title: job.title, repo: job.repo, branch: job.branch, test_commands: job.checkCommands || [],
         dashboard: relayUrl, next: 'Use relay_job_status with this job_id to follow progress.' };
@@ -97,7 +100,7 @@ async function handle(message) {
     if (method === 'initialize') {
       return send({ jsonrpc: '2.0', id, result: { protocolVersion: params?.protocolVersion || '2025-06-18',
         capabilities: { tools: {} }, serverInfo: { name: 'relay', version: '0.2.0' },
-        instructions: 'Relay runs coding tasks with several AIs on a separate Git branch. Draft a Task Card with the user, show it, and call relay_create_task only after they confirm.' } });
+        instructions: 'Relay runs coding tasks with several AIs on a separate Git branch. Use relay_list_projects to resolve a project, turn the user-authorized request into a Task Card, and use relay_create_task to queue it. Creating a task starts AI work and can consume the user\'s quota. Ask for missing material requirements when needed. Read progress with relay_job_status and inspect delivery with relay_job_result.' } });
     }
     if (method === 'ping') return send({ jsonrpc: '2.0', id, result: {} });
     if (method === 'tools/list') return send({ jsonrpc: '2.0', id, result: { tools: tools.map(({ run: _run, ...tool }) => tool) } });
