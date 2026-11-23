@@ -695,7 +695,9 @@ async function editOn(job, role, cwd, tracked, signal, {
   // Stage exactly what the agent changed, including new files.
   if (output[CHANGED]?.length) await git(cwd, '--literal-pathspecs', 'add', '-A', '--', ...output[CHANGED]);
   signal.throwIfAborted();
-  const tip = await checkpoint(cwd, message);
+  // Commit only what this attempt produced (the agent's changed files and the JSON files/edits), not other staged files.
+  const accepted = [...new Set([...(output[CHANGED] || []), ...(output.files || []).map(item => item.path), ...(output.edits || []).map(item => item.path)])];
+  const tip = await checkpoint(cwd, message, accepted);
   const changedFiles = monitorFiles(tip ? await changedFileNames(cwd, tip + '^', tip) : []);
   signal.throwIfAborted();
   finishRole(job, role, { note: output.status === 'no_work' ? 'ไม่มีงานส่วนนี้' : '' }, { changedFiles });

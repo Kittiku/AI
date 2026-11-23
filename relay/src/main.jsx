@@ -943,8 +943,11 @@ function JobDetail({ job, projectName, monitor, approvalRequested, onApproval, o
   const status = liveJob?.status ?? finishedJob?.status ?? savedJob?.status ?? job.status;
   const finishedAt = finishedJob?.finishedAt ?? savedJob?.finishedAt ?? job.finishedAt;
   const busy = busyStatuses.has(status);
+  // The live snapshot confirms a request only while it is trustworthy. When it is missing or stale (the live channel
+  // is down), /api/state is the source of truth, and the answer is still checked against a fresh /api/state and by the server.
+  const liveUnreliable = !snapshot || monitor.connection === 'stale';
   const showApproval = job.status === 'waiting_approval' && Number.isFinite(job.approval?.requestedAt) &&
-    (job.approval.kind !== 'plan' || Boolean(job.plan)) && (!snapshot || sameApproval(job.approval, liveJob?.approval));
+    (job.approval.kind !== 'plan' || Boolean(job.plan)) && (liveUnreliable || sameApproval(job.approval, liveJob?.approval));
   const hasResult = Boolean(job.worktree || job.branchKept || job.merged);
   useEffect(() => {
     if (!approvalRequested || !showApproval) return;

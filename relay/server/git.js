@@ -100,7 +100,7 @@ function sameIndex(first, second) {
 }
 
 export function attemptChanges(before, after) {
-  if (before.head !== after.head) throw Error('HEAD ของ worktree เปลี่ยนระหว่างการลอง');
+  if (before.head !== after.head) throw Error('AI สร้าง commit เองหรือย้าย HEAD ของ worktree ระหว่างการลอง Relay จะย้อน HEAD กลับและไม่ใช้ผลนี้');
   return [...new Set([...before.files.keys(), ...after.files.keys()])].filter(name => {
     const first = before.files.get(name);
     const second = after.files.get(name);
@@ -109,7 +109,13 @@ export function attemptChanges(before, after) {
 }
 
 export async function restoreAttempt(cwd, before) {
-  const after = await attemptState(cwd, before);
+  let after = await attemptState(cwd, before);
+  if (after.head !== before.head) {
+    // The AI made a commit of its own. Put the branch back to where the attempt started so that commit cannot
+    // stay in the job; files that were already dirty are restored from the saved copies below.
+    await git(cwd, 'reset', '--hard', before.head);
+    after = await attemptState(cwd, before);
+  }
   const changed = attemptChanges(before, after);
   const restoreIndex = [];
   const restoreFiles = [];
@@ -248,8 +254,13 @@ export async function applyFiles(cwd, changes) {
   if (paths.length) await git(cwd, '--literal-pathspecs', 'add', '--', ...changes.map(change => change.path));
 }
 
-export async function checkpoint(cwd, message) {
-  if (!(await git(cwd, 'diff', '--cached', '--name-only'))) return null;
-  await git(cwd, '-c', 'user.name=Relay', '-c', 'user.email=relay@localhost', 'commit', '-m', message);
+// With `paths`, only those files are committed; anything else already staged in the index (for example by a
+// test command) stays out of the commit. Without `paths` the whole index is committed.
+export async function checkpoint(cwd, message, paths) {
+  const only = Array.isArray(paths) ? ['--only', '--', ...paths] : [];
+  if (Array.isArray(paths) && !paths.length) return null;
+  const staged = await git(cwd, '--literal-pathspecs', 'diff', '--cached', '--name-only', ...(only.length ? ['--', ...paths] : []));
+  if (!staged) return null;
+  await git(cwd, '--literal-pathspecs', '-c', 'user.name=Relay', '-c', 'user.email=relay@localhost', 'commit', '-m', message, ...only);
   return git(cwd, 'rev-parse', 'HEAD');
 }

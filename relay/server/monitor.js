@@ -37,7 +37,9 @@ export function closeMonitorStages(job, status, at) {
 function projectStage(job, key) {
   const stage = job.monitor?.stages[key];
   const legacy = job.stages?.[key];
-  const status = stage?.status ?? (legacy && !liveStage(legacy.status) ? legacy.status : 'pending');
+  // A job created with tests off never runs the checks stage; show it as skipped, not as waiting forever.
+  const notPlanned = key === 'checks' && job.runChecks === false ? 'skipped' : 'pending';
+  const status = stage?.status ?? (legacy && !liveStage(legacy.status) ? legacy.status : notPlanned);
   return {
     key, status, action: stage?.action ?? null,
     provider: providerId(stage ? stage.provider : status !== 'pending' ? legacy?.provider : null),
