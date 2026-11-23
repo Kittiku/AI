@@ -29,8 +29,15 @@ const expressUrl = moduleUrl(`
 const fsUrl = moduleUrl("export * from 'node:fs'; export const mkdirSync = () => {}; export const existsSync = () => false;");
 const sqliteUrl = moduleUrl(`
   import { DatabaseSync as SQLite } from 'node:sqlite';
+  let db;
   export class DatabaseSync extends SQLite {
-    constructor() { super(':memory:'); }
+    constructor() {
+      super(':memory:');
+      db = this;
+    }
+  }
+  export function resetDatabase() {
+    db.exec('DELETE FROM steps; DELETE FROM jobs;');
   }
 `);
 
@@ -65,6 +72,7 @@ const { call, defaults, state, store, publicQuotas } = await import(indexUrl).fi
   else process.env.RELAY_RETRY_DELAY_MS = priorDelay;
 });
 const { fake, pacificDay } = await import(providersUrl);
+const { resetDatabase } = await import(sqliteUrl);
 
 const role = 'backend';
 const contextError = Object.assign(Error('บริบทเกินขนาดที่ส่งให้ Gemini CLI ได้'), { code: 'RELAY_CONTEXT_TOO_LARGE' });
@@ -74,6 +82,7 @@ const activities = job => job.monitor.activities.map(activity => activity.code);
 let nextJobId = 0;
 
 function prepare({ mode = 'auto', retries = 2, claudeReady = true, fallback = () => ({ ...success }) } = {}) {
+  resetDatabase();
   const settings = structuredClone(defaults);
   settings.routes[role] = ['gemini', 'claudecode'];
   settings.routing.mode = mode;
