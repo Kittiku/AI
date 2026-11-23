@@ -1327,7 +1327,13 @@ const isAncestor = (cwd, a, b) => git(cwd, 'merge-base', '--is-ancestor', a, b).
 async function mergeCheck(job) {
   if (!job.worktree && !job.branchKept) throw Error('งานนี้ไม่มี branch ผลลัพธ์ให้ merge');
   const target = await git(job.repo, 'rev-parse', '--abbrev-ref', 'HEAD');
-  const dirty = (await git(job.repo, 'status', '--porcelain', '--untracked-files=no')).split('\n').filter(Boolean).map(line => line.slice(3));
+  // Uncommitted files only matter when the merge writes them too (git refuses the same way); staged changes always block,
+  // because a merge commit would pick them up. Renames list both names.
+  const status = (await git(job.repo, 'status', '--porcelain', '--untracked-files=no')).split('\n').filter(Boolean);
+  const dirty = status.flatMap(line => line.slice(3).split(' -> '));
+  const staged = status.filter(line => line[0] !== ' ' && line[0] !== '?').flatMap(line => line.slice(3).split(' -> '));
+  const incoming = new Set((await git(job.repo, 'diff', '--name-only', '-z', 'HEAD...' + job.branch).catch(() => '')).split('\0').filter(Boolean));
+  const overlap = dirty.filter(name => incoming.has(name));
   const alreadyMerged = await isAncestor(job.repo, job.branch, 'HEAD');
   const fastForward = !alreadyMerged && await isAncestor(job.repo, 'HEAD', job.branch);
   let conflicts = [];
@@ -1339,9 +1345,11 @@ async function mergeCheck(job) {
   const stat = await git(job.repo, 'diff', '--shortstat', 'HEAD...' + job.branch).catch(() => '');
   const blockers = [];
   if (target === 'HEAD') blockers.push('repo ไม่ได้อยู่บน branch ใด (detached HEAD) สลับไปที่ branch ที่จะรับงานก่อน');
-  if (dirty.length) blockers.push('repo มีไฟล์ที่แก้แล้วยังไม่ commit ' + dirty.length + ' ไฟล์ ให้ commit หรือ stash ก่อน');
+  if (overlap.length) blockers.push('ไฟล์ที่งานนี้จะ merge ' + overlap.length + ' ไฟล์ถูกแก้ค้างไว้ใน repo และยังไม่ commit ให้ commit หรือ stash ไฟล์เหล่านั้นก่อน');
+  if (staged.length && !alreadyMerged) blockers.push('repo มีไฟล์ที่ stage ไว้แล้วยังไม่ commit ' + staged.length + ' ไฟล์ ให้ commit หรือเอาออกจาก stage ก่อน');
   if (conflicts.length) blockers.push('merge แล้วจะชนกันใน ' + conflicts.length + ' ไฟล์ ต้องแก้เองใน Git');
   return { target, expected: job.baseBranch || null, otherBranch: Boolean(job.baseBranch && job.baseBranch !== target), dirty: dirty.slice(0, 20),
+    overlap: overlap.slice(0, 20), staged: staged.slice(0, 20), untouched: dirty.filter(name => !incoming.has(name) && !staged.includes(name)).length,
     alreadyMerged, fastForward, conflicts: conflicts.slice(0, 20), stat, blockers };
 }
 

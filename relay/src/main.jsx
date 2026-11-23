@@ -939,7 +939,10 @@ function MergePanel({ job, updated }) {
         !check.conflicts.length ? <li>{check.target} มี commit ใหม่ระหว่างทาง Relay จะสร้าง merge commit ให้ จำลองแล้วไม่ชนกัน</li> : null}
       {check.otherBranch ? <li className="warn-text">งานนี้เริ่มจาก {check.expected} แต่ตอนนี้ repo อยู่บน {check.target}</li> : null}
       {check.blockers.map(item => <li key={item} className="bad-text">{item}</li>)}
-      {check.dirty.length ? <li className="files">{check.dirty.join(', ')}</li> : null}
+      {check.overlap?.length ? <li className="files">ไฟล์ที่แก้ค้างและงานนี้จะ merge ทับ: {check.overlap.join(', ')}</li> : null}
+      {check.staged?.length ? <li className="files">ไฟล์ที่ stage ไว้: {check.staged.join(', ')}</li> : null}
+      {!check.overlap && check.dirty.length ? <li className="files">{check.dirty.join(', ')}</li> : null}
+      {check.untouched ? <li>repo มีไฟล์ที่แก้ค้างไว้ {check.untouched} ไฟล์ซึ่งงานนี้ไม่ได้แตะ merge ได้ และไฟล์เหล่านั้นจะอยู่เหมือนเดิม</li> : null}
       {check.conflicts.length ? <li className="files">ไฟล์ที่จะชน: {check.conflicts.join(', ')}</li> : null}
     </ul>
     {blocked ? null : <label className="checkbox"><input type="checkbox" checked={cleanupAfter} onChange={event => setCleanupAfter(event.target.checked)} />หลัง merge ล้าง worktree และลบ branch ของงานนี้</label>}
