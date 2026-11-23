@@ -4,6 +4,8 @@ import path from 'node:path';
 import { createInterface } from 'node:readline';
 
 export const names = { claudecode: 'Claude Code', gemini: 'Gemini', codex: 'Codex' };
+// Every AI process is started through this object, so tests can replace `spawn` with a stand-in process.
+export const processes = { spawn };
 const desktopCodexBin = process.platform === 'win32' && process.env.PATH?.split(path.delimiter)
   .filter(folder => /[\\/]WindowsApps[\\/]OpenAI\.Codex_[^\\/]+[\\/]app[\\/]resources[\\/]?$/i.test(folder))
   .map(folder => path.join(folder, 'codex.exe'))
@@ -80,7 +82,7 @@ export function validate(result, schema) {
 }
 
 function codexRpc(cwd, signal) {
-  const processHandle = spawn(codexBinary, ['app-server'], { cwd, env: codexEnv, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+  const processHandle = processes.spawn(codexBinary, ['app-server'], { cwd, env: codexEnv, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
   const lines = createInterface({ input: processHandle.stdout });
   const requests = new Map();
   let listener = () => {};
@@ -187,7 +189,7 @@ async function runCodexModel(rpc, cwd, model, prompt, schema, write = false) {
 
 function runClaudeCode(args, { cwd, input = '', signal }) {
   return new Promise((resolve, reject) => {
-    const child = spawn(claudeCodeBinary, args, { cwd, env: claudeCodeEnv, signal, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = processes.spawn(claudeCodeBinary, args, { cwd, env: claudeCodeEnv, signal, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', chunk => { stdout += chunk; });
@@ -231,7 +233,7 @@ async function claudeCodeTurn(cwd, prompt, schema, signal, write = false) {
 
 function runCliBinary(binary, args, { cwd, env, input = '', signal, notFoundMessage, stopOnResult = false }) {
   return new Promise((resolve, reject) => {
-    const child = spawn(binary, args, { cwd, env, signal, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = processes.spawn(binary, args, { cwd, env, signal, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', chunk => { stdout += chunk; });
@@ -303,61 +305,85 @@ let geminiCli = { ready: false, backend: null, updatedAt: null, note: 'กำล
 let geminiCliInFlight;
 
 // Keep the entire encoded CLI request below the size that has caused silent truncation.
+// `encode` turns a context string into the exact stdin text; its UTF-8 size is what is measured.
+// Required files the snapshot could not include (too large or past its budget) are not an error: they are listed
+// first in omittedPaths. Only when the required files that are present, with nothing optional, still exceed the
+// limit does this throw RELAY_CONTEXT_TOO_LARGE so the caller can move on to the next AI.
 export function fitGeminiCliInput(context, encode, limit = 88_000) {
-  const data = context ? JSON.parse(context) : null;
-  const repo = data?.repo;
-  const needed = new Set(repo?.requiredPaths || []);
-  const required = repo?.files.filter(file => needed.has(file.path)) || [];
-  const contextError = message => Object.assign(
-    Error(message + ' ระบบจะลอง AI ตัวถัดไปที่พร้อมใช้'),
+  const fits = text => Buffer.byteLength(text, 'utf8') <= limit;
+  const oversized = () => Object.assign(
+    Error('บริบทเกินขนาดที่ส่งให้ Gemini CLI ได้ (' + limit + ' ไบต์) ระบบจะลอง AI ตัวถัดไปที่พร้อมใช้'),
     { code: 'RELAY_CONTEXT_TOO_LARGE' }
   );
-  const oversized = () => contextError('บริบทเกินขนาดที่ส่งให้ Gemini CLI ได้ครบ');
-  if (required.length !== needed.size) throw contextError('ข้อมูลไฟล์ที่ต้องใช้สำหรับ Gemini CLI ไม่ครบ');
-  const fits = input => Buffer.byteLength(input) <= limit;
   const input = encode(context);
   if (fits(input)) return input;
-  if (!repo?.files.length) throw oversized();
+  let data = null;
+  try { data = context ? JSON.parse(context) : null; } catch {}
+  const repo = data?.repo;
+  if (!repo || !Array.isArray(repo.files)) throw oversized();
 
-  const optional = repo.files.filter(file => !needed.has(file.path));
-  function withOptional(count) {
-    const files = [...required, ...optional.slice(0, count)];
+  const key = name => String(name).replaceAll('\\', '/').toLowerCase();
+  const requiredPaths = Array.isArray(repo.requiredPaths) ? repo.requiredPaths : [];
+  const needed = new Set(requiredPaths.map(key));
+  const present = new Set(repo.files.map(file => key(file.path)));
+  const required = repo.files.filter(file => needed.has(key(file.path)));
+  const optional = repo.files.filter(file => !needed.has(key(file.path)));
+  const missingRequired = [...new Set(requiredPaths.filter(name => !present.has(key(name))))];
+  const earlierOmitted = Array.isArray(repo.omittedPaths) ? repo.omittedPaths : [];
+  const omittedBase = Number.isFinite(repo.omitted) ? repo.omitted : 0;
+
+  // count: optional files kept (in snapshot order). listed: entries kept in omittedPaths (missing required files first).
+  function pack(count, listed) {
+    const omittedPaths = [...new Set([...missingRequired, ...optional.slice(count).map(file => file.path), ...earlierOmitted])]
+      .slice(0, Math.max(listed, 0));
     return encode(JSON.stringify({ ...data, repo: {
-      ...repo, files, omitted: repo.omitted + optional.length - count,
-      omittedPaths: [...new Set([...optional.slice(count).map(file => file.path), ...repo.omittedPaths])].slice(0, 100)
+      ...repo, files: [...required, ...optional.slice(0, count)], omitted: omittedBase + optional.length - count, omittedPaths
     } }));
   }
-  let packed = withOptional(0);
-  if (!fits(packed)) throw oversized();
-  let low = 0;
-  let high = optional.length;
-  while (low < high) {
-    const count = Math.floor((low + high + 1) / 2);
-    const candidate = withOptional(count);
-    if (fits(candidate)) { low = count; packed = candidate; }
-    else high = count - 1;
+  // Largest n in [low, high] for which make(n) fits; make(low) must already fit.
+  function largest(low, high, make) {
+    let best = make(low);
+    while (low < high) {
+      const middle = Math.floor((low + high + 1) / 2);
+      const candidate = make(middle);
+      if (fits(candidate)) { low = middle; best = candidate; } else high = middle - 1;
+    }
+    return best;
   }
-  return packed;
+
+  const fullList = 100;
+  if (fits(pack(0, fullList))) return largest(0, optional.length, count => pack(count, fullList));
+  // No optional file fits: shorten omittedPaths, but keep the required files that are missing listed.
+  const minimum = Math.min(missingRequired.length, fullList);
+  if (!fits(pack(0, minimum))) throw oversized();
+  return largest(minimum, fullList, listed => pack(0, listed));
 }
 
 const withContext = (prompt, context) => context ? prompt + '\nCONTEXT\n' + context : prompt;
+
+const geminiCliInstruction = schema => [
+  'Complete the Relay request below using only the supplied CONTEXT. Do not call tools, read or modify files, or run shell commands.',
+  'Return ONLY a single valid JSON object conforming to this exact JSON Schema (no markdown code fences, no explanation):',
+  JSON.stringify(schema)
+].join(' ');
+
+// The exact stdin text for the Gemini / Antigravity CLI: plain prompt text, or one stream-json user event for agy.
+export function geminiCliEncoder(prompt, schema, stream) {
+  const instruction = geminiCliInstruction(schema);
+  return packed => stream
+    ? JSON.stringify({ event: 'user', message: { content: instruction + '\n\n' + withContext(prompt, packed) } }) + '\n'
+    : withContext(prompt, packed);
+}
 
 async function geminiCliTurn(cwd, prompt, context, schema, signal, onUsage) {
   const backend = geminiCli.backend || 'agy';
   const binary = backend === 'agy' ? agyBinary : geminiBinary;
   const label = backend === 'agy' ? 'Antigravity CLI (agy)' : 'Gemini CLI';
-  const instruction = [
-    'Complete the Relay request below using only the supplied CONTEXT. Do not call tools, read or modify files, or run shell commands.',
-    'Return ONLY a single valid JSON object conforming to this exact JSON Schema (no markdown code fences, no explanation):',
-    JSON.stringify(schema)
-  ].join(' ');
   const useStream = backend === 'agy';
   const args = useStream
     ? ['--input-format', 'stream-json', '--output-format', 'stream-json', '--json-schema', JSON.stringify(schema), '--disable-slash-commands']
-    : ['-p', instruction, '--output-format', 'json'];
-  const input = fitGeminiCliInput(context, packed => useStream
-    ? JSON.stringify({ event: 'user', message: { content: instruction + '\n\n' + withContext(prompt, packed) } }) + '\n'
-    : withContext(prompt, packed));
+    : ['-p', geminiCliInstruction(schema), '--output-format', 'json'];
+  const input = fitGeminiCliInput(context, geminiCliEncoder(prompt, schema, useStream));
   if (geminiCliModel) args.push('--model', geminiCliModel);
   const { code, stdout, stderr } = await runCliBinary(binary, args, {
     cwd,
@@ -546,7 +572,9 @@ export function quota(settings, usage, now = Date.now()) {
   };
 }
 
-export async function generate(provider, cwd, prompt, schema, jobSignal, onUsage, { write = false, context } = {}) {
+// `geminiCliContext` (optional) replaces `context` only on the Gemini / Antigravity CLI path, for example a snapshot
+// built for its size limit. Claude Code, Codex and the Gemini API always get prompt + '\nCONTEXT\n' + context.
+export async function generate(provider, cwd, prompt, schema, jobSignal, onUsage, { write = false, context, geminiCliContext } = {}) {
   if (provider === 'gemini' && !geminiCli.updatedAt) await refreshGemini(cwd);
   const useCli = provider === 'gemini' && shouldUseCli();
   // Agents that read the repo themselves (Claude Code, Codex, Gemini CLI) get 15 minutes; one-shot API calls get 4.
@@ -560,7 +588,7 @@ export async function generate(provider, cwd, prompt, schema, jobSignal, onUsage
     return result;
   }
   if (provider === 'gemini' && useCli) {
-    const result = await geminiCliTurn(cwd, prompt, context, schema, signal, onUsage);
+    const result = await geminiCliTurn(cwd, prompt, geminiCliContext ?? context, schema, signal, onUsage);
     if (!validate(result, schema)) throw Error(names[provider] + ' ส่งข้อมูลไม่ตรงกับรูปแบบที่กำหนด');
     return result;
   }
