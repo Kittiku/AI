@@ -626,13 +626,60 @@ function NewJob({ close, created, previous, jobs, projects, settings, quotas }) 
         {chosenProject?.checks?.length ? 'รันคำสั่งทดสอบของโปรเจกต์ (' + chosenProject.checks.length + ' คำสั่ง) และให้ AI แก้จนผ่าน' : 'รัน npm test และ build ที่มีใน repo นี้ และให้ AI แก้จนผ่าน'}</label>
       <small>เลือกสำหรับ repo ที่คุณไว้วางใจ แอปอาจติดตั้ง dependencies จาก lockfile และรันโค้ดที่เพิ่งแก้บนเครื่อง</small>
       <details className="advanced" open={override} onToggle={event => setOverride(event.currentTarget.open)}>
-        <summary>เลือก AI เฉพาะงานนี้</summary>
+        <summary>เลือก AI เฉพาะงานนี้ (งานนี้จะไม่ใช้การเลือกอัตโนมัติ)</summary>
         <RouteTable routes={routes} quotas={quotas} label="AI สำหรับงานนี้" onChange={(role, index, value) => setRoutes(current => updateRoutes(current, role, index, value))} />
       </details>
       </>}
       {error ? <p role="alert" className="error">{error}</p> : null}
       <footer><Button disabled={pending} onClick={close}>ยกเลิก</Button><button type="submit" className="button primary" disabled={pending}>{pending ? 'กำลังเพิ่มงาน…' : 'เพิ่มเข้าคิว'}</button></footer>
     </form>
+  </div>;
+}
+
+const profileNames = { balanced: 'สมดุล', fast: 'เร็วที่สุด', cheap: 'ประหยัดที่สุด' };
+const profileHints = {
+  balanced: 'สมดุล: ให้น้ำหนักความเหมาะกับขั้น โควตา และอัตราสำเร็จเป็นหลัก',
+  fast: 'เร็วที่สุด: ให้น้ำหนักความเร็วที่วัดได้จริงมากขึ้น เหมาะเมื่อมีคนรอผล',
+  cheap: 'ประหยัดที่สุด: เลือก AI ที่โควตาเหลือมากและต้นทุนต่ำก่อน เก็บโควตาของตัวที่เหลือน้อยไว้'
+};
+const factorLabels = { fit: 'เหมาะกับขั้น', quota: 'โควตา', success: 'อัตราสำเร็จ', speed: 'ความเร็ว', cost: 'ต้นทุน' };
+
+function ScoreBars({ row }) {
+  return <span className="score-bars" title={Object.entries(row.parts).map(([key, value]) => factorLabels[key] + ' ' + value).join(' · ')}>
+    {Object.entries(row.parts).map(([key, value]) => <i key={key} style={{ height: Math.max(8, value * 100) + '%' }} />)}
+  </span>;
+}
+
+function adjustText(row) {
+  return [row.adjust?.independence ? 'ตัดคะแนนเพราะเป็นตัวที่เขียนโค้ด' : '', row.adjust?.spread ? 'ตัดคะแนนเพราะซ้ำกับส่วนที่ทำพร้อมกัน' : ''].filter(Boolean).join(' · ');
+}
+
+// What automatic routing would choose for each role right now, from the saved settings.
+function RoutingPreview({ refreshKey }) {
+  const [data, setData] = useState(null);
+  const [error, setError] = useState('');
+  useEffect(() => {
+    let live = true;
+    api('/routing/preview').then(result => { if (live) { setData(result); setError(''); } }, failure => { if (live) setError(failure.message); });
+    return () => { live = false; };
+  }, [refreshKey]);
+  if (error) return <p className="error">{error}</p>;
+  if (!data) return <p className="muted">กำลังโหลดตัวอย่างการเลือก…</p>;
+  const enough = data.stats.filter(item => item.n >= data.minSamples).length;
+  return <div className="routing-preview">
+    <h3>ถ้าสั่งงานตอนนี้ Relay จะเลือก</h3>
+    <div className="table-scroll"><table className="steps">
+      <thead><tr><th>ขั้น</th><th>อันดับ 1</th><th>อันดับ 2</th><th>อันดับ 3</th><th>เหตุผลที่เลือกอันดับ 1</th></tr></thead>
+      <tbody>{Object.entries(roleNames).map(([role, label]) => {
+        const { ranking, skipped } = data.roles[role];
+        return <tr key={role}>
+          <td>{label}</td>
+          {[0, 1, 2].map(index => <td key={index}>{ranking[index] ? <><strong>{providerName(ranking[index].provider)}</strong> {ranking[index].score} <ScoreBars row={ranking[index]} /></> : '–'}</td>)}
+          <td className="wrap">{ranking[0]?.reason || 'ไม่มี AI ที่พร้อมใช้'}{skipped.length ? <small>ข้าม: {skipped.map(item => providerName(item.provider) + ' (' + item.reason + ')').join(', ')}</small> : null}</td>
+        </tr>;
+      })}</tbody>
+    </table></div>
+    <p className="muted">แท่งสีเล็กๆ คือคะแนนย่อย (เหมาะกับขั้น · โควตา · อัตราสำเร็จ · ความเร็ว · ต้นทุน) เอาเมาส์ชี้เพื่อดูตัวเลข ข้อมูลที่ใช้: {data.stats.length} คู่ AI/ขั้นที่เคยทำ มี {enough} คู่ที่ข้อมูลพอให้ใช้สถิติจริง ที่เหลือใช้ค่าตั้งต้น คำนวณจากค่าที่บันทึกแล้ว</p>
   </div>;
 }
 
@@ -656,10 +703,29 @@ function SettingsForm({ initial, changed, quotas, onDirty }) {
     } catch (error) { setNotice({ text: error.message, error: true }); }
     finally { setSaving(false); }
   }
+  const routing = draft.routing || { mode: 'auto', profile: 'balanced', minSamples: 5 };
+  const setRouting = (key, value) => setDraft(current => ({ ...current, routing: { ...routing, [key]: value } }));
+  const table = <RouteTable routes={draft.routes} quotas={quotas} label="การมอบหมายงาน" onChange={(role, index, value) => setDraft(current => ({ ...current, routes: updateRoutes(current.routes, role, index, value) }))} />;
   return <form className="card settings" onSubmit={submit}>
-    <h2>การมอบหมายงาน</h2>
-    <p className="muted">Relay ใช้ตัวหลักก่อน ถ้าตัวหลักยังไม่เชื่อมต่อ โควตาต่ำกว่าที่กันไว้ หรือเรียกไม่สำเร็จ จะเปลี่ยนไปใช้ตัวสำรอง</p>
-    <RouteTable routes={draft.routes} quotas={quotas} label="การมอบหมายงาน" onChange={(role, index, value) => setDraft(current => ({ ...current, routes: updateRoutes(current.routes, role, index, value) }))} />
+    <h2>การจ่ายงาน</h2>
+    <div className="filters" aria-label="โหมดการจ่ายงาน">
+      <button type="button" aria-pressed={routing.mode === 'auto'} onClick={() => setRouting('mode', 'auto')}>อัตโนมัติ (Relay เลือกให้)</button>
+      <button type="button" aria-pressed={routing.mode === 'fixed'} onClick={() => setRouting('mode', 'fixed')}>กำหนดเอง</button>
+    </div>
+    {routing.mode === 'auto' ? <>
+      <p className="muted">Relay ให้คะแนน AI ทุกตัวที่พร้อมใช้ในแต่ละขั้น แล้วเลือกตัวที่คะแนนสูงสุด ไม่ต้องเรียก AI ช่วยเลือก จึงไม่เสียโควตา ตัวที่เหลือเรียงเป็นตัวสำรองตามลำดับคะแนน คะแนนมาจากความเหมาะกับขั้นนั้น โควตาที่เหลือ อัตราสำเร็จและความเร็วจริง ต้นทุน และขั้นรีวิวจะเลี่ยง AI ที่เขียนโค้ดงานนั้น</p>
+      <div className="settings-grid">
+        <label>โปรไฟล์<select value={routing.profile} onChange={event => setRouting('profile', event.target.value)}>
+          {Object.entries(profileNames).map(([id, label]) => <option key={id} value={id}>{label}</option>)}</select></label>
+        <label>ใช้สถิติจริงเมื่อมีข้อมูลอย่างน้อย (ครั้งต่อ AI ต่อขั้น)<input type="number" required min="1" max="50" value={routing.minSamples} onChange={event => setRouting('minSamples', Number(event.target.value))} /></label>
+      </div>
+      <p className="muted">{profileHints[routing.profile]}</p>
+      <RoutingPreview refreshKey={JSON.stringify(initial.routing) + JSON.stringify(initial.reserve)} />
+      <details className="advanced"><summary>ตารางกำหนดเอง (ใช้เมื่อเลือกโหมดกำหนดเอง)</summary>{table}</details>
+    </> : <>
+      <p className="muted">Relay ใช้ตัวหลักก่อน ถ้าตัวหลักยังไม่เชื่อมต่อ โควตาต่ำกว่าที่กันไว้ หรือเรียกไม่สำเร็จ จะเปลี่ยนไปใช้ตัวสำรอง</p>
+      {table}
+    </>}
     <h2>โควตาและรอบแก้</h2>
     <p className="muted">ในขั้นวางแผน Backend และ UX/UI Relay จะข้าม AI ที่โควตาคงเหลือต่ำกว่าค่านี้ เพื่อเก็บโควตาไว้ใช้ในขั้นรีวิว หลอดโควตาจะมีเส้นบอกระดับนี้</p>
     <div className="settings-grid">
@@ -929,6 +995,28 @@ function ApprovalPanel({ job, panelRef }) {
   </section>;
 }
 
+// Every automatic choice made for this job: who was picked for which step, why, and the scores of all AIs.
+function RoutingView({ job }) {
+  const decisions = [...(job.routing || [])].reverse();
+  return <div className="routing-view">
+    <p className="muted">{job.settings?.routing?.mode === 'auto' ? 'โปรไฟล์ ' + (profileNames[job.settings.routing.profile] || job.settings.routing.profile) : 'งานนี้ใช้ตารางกำหนดเอง'}
+      {job.pinned ? ' · Task Card กำหนด: ' + Object.entries(job.pinned).map(([role, provider]) => (roleNames[role] || role) + ' → ' + providerName(provider)).join(', ') : ''}</p>
+    <ol className="events">{decisions.map((decision, index) => <li key={decision.at + ':' + index}>
+      <span>{time(decision.at)}</span>
+      <div>
+        <strong>{roleNames[decision.role] || decision.role}{decision.round ? ' · รอบแก้ ' + decision.round : ''} → {decision.attempts?.length ? decision.attempts.map(providerName).join(' แล้วลอง ') : 'ยังไม่ได้เลือก'}</strong>
+        <p>{decision.ranking[0]?.reason || '—'}</p>
+        <details><summary>คะแนนของทุก AI</summary>
+          <table className="steps"><thead><tr><th>อันดับ</th><th>AI</th><th>รวม</th>{Object.keys(factorLabels).map(key => <th key={key}>{factorLabels[key]}</th>)}</tr></thead>
+            <tbody>{decision.ranking.map(row => <tr key={row.provider}><td>{row.rank}</td><td>{providerName(row.provider)}{adjustText(row) ? <small>{adjustText(row)}</small> : null}</td><td>{row.score}</td>
+              {Object.keys(factorLabels).map(key => <td key={key}>{row.parts[key]}</td>)}</tr>)}</tbody></table>
+          {decision.skipped?.length ? <small>ข้าม: {decision.skipped.map(item => providerName(item.provider) + ' (' + item.reason + ')').join(', ')}</small> : null}
+        </details>
+      </div>
+    </li>)}</ol>
+  </div>;
+}
+
 function JobDetail({ job, projectName, monitor, approvalRequested, onApproval, onApprovalFocused, back, retry, updated, removed }) {
   const [tab, setTab] = useState('events');
   const [diff, setDiff] = useState(null);
@@ -986,9 +1074,10 @@ function JobDetail({ job, projectName, monitor, approvalRequested, onApproval, o
       <section className="card detail">
         <div className="filters"><button aria-pressed={tab === 'events'} onClick={() => { setTab('events'); setError(''); }}>ประวัติการทำงาน</button>
           <button aria-pressed={tab === 'diff'} onClick={() => showDiff()} disabled={!hasResult}>Git diff</button>
-          <button aria-pressed={tab === 'usage'} onClick={() => { setTab('usage'); setError(''); }}>การใช้ AI</button></div>
+          <button aria-pressed={tab === 'usage'} onClick={() => { setTab('usage'); setError(''); }}>การใช้ AI</button>
+          {job.routing?.length ? <button aria-pressed={tab === 'routing'} onClick={() => { setTab('routing'); setError(''); }}>การจ่ายงาน</button> : null}</div>
         {error ? <p role="alert" className="error">{error}</p> : null}
-        {tab === 'usage' ? <UsageView job={job} /> :
+        {tab === 'routing' ? <RoutingView job={job} /> : tab === 'usage' ? <UsageView job={job} /> :
           tab === 'diff' ? loading ? <p>กำลังโหลด diff…</p> : diff ? <DiffView diff={diff} focus={focus} /> : null :
           <ol className="events">{job.events.length ? [...job.events].reverse().map((event, i) => <li key={job.events.length - i}><span>{time(event.at)}</span><div><strong>{event.title}{event.provider ? ' · ' + providerName(event.provider) : ''}</strong><p>{event.detail}</p></div></li>) : <li><p>รอเริ่มงาน</p></li>}</ol>}
       </section>

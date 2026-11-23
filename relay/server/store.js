@@ -113,9 +113,18 @@ export function openStore(dataDir) {
     return row.total;
   }
 
+  // Per AI and role: how many finished steps, how many succeeded, and the average time of the successful ones.
+  // The router uses this once a pair has enough samples; interrupted and cancelled steps say nothing about the AI.
+  function providerStats(since) {
+    const rows = db.prepare(`SELECT provider, role, COUNT(*) AS n, SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) AS done,
+        AVG(CASE WHEN status = 'done' THEN ended_at - started_at END) AS avg_ms
+      FROM steps WHERE ended_at IS NOT NULL AND status IN ('done', 'failed', 'rejected') AND started_at >= ? GROUP BY provider, role`).all(since);
+    return new Map(rows.map(row => [row.provider + ':' + row.role, { n: row.n, done: row.done, avgMs: row.avg_ms }]));
+  }
+
   function steps(jobId) {
     return db.prepare('SELECT * FROM steps WHERE job_id = ? ORDER BY id').all(jobId);
   }
 
-  return { load, persist, startStep, finishStep, closeOpenSteps, steps, spendSince };
+  return { load, persist, startStep, finishStep, closeOpenSteps, steps, spendSince, providerStats };
 }

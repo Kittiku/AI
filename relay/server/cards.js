@@ -37,7 +37,8 @@ export const taskCardSchema = {
       type: 'object', additionalProperties: false,
       properties: {
         prefer: { type: 'object', additionalProperties: false, properties: Object.fromEntries(roleIds.map(role => [role, { type: 'string', enum: providerIds }])) },
-        budget_usd: { type: 'number', minimum: 0, description: 'Recorded with the job; not enforced yet.' }
+        profile: { type: 'string', enum: ['balanced', 'fast', 'cheap'], description: 'How automatic routing weighs speed and cost for this job.' },
+        budget_usd: { type: 'number', minimum: 0, description: 'Budget for this job in USD. Relay pauses for approval when it is reached.' }
       }
     },
     approvals: {
@@ -124,7 +125,7 @@ export function cardToJob(card, settings) {
   }
   const scope = include.length || exclude.length ? { include, exclude } : null;
   return { title: card.title.trim(), prompt, commands, routes, budgetUsd: card.routing?.budget_usd ?? null,
-    type: card.type || 'feature', scope, approvals: card.approvals || [] };
+    type: card.type || 'feature', scope, approvals: card.approvals || [], pinned: prefer, profile: card.routing?.profile || null };
 }
 
 // Scope check for changed paths. A pattern without wildcards matches that file or everything under that folder;

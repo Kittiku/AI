@@ -193,6 +193,15 @@ input[type="checkbox"] { accent-color: var(--accent); }
 .steps td:nth-child(n+4) { font-variant-numeric: tabular-nums; }
 .steps tr.failed td:nth-child(3), .steps tr.rejected td:nth-child(3) { color: #b42318; }
 .usage .muted { margin-top: 10px; font-size: 12.5px; }
+.score-bars { display: inline-flex; align-items: flex-end; gap: 2px; height: 16px; margin-left: 6px; vertical-align: middle; }
+.score-bars i { display: block; width: 4px; background: #7a4fd6; border-radius: 1px; opacity: .8; }
+.routing-preview { margin-top: 14px; }
+.routing-preview h3 { font-size: 16px; margin-bottom: 6px; }
+.routing-preview td.wrap, .routing-view td { white-space: normal; }
+.routing-preview td small, .routing-view td small { display: block; color: var(--muted); font-size: 12px; }
+.routing-view details { margin-top: 6px; }
+.routing-view table { margin-top: 6px; }
+.settings > .filters { margin-top: 10px; }
 .section-gap { margin-top: 26px; }
 .settings > .checkbox { margin-top: 12px; font-weight: 550; }
 .checks-editor { margin-top: 12px; }
