@@ -1007,9 +1007,9 @@ const subtaskFinished = new Set(['passed', 'skipped', 'done']);
 const subtaskActive = new Set(['running', 'checking', 'fixing', 'merging', 'rerun']);
 const subtaskNumber = (item, index) => Number.isInteger(item.id) ? item.id : Number.isInteger(Number(item.id)) && String(item.id).trim() ? Number(item.id) : index + 1;
 
-// Which 1-based subtasks this one still waits for: waitingOn from the server, or unfinished dependsOn as a fallback.
+// Use the server's waitingOn list, including an empty list. Infer dependencies only for older records.
 function waitingFor(item, items) {
-  if (Array.isArray(item.waitingOn) && item.waitingOn.length) return item.waitingOn;
+  if (Array.isArray(item.waitingOn)) return item.waitingOn;
   if (!['pending', 'waiting'].includes(item.status || 'pending') || !Array.isArray(item.dependsOn)) return [];
   return item.dependsOn.filter(number => {
     const index = items.findIndex((other, i) => subtaskNumber(other, i) === number);
