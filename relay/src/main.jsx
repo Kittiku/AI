@@ -4,7 +4,7 @@ import '@fontsource-variable/inter';
 import '@fontsource-variable/noto-sans-thai';
 import {
   ArrowRight, ChartPie, Check, ChevronLeft, ClipboardList, CodeXml, Copy, FlaskConical, FolderGit2, FolderOpen, FolderPlus,
-  TriangleExclamationPoint, CircleCheck, Clock, GitBranch, Layers, LayoutDashboard, Plus, RefreshCw, RotateCcw, Settings, Sparkle, Terminal, Trash, X
+  TriangleExclamationPoint, CircleCheck, Clock, GitBranch, Layers, LayoutDashboard, Plus, RefreshCw, RotateCcw, Settings, Sparkle, Terminal, Trash, Wrench, X
 } from 'lucide-react';
 import './style.css';
 
@@ -913,7 +913,7 @@ function MergePanel({ job, updated }) {
     finally { setBusyState(''); }
   }
   if (!check) return <div className="merge-panel">
-    <Button primary icon={GitBranch} onClick={prepare} disabled={Boolean(busyState)}>{busyState ? 'กำลังตรวจ…' : 'Merge เข้า repo'}</Button>
+    <Button primary={job.status !== 'needs_review'} icon={GitBranch} onClick={prepare} disabled={Boolean(busyState)}>{busyState ? 'กำลังตรวจ…' : job.status === 'needs_review' ? 'Merge ทั้งที่ยังมีปัญหา' : 'Merge เข้า repo'}</Button>
     {error ? <p role="alert" className="error">{error}</p> : null}
   </div>;
   const blocked = check.blockers.length > 0;
@@ -939,6 +939,77 @@ function MergePanel({ job, updated }) {
   </div>;
 }
 
+// A ready-to-paste brief for a Claude Code session: where the work is, what is still wrong, and what done means.
+function handoffPrompt(job) {
+  const findings = job.review?.findings || [];
+  const failed = (job.checks || []).filter(item => item.code !== 0 && item.code !== null);
+  const lines = [
+    'งานนี้มาจาก Relay: "' + job.title + '" ช่วยแก้ปัญหาที่ยังค้างให้เสร็จ',
+    '',
+    ...(job.merged ? ['repo: ' + job.repo, 'งานนี้ merge เข้า ' + job.merged.into + ' แล้ว (commit ' + job.merged.commit.slice(0, 10) + ') ให้แก้ต่อบน ' + job.merged.into]
+      : [job.worktree ? 'ทำงานในโฟลเดอร์นี้ (เป็น git worktree ที่อยู่บน branch ของงานแล้ว): ' + job.worktree
+        : 'repo: ' + job.repo + ' ให้ checkout branch ' + job.branch + ' ก่อน',
+      'branch: ' + job.branch + (job.base ? ' (เริ่มจาก commit ' + job.base.slice(0, 10) + ')' : '')]),
+    ''
+  ];
+  if (findings.length) {
+    lines.push('ปัญหาที่รีวิวเจอ:');
+    findings.forEach((item, index) => lines.push((index + 1) + '. ' + (item.owner ? '[' + (item.owner === 'frontend' ? 'UX/UI' : 'Backend') + '] ' : '') + item.detail));
+    lines.push('');
+  }
+  if (failed.length) {
+    lines.push('เทสที่ไม่ผ่าน:');
+    for (const item of failed) lines.push('- ' + item.label + ' (exit ' + item.code + ')\n' + String(item.output || '').slice(-1200).trim());
+    lines.push('');
+  }
+  if (job.review?.summary) lines.push('สรุปจากรีวิว: ' + job.review.summary, '');
+  if (job.prompt) lines.push('โจทย์เดิม:', job.prompt.slice(0, 2500), '');
+  const tip = job.merged ? (job.merged.tip || job.merged.commit).slice(0, 10) : 'HEAD';
+  lines.push('ดูการเปลี่ยนแปลงของงานนี้ได้ด้วย git diff ' + (job.base ? job.base.slice(0, 10) : tip + '~1') + '..' + tip,
+    'แก้ให้ครบ รันเทสให้ผ่าน แล้ว commit ' + (job.merged ? 'บน ' + job.merged.into : 'บน branch นี้') + ' ห้าม push');
+  return lines.join('\n');
+}
+
+// One more fix round on the same branch, or hand the open problems to a Claude Code session.
+function FixPanel({ job, updated }) {
+  const [open, setOpen] = useState(false);
+  const [note, setNote] = useState('');
+  const [provider, setProvider] = useState('');
+  const [sending, setSending] = useState(false);
+  const [error, setError] = useState('');
+  const findings = job.review?.findings?.length || 0;
+  const failed = (job.checks || []).filter(item => item.code !== 0 && item.code !== null).length;
+  async function send() {
+    setSending(true); setError('');
+    try { updated(await api('/jobs/' + job.id + '/fix', 'POST', { note, provider })); setOpen(false); setNote(''); }
+    catch (error) { setError(error.message); } finally { setSending(false); }
+  }
+  const attention = job.status === 'needs_review';
+  return <div className={'fix-panel' + (attention ? ' attention' : '')}>
+    {attention ? <p className="fix-lead"><Wrench size={15} aria-hidden="true" /> ยังเหลือ{findings ? ' ปัญหาจากรีวิว ' + findings + ' ข้อ' : ''}{findings && failed ? ' ·' : ''}{failed ? ' เทสไม่ผ่าน ' + failed + ' คำสั่ง' : ''}</p> : null}
+    {open ? <div className="fix-form">
+      <label>บอก AI เพิ่ม (ไม่บังคับ{findings ? '' : ' แต่งานนี้ไม่มีปัญหาค้าง ต้องบอกว่าจะให้แก้อะไร'})
+        <textarea rows={3} value={note} onChange={event => setNote(event.target.value)} placeholder="เช่น ข้อ 2 ไม่ต้องแก้ ให้เน้นทำเทสให้ผ่าน" />
+      </label>
+      <label>ให้ AI ตัวไหนแก้
+        <select value={provider} onChange={event => setProvider(event.target.value)}>
+          <option value="">ให้ Relay เลือกเอง</option>
+          {Object.entries(providers).map(([id, item]) => <option key={id} value={id}>{item.name}</option>)}
+        </select>
+      </label>
+      <small>แก้บน branch เดิม <code>{job.branch}</code> แล้วทดสอบและรีวิวใหม่ 1 รอบ</small>
+      {error ? <p role="alert" className="error">{error}</p> : null}
+      <div className="action-row">
+        <Button primary icon={Wrench} onClick={send} disabled={sending || (!findings && !note.trim())}>{sending ? 'กำลังส่ง…' : 'เริ่มแก้'}</Button>
+        <Button onClick={() => { setOpen(false); setError(''); }} disabled={sending}>ยกเลิก</Button>
+      </div>
+    </div> : <div className="action-row">
+      <Button primary={attention} icon={Wrench} onClick={() => setOpen(true)}>แก้ต่ออีกรอบ</Button>
+      <CopyButton text={handoffPrompt(job)}>คัดลอก prompt ให้ Claude Code</CopyButton>
+    </div>}
+  </div>;
+}
+
 function JobActions({ job, updated, removed, setError }) {
   const [working, setWorking] = useState(false);
   const hasBranch = Boolean(job.worktree || job.branchKept);
@@ -957,6 +1028,11 @@ function JobActions({ job, updated, removed, setError }) {
       {merged.before !== null ? <><small>ถ้าต้องการย้อน ใช้คำสั่งนี้ จะได้ commit ใหม่ที่ยกเลิกการเปลี่ยนแปลง ประวัติเดิมไม่หาย</small>
         <div className="action-row"><CopyButton text={undoCommand}>คัดลอกคำสั่งย้อน</CopyButton></div></> : null}
     </div> : null}
+    {merged && job.status === 'needs_review' ? <div className="fix-panel attention">
+      <p className="fix-lead"><Wrench size={15} aria-hidden="true" /> merge แล้วแต่ยังมีปัญหาค้าง ส่งต่อให้ Claude Code แก้บน {merged.into} ได้</p>
+      <div className="action-row"><CopyButton text={handoffPrompt(job)}>คัดลอก prompt ให้ Claude Code</CopyButton></div>
+    </div> : null}
+    {hasBranch && !merged && ['complete', 'needs_review'].includes(job.status) ? <FixPanel job={job} updated={updated} /> : null}
     {hasBranch && !merged ? <MergePanel job={job} updated={updated} /> : null}
     {hasBranch ? <>
       {merged ? null : <p>หรือ merge เองด้วย Git: branch <code>{job.branch}</code></p>}

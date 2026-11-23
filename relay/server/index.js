@@ -168,7 +168,7 @@ function autoCandidates(role, settings, job, values, now, stats = routingStats()
   const siblingRole = role === 'backend' ? 'frontend' : role === 'frontend' ? 'backend' : null;
   const sibling = job && siblingRole ? inflight.get(job.id)?.get(siblingRole) : null;
   const implementers = new Set(job ? ['backend', 'frontend'].map(key => job.stages?.[key]?.provider).filter(provider => Object.hasOwn(names, provider)) : []);
-  const wanted = job?.pinned?.[role];
+  const wanted = wantedProvider(job, role);
   const pinned = wanted && ready.includes(wanted) ? wanted : null;
   const ranking = rank({ role, candidates: ready, quotas: values, settings, stats,
     context: { implementers, siblings: new Set(sibling ? [sibling] : []), pinned }, now });
@@ -180,11 +180,19 @@ function autoCandidates(role, settings, job, values, now, stats = routingStats()
   return list;
 }
 
+// The AI the user picked for an extra fix round wins for the implementer roles; otherwise the Task Card's pin.
+function wantedProvider(job, role) {
+  const fix = job?.fixRequest?.provider;
+  if (fix && ['backend', 'frontend'].includes(role)) return fix;
+  return job?.pinned?.[role] || null;
+}
+
 function routeCandidates(role, settings, job) {
   const now = Date.now();
   const values = publicQuotas();
   if (settings.routing?.mode === 'auto') return autoCandidates(role, settings, job, values, now);
-  const configured = settings.routes[role].filter(provider => Object.hasOwn(names, provider));
+  const preferred = wantedProvider(job, role);
+  const configured = [...new Set([...(preferred ? [preferred] : []), ...settings.routes[role]])].filter(provider => Object.hasOwn(names, provider));
   const order = [...new Set([...configured, ...(settings.auto?.allProviders ? Object.keys(names) : [])])];
   return order.map(provider => ({ provider, extra: !configured.includes(provider), ...providerStatus(provider, role, settings, values, now) }));
 }
@@ -657,7 +665,7 @@ async function work(job, signal) {
     }
     finishStage(job, 'integrate', 'skipped', { branch: job.branch });
   } else if (resuming && built) {
-    addEvent(job, 'ทำต่อ', 'Backend และ UX/UI เสร็จไว้แล้ว ไปขั้นทดสอบและรีวิวต่อ');
+    if (!job.fixRequest) addEvent(job, 'ทำต่อ', 'Backend และ UX/UI เสร็จไว้แล้ว ไปขั้นทดสอบและรีวิวต่อ');
     if (!job.monitor.stages.integrate) finishStage(job, 'integrate', 'skipped', { branch: job.branch });
   } else {
     if (resuming) {
@@ -679,7 +687,30 @@ async function work(job, signal) {
   }
   job.resuming = false;
 
-  for (let round = resuming ? job.round || 0 : 0; round <= job.settings.maxRounds; round++) {
+  // The user asked for one more fix round on a finished job: fix the open findings (and their note), then review once.
+  if (job.fixRequest && built) {
+    const { note, findings: open } = job.fixRequest;
+    job.round = (job.round || 0) + 1;
+    job.roundLimit = job.round;
+    const findings = open.length ? open : [{ owner: 'backend', detail: note }];
+    const prompt = ' Address only the assigned review findings.' + (note ? ' The user reviewed the result and added: ' + note : '');
+    for (const role of job.single ? ['backend'] : ['backend', 'frontend']) {
+      const mine = findings.filter(item => job.single || item.owner === role || (!open.length && role === 'backend'));
+      if (!mine.length) continue;
+      addEvent(job, 'แก้ต่อ', 'รอบ ' + job.round + ' · ' + roles[role] + ' · ' + mine.length + ' ข้อ');
+      await editOn(job, role, integrated, tracked, signal, {
+        branch: job.branch, action: 'fix_review', prompt,
+        context: { findings: mine, ...(note ? { userNote: note } : {}) },
+        findingsText: mine.map(item => item.detail).join('\n') + '\n' + note,
+        message: 'Relay: extra review fixes for ' + role
+      });
+    }
+    job.fixRequest = null;
+    save();
+  }
+  const lastRound = Math.max(job.settings.maxRounds, job.roundLimit || 0);
+
+  for (let round = resuming ? job.round || 0 : 0; round <= lastRound; round++) {
     signal.throwIfAborted();
     checkDeadline(job);
     job.round = round;
@@ -698,7 +729,7 @@ async function work(job, signal) {
     }
     finishRole(job, 'review');
     if (!job.review.findings.length) break;
-    if (round === job.settings.maxRounds) break;
+    if (round >= lastRound) break;
     job.round = round + 1;
     for (const role of job.single ? ['backend'] : ['backend', 'frontend']) {
       // One implementer owns every finding in single-implementer job types.
@@ -962,6 +993,31 @@ app.post('/api/jobs/:id/approve', (req, res) => {
   approvals.delete(job.id);
   resolve({ decision, note: text });
   res.json({ ok: true });
+});
+// One more fix round on a finished job's own branch: the open review findings plus the user's note, then test and review again.
+app.post('/api/jobs/:id/fix', async (req, res) => {
+  const job = findJob(req.params.id);
+  if (!job) return res.status(404).json({ error: 'ไม่พบงานนี้' });
+  if (!['complete', 'needs_review'].includes(job.status)) return res.status(409).json({ error: 'แก้ต่อได้เฉพาะงานที่ทำเสร็จแล้ว' });
+  if (job.merged) return res.status(409).json({ error: 'งานนี้ merge แล้ว สั่งงานใหม่แทน' });
+  if (!hasIntegratedBuild(job)) return res.status(409).json({ error: 'งานนี้ยังไม่มีผล Backend และ UX/UI ให้แก้ต่อ' });
+  const branchExists = await git(job.repo, 'rev-parse', '--verify', 'refs/heads/' + job.branch).then(() => true, () => false);
+  if (!branchExists) return res.status(409).json({ error: 'ไม่พบ branch ' + job.branch + ' แล้ว (อาจถูกลบไป) สั่งงานใหม่แทน' });
+  const { note, provider } = req.body || {};
+  const text = typeof note === 'string' ? note.trim().slice(0, 4000) : '';
+  if (provider && !Object.hasOwn(names, provider)) throw Error('AI ที่เลือกไม่ถูกต้อง');
+  const findings = (job.review?.findings || []).slice(0, 30);
+  if (!findings.length && !text) throw Error('งานนี้ไม่มีปัญหาค้าง บอกด้วยว่าต้องการให้แก้อะไร');
+  job.fixRequest = { note: text, provider: provider || null, findings, at: Date.now() };
+  job.status = 'queued';
+  job.resuming = true;
+  job.error = null;
+  job.finishedAt = null;
+  addEvent(job, 'แก้ต่อ', 'ผู้ใช้สั่งแก้ต่ออีกรอบ' + (findings.length ? ' · ปัญหาค้าง ' + findings.length + ' ข้อ' : '') +
+    (provider ? ' · ให้ ' + names[provider] + ' แก้' : '') + (text ? ' · ' + text : ''));
+  save();
+  setImmediate(drain);
+  res.json(publicJob(job));
 });
 app.get('/api/jobs/:id/steps', (req, res) => res.json(store.steps(req.params.id)));
 // What automatic routing would pick right now for each role, with the scores and the data behind them.
