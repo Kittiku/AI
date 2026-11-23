@@ -64,7 +64,7 @@ function projectJob(job, projects) {
   };
 }
 
-// Both routes use the same persisted projection. Unrelated writes do not publish new snapshots.
+// The live snapshot and job history share a projection. Unrelated writes do not publish new snapshots.
 export function createMonitor(state, activeId) {
   const clients = new Set();
   let previous;
@@ -105,6 +105,13 @@ export function createMonitor(state, activeId) {
     res.set('Cache-Control', 'no-store').json(snapshot);
   }
 
+  function jobJson(req, res) {
+    res.set('Cache-Control', 'no-store');
+    const job = state.jobs.find(item => item.id === req.params.id);
+    if (!job) return res.status(404).json({ error: 'ไม่พบงานนี้' });
+    return res.json({ ...projectJob(job, state.projects), finishedAt: job.finishedAt ?? null });
+  }
+
   function events(_req, res) {
     res.set({
       'Content-Type': 'text/event-stream',
@@ -120,5 +127,5 @@ export function createMonitor(state, activeId) {
     send(res, frame('snapshot', snapshot));
   }
 
-  return { publish, json, events };
+  return { publish, json, jobJson, events };
 }

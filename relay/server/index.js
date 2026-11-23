@@ -469,7 +469,7 @@ async function npm(cwd, args, signal) {
     let output = '';
     for (const stream of [child.stdout, child.stderr]) stream.on('data', chunk => { output = (output + chunk).slice(-6000); });
     child.on('error', reject);
-    child.on('close', code => resolve({ label: 'npm ' + args.join(' '), code, output }));
+    child.on('close', code => resolve({ label: 'npm ' + args.join(' '), code: code ?? -1, output }));
   });
 }
 
@@ -482,7 +482,7 @@ async function verify(job, cwd, signal) {
   setStage(job, 'checks', { status: 'running', startedAt: Date.now(), endedAt: null, round: job.round || 0 });
   const results = await runChecks(job, cwd, signal);
   signal.throwIfAborted();
-  // code null means nothing could be run (no package.json and no project commands), which is "not tested", not a failure.
+  // A null code means no check was available to run.
   const nothingRan = results.every(result => result.code === null);
   const status = nothingRan ? 'skipped' : failedChecks(results).length ? 'warning' : 'done';
   setStage(job, 'checks', { status, note: nothingRan ? 'ไม่มีคำสั่งทดสอบ ตั้งได้ในหน้าโปรเจกต์' : '', endedAt: Date.now() });
@@ -492,24 +492,38 @@ async function verify(job, cwd, signal) {
 
 async function runChecks(job, cwd, signal) {
   if (job.checkCommands?.length) return runCommands(job, cwd, signal);
-  let manifest;
-  try { manifest = JSON.parse(readFileSync(path.join(cwd, 'package.json'), 'utf8')); } catch {
-    return [{ label: 'package.json', code: null, output: 'ไม่พบ package.json ที่ root และโปรเจกต์นี้ยังไม่ได้ตั้งคำสั่งทดสอบ' }];
+  let manifest = readCheckManifest(cwd);
+  let steps = ['test', 'build'].filter(name => manifest?.scripts?.[name]);
+  let prefix = [];
+  if (!steps.length) {
+    // Relay's package lives under relay/ in a checkout of this repository.
+    const nested = readCheckManifest(path.join(cwd, 'relay'));
+    if (nested?.scripts?.build) {
+      manifest = nested;
+      steps = ['build'];
+      prefix = ['--prefix', 'relay'];
+    }
   }
-  const steps = ['test', 'build'].filter(name => manifest.scripts?.[name]);
+  if (!manifest) return [{ label: 'package.json', code: null, output: 'ไม่พบ package.json สำหรับทดสอบ และโปรเจกต์นี้ยังไม่ได้ตั้งคำสั่งทดสอบ' }];
   if (!steps.length) return [{ label: 'npm', code: null, output: 'ไม่พบสคริปต์ test หรือ build' }];
   const results = [];
   if (Object.keys({ ...manifest.dependencies, ...manifest.devDependencies }).length) {
     addEvent(job, 'ทดสอบ', 'เตรียม dependencies จาก lockfile');
-    const install = await npm(cwd, ['ci', '--ignore-scripts', '--no-audit', '--no-fund'], signal);
+    const install = await npm(cwd, [...prefix, 'ci', '--ignore-scripts', '--no-audit', '--no-fund'], signal);
     if (install.code !== 0) return [install];
   }
   for (const step of steps) {
     signal.throwIfAborted();
-    addEvent(job, 'ทดสอบ', 'npm run ' + step);
-    results.push(await npm(cwd, ['run', step], signal));
+    const args = [...prefix, 'run', step];
+    addEvent(job, 'ทดสอบ', 'npm ' + args.join(' '));
+    results.push(await npm(cwd, args, signal));
   }
   return results;
+}
+
+function readCheckManifest(cwd) {
+  try { return JSON.parse(readFileSync(path.join(cwd, 'package.json'), 'utf8')); }
+  catch { return null; }
 }
 
 // Test commands the user set on the project, run through the system shell in the job's worktree.
@@ -826,6 +840,7 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: '200kb' }));
 app.get('/api/monitor', monitor.json);
 app.get('/api/monitor/events', monitor.events);
+app.get('/api/jobs/:id/monitor', monitor.jobJson);
 app.get('/api/state', (_req, res) => res.json({
   ...state, jobs: state.jobs.map(publicJob), usage: undefined, quotas: publicQuotas()
 }));
