@@ -112,21 +112,25 @@ function ProviderCard({ id, info, detailed, reserve }) {
   </article>;
 }
 
-function stagesOf(job) {
-  const keys = ['plan', 'backend', 'frontend', ...(job.runChecks ? ['checks'] : []), 'review'];
+function stagesOf(job, inactive) {
+  const keys = ['plan', 'backend', ...(job.single ? [] : ['frontend']), 'checks', 'review'];
   return keys.map(key => {
     const stage = job.stages?.[key] || {};
     let status = stage.status || 'pending';
-    if (status === 'skipped' && stage.note) return { key, ...stage, status, skippedText: 'ไม่ได้ทดสอบ' };
+    if (key === 'checks' && !job.runChecks && status === 'pending') return { key, status: 'skipped', skippedText: 'ไม่ได้ทดสอบ' };
+    if (key === 'checks' && status === 'skipped') return { key, ...stage, status, skippedText: 'ไม่ได้ทดสอบ' };
+    if (inactive && ['running', 'waiting', 'retrying'].includes(status)) {
+      return { key, status: job.status === 'queued' ? 'pending' : 'skipped' };
+    }
     if (status === 'pending' && stuckStatuses.has(job.status)) status = 'skipped';
     return { key, ...stage, status };
   });
 }
 
-function Stepper({ job, compact }) {
-  const stages = stagesOf(job);
+function Stepper({ job, inactive }) {
+  const stages = stagesOf(job, inactive);
   const now = Date.now();
-  return <ol className={'stepper' + (compact ? ' compact' : '')}>
+  return <ol className="stepper" aria-label="ขั้นตอนการทำงาน">
     {stages.map(stage => <li key={stage.key} className={'stage ' + stage.status}>
       <span className="stage-dot" aria-hidden="true">{stage.status === 'done' ? <Check size={14} /> : stage.status === 'failed' ? <X size={14} /> : null}</span>
       <div>
@@ -135,40 +139,299 @@ function Stepper({ job, compact }) {
           {stage.status === 'waiting' && stage.waitUntil ? ' ถึง ' + time(stage.waitUntil) : ''}
           {stage.provider && stage.status !== 'waiting' ? ' · ' + providerName(stage.provider) : ''}
           {stage.startedAt && stage.status !== 'pending' ? ' · ' + duration((stage.endedAt || now) - stage.startedAt) : ''}
-          {stage.round ? ' · แก้รอบ ' + stage.round : ''}
-          {stage.note ? ' · ' + stage.note : ''}</small>
+          {stage.round ? ' · แก้รอบ ' + stage.round : ''}</small>
       </div>
     </li>)}
   </ol>;
 }
 
-const steps = [
-  [ClipboardList, 'วางแผน', 'กำหนดขอบเขต เกณฑ์รับงาน และ API contract'],
-  [CodeXml, 'Backend + UX/UI', 'ให้แต่ละ AI ทำงานพร้อมกันใน Git worktree แยก'],
-  [FlaskConical, 'รีวิวและทดสอบ', 'ตรวจ diff และผล build กับ test'],
-  [RotateCcw, 'ส่งกลับไปแก้', 'ส่งเฉพาะข้อที่ต้องแก้ให้ AI เจ้าของงาน']
-];
+const monitorStageNames = {
+  ...stageNames, prepare: 'เตรียมงาน', integrate: 'รวมงาน', delivery: 'ส่งมอบ'
+};
+const monitorStageIcons = {
+  prepare: FolderGit2, plan: ClipboardList, work: CodeXml, integrate: GitBranch,
+  checks: FlaskConical, review: ClipboardList, delivery: Check
+};
+const monitorActions = {
+  prepare_worktree: 'เตรียม worktree', plan: 'จัดทำแผน', implement: 'ลงมือแก้ไฟล์',
+  integrate: 'รวมผลจากแต่ละส่วน', run_check: 'รันคำสั่งทดสอบ', review: 'ตรวจผลการแก้ไข',
+  fix_review: 'แก้ตามรีวิว', apply_result: 'นำผลไปใช้', wait_quota: 'รอโควตา AI',
+  wait_approval: 'รอการอนุมัติ', retry: 'ลองใหม่', finish: 'ส่งมอบงาน'
+};
+const monitorActivities = {
+  started: 'เริ่มทำงาน', provider_fallback: 'เปลี่ยนไปใช้ AI สำรอง', quota_wait: 'รอโควตา AI',
+  retry_scheduled: 'เตรียมลองใหม่', approval_requested: 'ขออนุมัติ', completed: 'เสร็จแล้ว',
+  failed: 'ล้มเหลว', cancelled: 'หยุดแล้ว'
+};
+const monitorConnections = {
+  connecting: 'กำลังเชื่อมต่อ', live: 'สด', polling: 'อัปเดตเป็นระยะ', stale: 'ข้อมูลล่าสุดอาจล้าสมัย'
+};
+const approvalLabels = { plan: 'รออนุมัติแผน', budget: 'รออนุมัติงบงาน', daily_budget: 'รออนุมัติงบรายวัน' };
+const workKeys = new Set(['backend', 'frontend']);
+const monitorClock = new Intl.DateTimeFormat('th-TH', {
+  timeZone: 'Asia/Bangkok', hour: '2-digit', minute: '2-digit', second: '2-digit'
+});
+const monitorTime = at => monitorClock.format(at);
 
-function SidePanel({ jobs, select }) {
-  const active = jobs.find(job => job.status === 'running' || job.status === 'stopping');
-  const waiting = jobs.filter(job => job.status === 'queued').length;
-  if (active) return <section className="card workflow active-job">
-    <h2>กำลังทำงาน</h2>
-    <button type="button" className="active-title" onClick={() => select(active.id)}>
-      <strong>{active.title}</strong><small>{repoName(active.repo)} · {jobDuration(active)}</small>
-    </button>
-    <Stepper job={active} compact />
-    <div className="active-footer">
-      {waiting ? <span className="muted">รอคิวอีก {waiting} งาน</span> : <span />}
-      <Button icon={ArrowRight} onClick={() => select(active.id)}>ดูรายละเอียด</Button>
+function isMonitorSnapshot(value) {
+  return Number.isFinite(value?.updatedAt) && Number.isInteger(value.queuedCount) &&
+    (value.lastFinishedJob === null || Boolean(value.lastFinishedJob?.id)) &&
+    (value.activeJob === null || Boolean(value.activeJob?.id &&
+      Array.isArray(value.activeJob.stages) && Array.isArray(value.activeJob.activities)));
+}
+
+function useMonitor() {
+  const [monitor, setMonitor] = useState({ snapshot: null, receivedAt: null, connection: 'connecting' });
+  useEffect(() => {
+    const silenceLimit = 25_000;
+    const pollInterval = 2200;
+    let disposed = false;
+    let stream;
+    let watchdog;
+    let reconnectTimer;
+    let pollTimer;
+    let request;
+    let live = false;
+
+    function applySnapshot(snapshot, connection) {
+      setMonitor({ snapshot, receivedAt: Date.now(), connection });
+    }
+
+    function stopPolling() {
+      clearInterval(pollTimer);
+      pollTimer = undefined;
+      request?.abort();
+      request = undefined;
+    }
+
+    async function poll() {
+      if (request) return;
+      const controller = new AbortController();
+      request = controller;
+      const timeout = setTimeout(() => controller.abort(), 2000);
+      try {
+        const response = await fetch('/api/monitor', { signal: controller.signal, cache: 'no-store' });
+        if (!response.ok) throw Error('Monitor unavailable');
+        const snapshot = await response.json();
+        if (!isMonitorSnapshot(snapshot)) throw Error('Invalid monitor snapshot');
+        if (request === controller && !controller.signal.aborted) applySnapshot(snapshot, 'polling');
+      } catch {
+        if (request === controller) setMonitor(previous => ({ ...previous, connection: 'stale' }));
+      } finally {
+        clearTimeout(timeout);
+        if (request === controller) request = undefined;
+      }
+    }
+
+    function fallBack() {
+      clearTimeout(watchdog);
+      stream?.close();
+      stream = undefined;
+      live = false;
+      setMonitor(previous => previous.connection === 'stale' || !previous.snapshot
+        ? previous : { ...previous, connection: 'polling' });
+      if (pollTimer === undefined) {
+        pollTimer = setInterval(poll, pollInterval);
+        void poll();
+      }
+      if (typeof EventSource === 'function') reconnectTimer = setTimeout(connect, pollInterval);
+    }
+
+    function watchStream() {
+      clearTimeout(watchdog);
+      watchdog = setTimeout(fallBack, silenceLimit);
+    }
+
+    function connect() {
+      const source = new EventSource('/api/monitor/events');
+      stream = source;
+      watchStream();
+      source.addEventListener('snapshot', event => {
+        if (disposed || stream !== source) return;
+        let snapshot;
+        try { snapshot = JSON.parse(event.data); } catch { return; }
+        if (!isMonitorSnapshot(snapshot)) return;
+        live = true;
+        stopPolling();
+        watchStream();
+        applySnapshot(snapshot, 'live');
+      });
+      source.addEventListener('heartbeat', () => {
+        if (stream === source && live) watchStream();
+      });
+      source.addEventListener('error', () => {
+        if (stream === source) fallBack();
+      });
+    }
+
+    if (typeof EventSource === 'function') connect();
+    else fallBack();
+    return () => {
+      disposed = true;
+      stream?.close();
+      stream = undefined;
+      clearTimeout(watchdog);
+      clearTimeout(reconnectTimer);
+      stopPolling();
+    };
+  }, []);
+  return monitor;
+}
+
+function monitorStageStatus(stage) {
+  if (stage.status === 'waiting') {
+    return stage.action === 'wait_approval' ? 'รออนุมัติ' : stage.action === 'wait_quota' ? 'รอโควตา' : 'กำลังรอ';
+  }
+  if (stage.status === 'skipped') return stage.key === 'checks' ? 'ข้ามการทดสอบ' : 'ข้ามขั้นนี้';
+  return stageStatus[stage.status] || 'ยังไม่มีข้อมูล';
+}
+
+function implementationStage(roles) {
+  const statusOrder = ['running', 'retrying', 'waiting', 'failed', 'warning', 'cancelled', 'pending', 'done', 'skipped'];
+  const stage = statusOrder.map(status => roles.find(role => role.status === status)).find(Boolean);
+  const running = roles.filter(role => role.status === 'running').length;
+  return {
+    key: 'work', status: stage?.status,
+    label: running && roles.length > 1 ? 'กำลังทำ ' + running + '/' + roles.length + ' ส่วน' : monitorStageStatus(stage || {})
+  };
+}
+
+function MonitorActivity({ activity }) {
+  return <><strong>{monitorActivities[activity.code] || 'อัปเดตสถานะ'}</strong>
+    {activity.provider ? <span> · {providerName(activity.provider)}</span> : null}</>;
+}
+
+function MonitorTimeline({ job, roles }) {
+  const byKey = Object.fromEntries(job.stages.map(stage => [stage.key, stage]));
+  const keys = ['prepare', 'plan', 'work', 'integrate', 'checks', 'review', 'delivery'];
+  return <ol className="monitor-timeline" aria-label="ขั้นตอนการทำงาน">
+    {keys.filter(key => !['prepare', 'delivery'].includes(key) || byKey[key]).map(key => {
+      const stage = key === 'work' ? implementationStage(roles) : byKey[key] || { key };
+      const Icon = monitorStageIcons[key];
+      const current = ['running', 'waiting', 'retrying'].includes(stage.status);
+      const activity = job.activities.find(item => item.stageKey === key);
+      return <li key={key} className={'monitor-step ' + (stage.status || 'pending')} aria-current={current ? 'step' : undefined}>
+        <span className="monitor-step-icon"><Icon size={16} aria-hidden="true" /></span>
+        <div>
+          <strong>{key === 'work' ? 'ลงมือทำ' : monitorStageNames[key]}</strong>
+          <small>{stage.label || monitorStageStatus(stage)}</small>
+          {stage.action && current ? <small>{monitorActions[stage.action]}{stage.waitUntil ? ' ถึง ' + monitorTime(stage.waitUntil) : ''}</small> : null}
+          {activity?.code === 'provider_fallback' && activity.provider === stage.provider ?
+            <small>{monitorActivities.provider_fallback}</small> : null}
+          {stage.provider ? <small>{providerName(stage.provider)}</small> : null}
+          {stage.round > 0 ? <small>แก้รอบ {stage.round}</small> : null}
+        </div>
+      </li>;
+    })}
+  </ol>;
+}
+
+function MonitorFiles({ label, files, unknown, empty }) {
+  return <details className="monitor-files">
+    <summary>{label}{files != null ? <span>{files.length}</span> : null}</summary>
+    {files?.length ? <ul>{files.map(file => <li key={file}><code>{file}</code></li>)}</ul> :
+      <p>{files == null ? unknown : empty}</p>}
+  </details>;
+}
+
+function MonitorRole({ stage, single, activities }) {
+  const activity = activities.find(item => item.stageKey === stage.key);
+  const Icon = stage.key === 'frontend' ? Layers : CodeXml;
+  return <article className={'monitor-role ' + stage.status}>
+    <header>
+      <h3><Icon size={18} aria-hidden="true" />{single ? 'ลงมือทำ' : monitorStageNames[stage.key]}</h3>
+      <span className="monitor-role-status">{monitorStageStatus(stage)}</span>
+    </header>
+    <p className="monitor-role-action">
+      {monitorActions[stage.action] || monitorStageStatus(stage)}
+      {stage.waitUntil ? <> ถึง <time dateTime={new Date(stage.waitUntil).toISOString()}>{dateTime(stage.waitUntil)}</time></> : null}
+    </p>
+    {activity ? <p className="monitor-role-activity">
+      <time dateTime={new Date(activity.at).toISOString()}>{monitorTime(activity.at)}</time> <MonitorActivity activity={activity} />
+    </p> : null}
+    <dl className="monitor-role-meta">
+      <div><dt>AI</dt><dd>{stage.provider ? providerName(stage.provider) : '–'}</dd></div>
+      <div><dt>รอบแก้</dt><dd>{stage.round ?? '–'}</dd></div>
+      <div><dt>Branch</dt><dd><code>{stage.branch || '–'}</code></dd></div>
+    </dl>
+    <MonitorFiles label="ไฟล์ตามแผน" files={stage.plannedFiles} unknown="ยังไม่มีข้อมูลไฟล์ตามแผน" empty="ไม่มีไฟล์ในแผน" />
+    <MonitorFiles label="ไฟล์ที่ตรวจพบว่าแก้แล้ว" files={stage.changedFiles} unknown="ยังไม่มีผลตรวจไฟล์" empty="ตรวจแล้วไม่พบการแก้ไข" />
+  </article>;
+}
+
+function MonitorActivityList({ job, expanded }) {
+  return <details className="monitor-activity-list" open={expanded ? true : undefined}>
+    <summary>กิจกรรมล่าสุด <span>{job.activities.length}</span></summary>
+    <ol className="events">
+      {job.activities.map(activity => <li key={activity.id}>
+        <time dateTime={new Date(activity.at).toISOString()}>{monitorTime(activity.at)}</time>
+        <div><MonitorActivity activity={activity} />
+          <p>{activity.stageKey === 'backend' && job.single ? 'ลงมือทำ' : monitorStageNames[activity.stageKey] || 'งาน'}</p></div>
+      </li>)}
+    </ol>
+  </details>;
+}
+
+function LiveMonitor({ monitor, job, fallbackJob, onDetails, onApproval, children }) {
+  const { snapshot, receivedAt, connection } = monitor;
+  const [now, setNow] = useState(Date.now);
+  const ticking = Boolean(job?.startedAt) && connection !== 'stale';
+  useEffect(() => {
+    if (!ticking) return;
+    setNow(Date.now());
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [ticking]);
+  const latest = snapshot?.lastFinishedJob;
+  const summary = job || fallbackJob || latest;
+  const roles = job?.stages.filter(stage => workKeys.has(stage.key) && !(job.single && stage.key === 'frontend')) || [];
+  const elapsed = summary?.startedAt == null ? '' : duration(Math.max(0,
+    (summary.finishedAt ?? (connection === 'stale' ? receivedAt ?? now : Math.max(now, receivedAt ?? 0))) - summary.startedAt));
+  const approval = job?.approval;
+  return <section className="card monitor" aria-label="ติดตามงานสด">
+    <header className="monitor-header">
+      <h2><span><Terminal size={19} aria-hidden="true" /></span>ติดตามงานสด</h2>
+      <span className={'monitor-connection ' + connection} role="status">{monitorConnections[connection]}</span>
+    </header>
+    <div className="monitor-summary">
+      <div className="monitor-job">
+        {summary ? <>
+          {!job && !fallbackJob ? <small>งานล่าสุดที่จบ</small> : null}
+          <h3>{summary.title}</h3>
+          {summary.projectName || summary.branch ? <p className="monitor-project">
+            {summary.projectName ? <span>{summary.projectName}</span> : null}
+            {summary.branch ? <span><GitBranch size={14} aria-hidden="true" /><code>{summary.branch}</code></span> : null}
+          </p> : null}
+        </> : <h3>{snapshot ? 'ไม่มีงานที่กำลังทำ' : 'ยังไม่มีข้อมูลติดตามงาน'}</h3>}
+      </div>
+      <div className="monitor-summary-right">
+        {summary ? <span className={'status ' + summary.status}>{statusLabels[summary.status] || 'ยังไม่มีสถานะ'}</span> : null}
+        {onDetails && summary ? <button type="button" className="monitor-link" onClick={() => onDetails(summary.id)}>
+          ดูรายละเอียด <ArrowRight size={15} aria-hidden="true" />
+        </button> : null}
+      </div>
+      <dl className="monitor-metrics">
+        {job || elapsed ? <div><dt>เวลาที่ผ่านไป</dt><dd>{elapsed || '–'}</dd></div> : null}
+        {!job && summary?.finishedAt != null ? <div><dt>จบเมื่อ</dt><dd>{dateTime(summary.finishedAt)}</dd></div> : null}
+        <div><dt>ได้รับข้อมูลล่าสุด</dt><dd>{receivedAt == null ? '–' :
+          <time dateTime={new Date(receivedAt).toISOString()} title={'ข้อมูลจากเซิร์ฟเวอร์ ' + dateTime(snapshot.updatedAt)}>
+            {monitorTime(receivedAt)}
+          </time>}</dd></div>
+        <div><dt>รอในคิว</dt><dd>{snapshot ? snapshot.queuedCount + ' งาน' : '–'}</dd></div>
+      </dl>
     </div>
-  </section>;
-  return <section className="card workflow">
-    <h2>ขั้นตอนการทำงาน</h2>
-    <ol>{steps.map(([Icon, title, detail]) => <li key={title}>
-      <span className="step-icon"><Icon size={23} aria-hidden="true" /></span>
-      <div><h3>{title}</h3><p>{detail}</p></div>
-    </li>)}</ol>
+    {approval ? <div className="monitor-approval">
+      <div><strong>{approvalLabels[approval.kind] || 'รออนุมัติ'}</strong>
+        {approval.requestedAt != null ? <small>ขออนุมัติเมื่อ {dateTime(approval.requestedAt)}</small> : null}</div>
+      <Button primary icon={ArrowRight} onClick={() => onApproval(job.id)}>ไปที่แผงอนุมัติ</Button>
+    </div> : null}
+    {job ? <>
+      <MonitorTimeline job={job} roles={roles} />
+      {roles.length ? <div className={'monitor-roles' + (roles.length === 1 ? ' single' : '')} key={job.id}>
+        {roles.map(stage => <MonitorRole key={stage.key} stage={stage} single={job.single} activities={job.activities} />)}
+      </div> : null}
+      {job.activities.length ? <MonitorActivityList key={job.id} job={job} expanded={Boolean(fallbackJob)} /> : null}
+    </> : children}
   </section>;
 }
 
@@ -577,7 +840,7 @@ function UsageView({ job }) {
 }
 
 // Shown while a job waits: the plan to approve, revise or reject, or a budget question.
-function ApprovalPanel({ job }) {
+function ApprovalPanel({ job, panelRef }) {
   const [note, setNote] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -590,7 +853,7 @@ function ApprovalPanel({ job }) {
     catch (error) { setError(error.message); }
     finally { setBusy(false); }
   }
-  return <section className="card approval-panel" role="region" aria-label="รออนุมัติ">
+  return <section ref={panelRef} tabIndex={-1} className="card approval-panel" aria-label="รออนุมัติ">
     <h2>{plan ? 'ตรวจแผนก่อนลงมือ' : 'ถึงงบที่ตั้งไว้'}</h2>
     <p>{job.approval.message}</p>
     {plan ? <div className="plan-view">
@@ -609,14 +872,29 @@ function ApprovalPanel({ job }) {
   </section>;
 }
 
-function JobDetail({ job, back, retry, updated, removed }) {
+function JobDetail({ job, projectName, monitor, approvalRequested, onApproval, onApprovalFocused, back, retry, updated, removed }) {
   const [tab, setTab] = useState('events');
   const [diff, setDiff] = useState(null);
   const [focus, setFocus] = useState(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
-  const busy = busyStatuses.has(job.status);
+  const approvalRef = useRef(null);
+  const { snapshot } = monitor;
+  const liveJob = snapshot?.activeJob?.id === job.id ? snapshot.activeJob : null;
+  const finishedJob = snapshot?.lastFinishedJob?.id === job.id ? snapshot.lastFinishedJob : null;
+  const status = liveJob?.status ?? finishedJob?.status ?? job.status;
+  const finishedAt = finishedJob?.finishedAt ?? job.finishedAt;
+  const busy = busyStatuses.has(status);
+  const showApproval = Boolean(job.approval && (liveJob
+    ? liveJob.approval?.kind === job.approval.kind : !snapshot && job.status === 'waiting_approval'));
   const hasResult = Boolean(job.worktree || job.branchKept || job.merged);
+  useEffect(() => {
+    if (!approvalRequested || !showApproval) return;
+    const panel = approvalRef.current;
+    panel.focus({ preventScroll: true });
+    panel.scrollIntoView({ block: 'start' });
+    onApprovalFocused();
+  }, [approvalRequested, showApproval, onApprovalFocused]);
   async function showDiff(file) {
     setTab('diff'); setError(''); setFocus(file || null);
     if (diff && !busy && file) return;
@@ -634,9 +912,13 @@ function JobDetail({ job, back, retry, updated, removed }) {
     <button type="button" className="back" onClick={back}><ChevronLeft size={18} /> กลับไปคิวงาน</button>
     <div className="heading detail-heading"><div><h1>{job.title}</h1>
       <p>{job.repo} · สร้าง {dateTime(job.createdAt)}{job.startedAt ? ' · ใช้เวลา ' + jobDuration(job) : ''}{job.resumedFrom ? ' · ใช้แผนจากงานเดิม' : ''}</p></div>
-      <span className={'status ' + job.status}>{statusLabels[job.status]}</span></div>
-    {job.status === 'waiting_approval' && job.approval ? <ApprovalPanel job={job} /> : null}
-    <section className="card progress-card"><Stepper job={job} /></section>
+      <span className={'status ' + status}>{statusLabels[status]}</span></div>
+    <LiveMonitor monitor={monitor} job={liveJob} fallbackJob={{ ...job, status, finishedAt, projectName }} onApproval={onApproval}>
+      <div className="monitor-legacy-progress">
+        <Stepper job={{ ...job, status }} inactive={Boolean(snapshot) || !busy || status === 'queued'} />
+      </div>
+    </LiveMonitor>
+    {showApproval ? <ApprovalPanel job={job} panelRef={approvalRef} /> : null}
     <div className="detail-grid">
       <section className="card detail">
         <div className="filters"><button aria-pressed={tab === 'events'} onClick={() => { setTab('events'); setError(''); }}>ประวัติการทำงาน</button>
@@ -882,9 +1164,11 @@ function useJobAlerts(jobs) {
 
 function App() {
   const [data, setData] = useState(null);
+  const monitor = useMonitor();
   const [networkError, setNetworkError] = useState('');
   const [page, setPage] = useState('queue');
   const [selection, setSelection] = useState(null);
+  const [approvalTarget, setApprovalTarget] = useState(null);
   const [filter, setFilter] = useState('all');
   const [dialog, setDialog] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -910,8 +1194,9 @@ function App() {
   }, [settingsDirty]);
   useJobAlerts(data?.jobs);
   const leaveSettings = () => !settingsDirty || confirm('ออกจากหน้าตั้งค่าโดยไม่บันทึก?');
-  function open(next) { if (next !== page && !leaveSettings()) return; setPage(next); setSelection(null); }
-  function select(id) { if (!leaveSettings()) return; setPage('queue'); setSelection(id); }
+  function open(next) { if (next !== page && !leaveSettings()) return; setPage(next); setSelection(null); setApprovalTarget(null); }
+  function select(id) { if (!leaveSettings()) return; setPage('queue'); setSelection(id); setApprovalTarget(null); }
+  function openApproval(id) { if (!leaveSettings()) return; setPage('queue'); setSelection(id); setApprovalTarget(id); }
   function updateJob(job) {
     setData(previous => ({ ...previous, jobs: [...previous.jobs.filter(item => item.id !== job.id), job].sort((a, b) => a.createdAt - b.createdAt) }));
   }
@@ -932,9 +1217,14 @@ function App() {
   const addProject = project => setData(previous => ({ ...previous, projects: [...previous.projects.filter(item => item.id !== project.id), project] }));
   const removeProject = id => setData(previous => ({ ...previous, projects: previous.projects.filter(item => item.id !== id) }));
   const job = jobs.find(item => item.id === selection);
-  const runningCount = jobs.filter(item => ['running', 'stopping', 'waiting_approval'].includes(item.status)).length;
-  const waitingCount = jobs.filter(item => item.status === 'waiting_approval').length;
-  const queuedCount = jobs.filter(item => item.status === 'queued').length;
+  const projectName = job && (projects.find(project => samePath(project.path, job.repo))?.name || repoName(job.repo));
+  const { snapshot, connection } = monitor;
+  const currentSnapshot = connection === 'stale' ? null : snapshot;
+  const runningCount = currentSnapshot ? Number(Boolean(currentSnapshot.activeJob)) :
+    jobs.filter(item => ['running', 'stopping', 'waiting_approval'].includes(item.status)).length;
+  const waitingCount = currentSnapshot ? Number(Boolean(currentSnapshot.activeJob?.approval)) :
+    jobs.filter(item => item.status === 'waiting_approval').length;
+  const queuedCount = currentSnapshot?.queuedCount ?? jobs.filter(item => item.status === 'queued').length;
   const reserve = data?.settings.reserve ?? {};
   const cards = detailed => <div className="providers">{Object.keys(providers).map(id => <ProviderCard id={id} key={id} info={data?.quotas[id]} detailed={detailed} reserve={reserve[id] ?? 0} />)}</div>;
   return <div className="shell">
@@ -951,15 +1241,18 @@ function App() {
       </header>
       <main>
         {networkError ? <p className="error banner" role="alert">{networkError}</p> : null}
-        {job ? <JobDetail key={job.id} job={job} back={() => setSelection(null)} retry={setDialog} updated={updateJob} removed={removeJob} /> :
+        {job ? <JobDetail key={job.id} job={job} projectName={projectName} monitor={monitor} approvalRequested={approvalTarget === job.id}
+          onApproval={openApproval} onApprovalFocused={() => setApprovalTarget(null)} back={() => open('queue')}
+          retry={setDialog} updated={updateJob} removed={removeJob} /> :
           page === 'settings' ? <><div className="heading"><h1>ตั้งค่า</h1><p>เลือก AI ที่จะรับผิดชอบแต่ละขั้น</p></div>
             {data ? <SettingsForm initial={data.settings} quotas={data.quotas} onDirty={setSettingsDirty} changed={settings => setData(previous => ({ ...previous, settings }))} /> : null}</> :
           page === 'projects' ? <ProjectsPage projects={projects} jobs={jobs} createJob={repo => setDialog({ repo })} added={addProject} removed={removeProject} select={select} /> :
           page === 'quota' ? <><div className="heading"><h1>โควตา AI</h1><p>ดูโควตาคงเหลือ เวลารีเซ็ต และระดับที่กันไว้ของแต่ละผู้ให้บริการ</p></div>{cards(true)}</> :
           <>
             <div className="heading"><h1>คิวงาน AI</h1><p>สั่งงาน ติดตามผล และจัดสรรโควตาจากที่เดียว</p></div>
+            <LiveMonitor monitor={monitor} job={snapshot?.activeJob} onDetails={select} onApproval={openApproval} />
+            <Queue jobs={jobs} filter={filter} setFilter={setFilter} select={select} create={() => setDialog({})} hasProjects={projects.length > 0} addProject={() => open('projects')} />
             {cards(false)}
-            <div className="dashboard-grid"><Queue jobs={jobs} filter={filter} setFilter={setFilter} select={select} create={() => setDialog({})} hasProjects={projects.length > 0} addProject={() => open('projects')} /><SidePanel jobs={jobs} select={select} /></div>
           </>}
       </main>
     </div>
