@@ -200,10 +200,9 @@ function routeCandidates(role, settings, job) {
   return order.map(provider => ({ provider, extra: !configured.includes(provider), ...providerStatus(provider, role, settings, values, now) }));
 }
 
-function recordRouting(job, role, round, decision) {
-  job.routing = [...(job.routing || []), { at: Date.now(), role, round, ...decision, attempts: [] }].slice(-60);
+function recordRouting(job, entry) {
+  job.routing = [...(job.routing || []), entry].slice(-60);
   save();
-  return job.routing.at(-1);
 }
 
 function sleep(ms, signal) {
@@ -242,26 +241,30 @@ async function callCore(job, role, cwd, task, context, schema, signal, accept, o
   if (role === 'review' || !publicQuotas().codex.ready) await refreshCodex(root);
   if ((job.settings.routing?.mode === 'auto' || job.settings.auto?.allProviders || job.settings.routes[role].includes('claudecode')) && !publicQuotas().claudecode.ready) await refreshClaudeCode(root);
   let lastError;
-  const contextLimitedProviders = new Set();
+  let contextError;
+  const contextSkips = new Map();
   let retriesLeft = job.settings.auto?.retries ?? 0;
   for (;;) {
     checkDeadline(job);
     let waitUntil = null;
-    let tried = false;
+    let failed = false;
     const candidates = routeCandidates(role, job.settings, job);
-    let entry = null;
+    const remaining = candidates.filter(item => !contextSkips.has(item.provider));
+    const decision = candidates.decision ?? { mode: 'fixed', ranking: [], skipped: [] };
+    const entry = { at: Date.now(), role, round, ...decision, attempts: [],
+      skipped: [...decision.skipped.filter(item => !contextSkips.has(item.provider)), ...contextSkips.values()] };
     if (candidates.decision) {
-      const first = candidates.find(item => !item.blocked);
+      const first = remaining.find(item => !item.blocked);
       if (first) {
         if (!inflight.has(job.id)) inflight.set(job.id, new Map());
         inflight.get(job.id).set(role, first.provider);
       }
-      entry = recordRouting(job, role, round, candidates.decision);
     }
-    for (const candidate of candidates) {
+    if (candidates.decision || contextSkips.size) recordRouting(job, entry);
+    signal.throwIfAborted();
+    for (const candidate of remaining) {
       const { provider, blocked, extra, waitUntil: until } = candidate;
       signal.throwIfAborted();
-      if (contextLimitedProviders.has(provider)) continue;
       await budgetGate(job, role, signal);
       if (blocked) {
         if (until) waitUntil = Math.min(waitUntil ?? until, until);
@@ -270,11 +273,11 @@ async function callCore(job, role, cwd, task, context, schema, signal, accept, o
       }
       const response = await attempt(provider, extra, candidate, entry);
       if (response) return response;
-      if (!contextLimitedProviders.has(provider)) tried = true;
+      if (!contextSkips.has(provider)) failed = true;
     }
     const auto = job.settings.auto || {};
     const now = Date.now();
-    if (tried && retriesLeft > 0) {
+    if (failed && retriesLeft > 0) {
       retriesLeft--;
       addEvent(job, label, `ทุก AI ทำไม่สำเร็จ ลองใหม่ใน ${Math.round(retryDelay / 1000)} วินาที (ลองได้อีก ${retriesLeft} ครั้ง)`);
       stageSet({ status: 'retrying', endedAt: null });
@@ -296,17 +299,20 @@ async function callCore(job, role, cwd, task, context, schema, signal, accept, o
   }
   stageSet({ status: 'failed', endedAt: Date.now(), waitUntil: null });
   stageFail();
-  throw lastError || Error('ไม่มี AI ที่พร้อมสำหรับงาน ' + label + ' ตรวจหน้าตั้งค่าหรือโควตาแล้วลองอีกครั้ง');
+  throw lastError || contextError || Error('ไม่มี AI ที่พร้อมสำหรับงาน ' + label + ' ตรวจหน้าตั้งค่าหรือโควตาแล้วลองอีกครั้ง');
 
   async function attempt(provider, extra, candidate, entry) {
     const write = Boolean(options.edit && job.settings.agentEdits !== false && (provider === 'claudecode' || provider === 'codex'));
     const before = write ? await attemptState(cwd) : null;
     signal.throwIfAborted();
-    if (entry) {
-      entry.attempts.push(provider);
-      entry.chosen = provider;
-      addEvent(job, label, entry.attempts.length > 1 ? 'ตัวก่อนหน้าทำไม่สำเร็จ ลองใช้ ' + names[provider] + ' ต่อ (อันดับ ' + candidate.row?.rank + ')' :
-        'มอบหมายให้ ' + names[provider] + ' · เลือกอัตโนมัติ: ' + (candidate.row?.reason || 'คะแนนรวมสูงสุด'), provider);
+    entry.attempts.push(provider);
+    entry.chosen = provider;
+    if (candidate.row) {
+      if (contextSkips.size) inflight.get(job.id)?.set(role, provider);
+      const fallback = 'ลองใช้ ' + names[provider] + ' ต่อ (อันดับ ' + candidate.row.rank + ')';
+      if (entry.attempts.length > 1) addEvent(job, label, 'ตัวก่อนหน้าทำไม่สำเร็จ ' + fallback, provider);
+      else if (contextSkips.size) addEvent(job, label, fallback, provider);
+      else addEvent(job, label, 'มอบหมายให้ ' + names[provider] + ' · เลือกอัตโนมัติ: ' + (candidate.row.reason || 'คะแนนรวมสูงสุด'), provider);
     } else addEvent(job, label, (extra ? 'ตัวที่กำหนดไว้ใช้ไม่ได้ ลองใช้ ' : 'มอบหมายให้ ') + names[provider], provider);
     const startedAt = Date.now();
     stageSet({ status: 'running', provider, startedAt, endedAt: null, waitUntil: null, round });
@@ -350,8 +356,21 @@ async function callCore(job, role, cwd, task, context, schema, signal, accept, o
         }
       }
       signal.throwIfAborted();
+      if (contextLimited) {
+        contextError = error;
+        const skip = { provider, reason: error.message };
+        entry.attempts.pop();
+        entry.chosen = entry.attempts.at(-1);
+        entry.skipped.push(skip);
+        // Fixed routing normally has no decision history. Record it when a context skip needs explaining.
+        if (entry.mode === 'fixed' && !contextSkips.size) recordRouting(job, entry);
+        contextSkips.set(provider, skip);
+        const assigned = inflight.get(job.id);
+        if (assigned?.get(role) === provider) assigned.delete(role);
+        addEvent(job, label, 'ข้าม ' + names[provider] + ' · ' + error.message.slice(0, 800), provider);
+        return null;
+      }
       lastError = error;
-      if (contextLimited) contextLimitedProviders.add(provider);
       if (error.cooldown) cooldowns[provider] = Date.now() + error.cooldown;
       addEvent(job, label, error.message.slice(0, 800), provider);
       stageFail();
