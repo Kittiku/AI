@@ -740,7 +740,22 @@ function RoutingPreview({ refreshKey }) {
   </div>;
 }
 
-function SettingsForm({ initial, changed, quotas, onDirty }) {
+function withTeamDefaults(settings) {
+  const team = settings.team;
+  return {
+    ...settings,
+    team: {
+      ...team,
+      mode: team?.mode ?? 'auto',
+      maxSubtasks: team?.maxSubtasks ?? 4,
+      parallel: team?.parallel ?? 2,
+      check: team?.check ?? 'always'
+    }
+  };
+}
+
+function SettingsForm({ initial: storedSettings, changed, quotas, onDirty }) {
+  const initial = withTeamDefaults(storedSettings);
   const [draft, setDraft] = useState(initial);
   const [notice, setNotice] = useState(null);
   const [saving, setSaving] = useState(false);
@@ -749,6 +764,8 @@ function SettingsForm({ initial, changed, quotas, onDirty }) {
   const duplicate = hasDuplicate(draft.routes);
   const setAuto = (key, value) => setDraft(current => ({ ...current, auto: { ...current.auto, [key]: value } }));
   const setBudget = (key, value) => setDraft(current => ({ ...current, budget: { ...current.budget, [key]: value } }));
+  const { team } = draft;
+  const setTeam = (key, value) => setDraft(current => ({ ...current, team: { ...current.team, [key]: value } }));
   useEffect(() => { onDirty(dirty); }, [dirty, onDirty]);
   useEffect(() => () => onDirty(false), [onDirty]);
   async function submit(event) {
@@ -756,7 +773,7 @@ function SettingsForm({ initial, changed, quotas, onDirty }) {
     try {
       const saved = await api('/settings', 'PUT', draft);
       changed(saved);
-      setDraft(saved);
+      setDraft(withTeamDefaults(saved));
       setNotice({ text: 'บันทึกการตั้งค่าแล้ว' });
     } catch (error) { setNotice({ text: error.message, error: true }); }
     finally { setSaving(false); }
@@ -806,16 +823,36 @@ function SettingsForm({ initial, changed, quotas, onDirty }) {
     <label className="checkbox"><input type="checkbox" checked={draft.agentEdits !== false} onChange={event => setDraft({ ...draft, agentEdits: event.target.checked })} />ให้ Claude Code และ Codex แก้ไฟล์เองใน worktree ของงาน (เห็นทั้ง repo แก้ไฟล์ใหญ่ได้ตรงจุด) Gemini ยังส่งผลเป็น JSON</label>
     <label className="checkbox"><input type="checkbox" checked={draft.approvals?.afterPlan} onChange={event => setDraft({ ...draft, approvals: { ...draft.approvals, afterPlan: event.target.checked } })} />ทุกงาน: หยุดให้ฉันอนุมัติแผนก่อนลงมือแก้โค้ด</label>
     <h2 className="section-gap">ทำงานเป็นทีม</h2>
-    <p className="muted">คนวางแผนประเมินความยากของงาน งานง่ายทำรวดเดียวแบบเดิม งานกลางและยากจะแบ่งงานของแต่ละฝั่งเป็นงานย่อย ทำทีละชิ้น และหัวหน้า (AI อีกตัว) ตรวจแต่ละชิ้นก่อนไปชิ้นต่อไป ถ้าไม่ผ่านส่งกลับให้แก้ 1 รอบ ใช้ AI มากขึ้นตามจำนวนงานย่อย</p>
+    <p className="muted">ผู้วางแผนประเมินความยากของงาน งานง่ายทำรวดเดียว งานระดับกลางและงานยากจะแบ่งเป็นงานย่อยของแต่ละฝั่ง งานย่อยที่ไม่ต้องรอกันทำพร้อมกันได้</p>
     <div className="settings-grid">
       <label>แบ่งงานย่อย
-        <select value={draft.team?.mode ?? 'auto'} onChange={event => setDraft({ ...draft, team: { maxSubtasks: 4, ...draft.team, mode: event.target.value } })}>
+        <select value={team.mode} onChange={event => setTeam('mode', event.target.value)}>
           <option value="auto">อัตโนมัติตามความยาก</option>
           <option value="off">ปิด ทำทั้งฝั่งรวดเดียว</option>
         </select>
       </label>
-      <label>งานย่อยสูงสุดต่อฝั่ง<input type="number" required min="2" max="6" disabled={draft.team?.mode === 'off'} value={draft.team?.maxSubtasks ?? 4}
-        onChange={event => setDraft({ ...draft, team: { mode: 'auto', ...draft.team, maxSubtasks: Number(event.target.value) } })} /></label>
+      <label>งานย่อยสูงสุดต่อฝั่ง<input type="number" required min="2" max="6" disabled={team.mode === 'off'} value={team.maxSubtasks}
+        onChange={event => setTeam('maxSubtasks', Number(event.target.value))} /></label>
+      <div className="settings-field">
+        <label htmlFor="team-parallel">งานย่อยที่ทำพร้อมกันต่อฝั่ง</label>
+        <select id="team-parallel" aria-describedby="team-parallel-help" value={team.parallel}
+          onChange={event => setTeam('parallel', Number(event.target.value))}>
+          <option value={1}>1</option>
+          <option value={2}>2 (ค่าเริ่มต้น)</option>
+          <option value={3}>3</option>
+        </select>
+        <small id="team-parallel-help">เลือก 1 เพื่อทำงานทีละชิ้นตามลำดับเหมือนเดิม</small>
+      </div>
+      <div className="settings-field">
+        <label htmlFor="team-check">ให้หัวหน้าตรวจงานย่อยเมื่อไร</label>
+        <select id="team-check" aria-describedby="team-check-help" value={team.check}
+          onChange={event => setTeam('check', event.target.value)}>
+          <option value="always">ตรวจทุกงานย่อย (ค่าเริ่มต้น)</option>
+          <option value="hard">ตรวจเฉพาะงานที่ประเมินว่ายาก</option>
+          <option value="off">ข้ามการตรวจงานย่อย</option>
+        </select>
+        <small id="team-check-help">เมื่อข้ามการตรวจงานย่อย ให้รีวิวรวมตอนท้ายตัดสิน</small>
+      </div>
     </div>
     </> : null}
     {show('budget') ? <>
