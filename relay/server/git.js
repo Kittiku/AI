@@ -162,36 +162,80 @@ export async function restoreAttempt(cwd, before) {
   }
 }
 
-export async function snapshot(cwd, include = []) {
+const snapshotKey = name => String(name).replaceAll('\\', '/').replace(/^\.\//, '').toLowerCase();
+const snapshotSource = name => sourceFile.test(name) && !/(^|\/)(package-lock\.json|pnpm-lock\.yaml)$/i.test(name);
+
+async function snapshotPaths(cwd) {
   const entries = (await git(cwd, 'ls-files', '--stage', '-z')).split('\0').filter(Boolean);
-  const files = [];
-  const list = entries.flatMap(entry => {
+  return entries.flatMap(entry => {
     const tab = entry.indexOf('\t');
     const name = entry.slice(tab + 1);
     return /^100[67]/.test(entry) && validFile(name) ? [name] : [];
   });
-  const wanted = new Set(include.map(name => String(name).replaceAll('\\', '/').replace(/^\.\//, '').toLowerCase()));
-  const priority = name => wanted.has(name.toLowerCase()) ? 0 : /(^|\/)(README\.md|package\.json|AGENTS\.md|CLAUDE\.md)$/i.test(name) ? 1 : 2;
-  list.sort((a, b) => priority(a) - priority(b));
+}
+
+export async function snapshot(cwd, include = []) {
+  return JSON.stringify(await buildSnapshot(cwd, await snapshotPaths(cwd), include));
+}
+
+export async function editContexts(cwd, fields, requiredFiles, priorChanges = []) {
+  const paths = await snapshotPaths(cwd);
+  const [repo, cliRepo] = await Promise.all([
+    buildSnapshot(cwd, paths, [...requiredFiles, ...priorChanges]),
+    buildSnapshot(cwd, paths, requiredFiles, priorChanges)
+  ]);
+  return {
+    context: JSON.stringify({ ...fields, repo }),
+    geminiCliContext: JSON.stringify({ ...fields, repo: cliRepo })
+  };
+}
+
+async function buildSnapshot(cwd, paths, include, priorChanges) {
+  const wanted = new Set(include.map(snapshotKey));
+  const prior = new Set((priorChanges ?? []).map(snapshotKey));
+  const priority = name => {
+    const key = snapshotKey(name);
+    if (wanted.has(key)) return 0;
+    if (prior.has(key) && snapshotSource(name)) return 1;
+    return /(^|\/)(README\.md|package\.json|AGENTS\.md|CLAUDE\.md)$/i.test(name) ? 2 : 3;
+  };
+  const list = paths.slice().sort((a, b) => priority(a) - priority(b));
   let includeBudget = 1_200_000;
   let budget = 125_000;
+  const preferred = new Set();
+  const trackedPaths = [];
+  const overflowPaths = [];
+  const files = [];
   const omittedPaths = [];
-  for (const name of list.slice(0, 400)) {
-    if (!sourceFile.test(name) || /(^|\/)(package-lock\.json|pnpm-lock\.yaml)$/i.test(name)) continue;
+  for (const name of list) {
+    if (trackedPaths.length === 400) break;
+    const key = snapshotKey(name);
+    const named = wanted.has(key);
+    const previous = !named && prior.has(key) && snapshotSource(name);
+    if (previous && (preferred.size >= 30 || preferred.has(key))) {
+      // Keep capped prior paths visible after other tracked paths.
+      overflowPaths.push(name);
+      continue;
+    }
+    trackedPaths.push(name);
+    if (!snapshotSource(name)) continue;
     const file = await checkedPath(cwd, name);
     const info = await lstat(file).catch(error => error.code === 'ENOENT' ? null : Promise.reject(error));
     if (!info?.isFile()) continue;
-    const named = priority(name) === 0;
     const fits = named ? info.size <= 400_000 && info.size <= includeBudget : info.size <= 24_000 && info.size <= budget;
     if (!fits) { omittedPaths.push(name); continue; }
     const content = await readFile(file, 'utf8');
     if (content.includes('\0')) continue;
+    const bytes = priorChanges !== undefined && !named ? Buffer.byteLength(content, 'utf8') : info.size;
+    if (!named && (bytes > 24_000 || bytes > budget)) { omittedPaths.push(name); continue; }
     files.push({ path: name, content });
-    if (named) includeBudget -= info.size; else budget -= info.size;
+    if (named) includeBudget -= bytes; else budget -= bytes;
+    if (previous) preferred.add(key);
   }
-  const requiredPaths = list.filter(name => wanted.has(name.toLowerCase()) && sourceFile.test(name) &&
-    !/(^|\/)(package-lock\.json|pnpm-lock\.yaml)$/i.test(name));
-  return JSON.stringify({ trackedPaths: list.slice(0, 400), files, requiredPaths, omitted: list.length - files.length, omittedPaths: omittedPaths.slice(0, 100) });
+  trackedPaths.push(...overflowPaths.slice(0, 400 - trackedPaths.length));
+  return { trackedPaths, files,
+    ...(priorChanges !== undefined && { requiredPaths: list.filter(name => wanted.has(snapshotKey(name)) && snapshotSource(name)) }),
+    omitted: list.length - files.length, omittedPaths: [...omittedPaths, ...overflowPaths].slice(0, 100) };
 }
 
 // Find/replace edits let an AI change part of a large file without resending all of it.

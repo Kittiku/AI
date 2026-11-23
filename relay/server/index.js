@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { realpath } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
-import { applyEdits, applyFiles, attemptChanges, attemptState, checkpoint, git, isSafePath, repository, restoreAttempt, snapshot } from './git.js';
+import { applyEdits, applyFiles, attemptChanges, attemptState, checkpoint, editContexts, git, isSafePath, repository, restoreAttempt, snapshot } from './git.js';
 import { editSchema, generate, names, pacificDay, planSchema, quota, refreshClaudeCode, refreshCodex, reviewSchema, subtaskCheckSchema, USAGE } from './providers.js';
 import { openStore } from './store.js';
 import { PROFILES, rank } from './router.js';
@@ -322,7 +322,7 @@ async function callCore(job, role, cwd, task, context, schema, signal, accept, o
       }
       const text = typeof task === 'function' ? task({ write }) : task;
       const response = await generate(provider, cwd, toolInstructions + '\n' + text +
-        '\nUSER TASK\n' + job.prompt, schema, signal, () => { day = null; }, { write, context });
+        '\nUSER TASK\n' + job.prompt, schema, signal, () => { day = null; }, { write, context, geminiCliContext: options.geminiCliContext });
       addUsage(job, response[USAGE]);
       signal.throwIfAborted();
       const after = write ? await attemptState(cwd, before) : null;
@@ -843,12 +843,13 @@ async function editOn(job, role, cwd, tracked, signal, {
   branch, message, action = 'implement', prompt = '', context = {}, findingsText = '', onOutput
 }) {
   beginStage(job, role, action, branch, job.round || 0);
-  const priorChanges = context.subtask ? await changedFileNames(cwd, job.base, 'HEAD') : [];
-  const requiredFiles = [...(context.subtask?.files || []), ...(priorChanges || []), ...filesFor(job, role, tracked, findingsText)];
-  const repo = JSON.parse(await snapshot(cwd, requiredFiles));
+  const priorChanges = context.subtask ? await changedFileNames(cwd, job.base, 'HEAD') : null;
+  const requiredFiles = [...(context.subtask?.files || []), ...filesFor(job, role, tracked, findingsText)];
+  const { context: normalContext, geminiCliContext } = await editContexts(cwd,
+    { plan: job.plan, project: projectMemory(job), ...context }, requiredFiles, priorChanges ?? []);
   const output = await call(job, role, cwd, ({ write }) => (write ? agentEditPrompt(job, role) : editPrompt(role) + scopeText(job)) + prompt,
-    JSON.stringify({ plan: job.plan, project: projectMemory(job), ...context, repo }), editSchema, signal,
-    (response, attempt) => checkEdits(job, cwd, response, attempt), { edit: true, action });
+    normalContext, editSchema, signal,
+    (response, attempt) => checkEdits(job, cwd, response, attempt), { edit: true, action, geminiCliContext });
   signal.throwIfAborted();
   onOutput?.(output);
   await applyOutput(cwd, output);
