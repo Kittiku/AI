@@ -79,10 +79,11 @@ function subtaskOrder(tasks) {
 }
 
 // runSubtask(task, number) resolves after implementation and any required check pass.
-// With parallel = 1 it runs directly on the role branch in plan order, as before.
+// With parallel = 1 it runs directly on the role branch, in dependency order with plan order as the tie-breaker.
 // Otherwise mergeSubtask(task, result, number) applies an isolated result to the role branch.
 // Return { conflict: true } after undoing a conflicted merge. rerunSequential(task, number)
 // then applies and checks a replacement directly on the role branch and returns its result.
+// availableProviders may be a function read before dispatching each set of ready tasks.
 // onWaiting(task, waitingOn, number) reports changed dependency lists, including when cleared.
 // The returned results are indexed in plan order even when a dependency points forward.
 export async function runSubtaskScheduler({
@@ -90,17 +91,8 @@ export async function runSubtaskScheduler({
 }) {
   const subtasks = normalizeSubtasks(tasks);
   const parallel = normalizeParallel(teamParallel);
+  const countAvailable = typeof availableProviders === 'function' ? availableProviders : () => availableProviders;
   const results = [];
-  if (parallel === 1) {
-    for (const [index, task] of subtasks.entries()) {
-      signal?.throwIfAborted();
-      results.push(await runSubtask(task, index + 1));
-    }
-    signal?.throwIfAborted();
-    return results;
-  }
-
-  const limit = effectiveParallelLimit(parallel, availableProviders);
   const order = subtaskOrder(subtasks);
   const pending = new Set(order);
   const running = new Set();
@@ -126,12 +118,14 @@ export async function runSubtaskScheduler({
         if (!waitingOn.length) ready.push(number);
       }
 
-      // Merge in one place, and finish any conflict rerun before starting more work.
+      // Confirm each result in order. Serial tasks have already written to the role branch.
       const number = order[nextMerge];
       if (completed.has(number)) {
         const task = subtasks[number - 1];
         const result = completed.get(number);
-        const outcome = await mergeSubtask(task, result, number);
+        const outcome = parallel === 1 ? null : await mergeSubtask(task, result, number);
+        // Drain active work and pause dispatch while the conflicted task runs on the role branch.
+        if (outcome?.conflict) await Promise.all(running);
         signal?.throwIfAborted();
         if (failure) throw failure.error;
         results[number - 1] = outcome?.conflict ? await rerunSequential(task, number) : result;
@@ -142,16 +136,20 @@ export async function runSubtaskScheduler({
         continue;
       }
 
-      for (const number of ready.slice(0, limit - running.size)) {
-        pending.delete(number);
-        const task = subtasks[number - 1];
-        const work = Promise.resolve().then(() => {
-          signal?.throwIfAborted();
-          return runSubtask(task, number);
-        })
-          .then(result => completed.set(number, result), error => { failure ??= { error }; })
-          .finally(() => running.delete(work));
-        running.add(work);
+      if (ready.length && running.size < parallel) {
+        const limit = parallel === 1 ? 1 : effectiveParallelLimit(parallel, countAvailable());
+        const slots = Math.max(0, limit - running.size);
+        for (const number of ready.slice(0, slots)) {
+          pending.delete(number);
+          const task = subtasks[number - 1];
+          const work = Promise.resolve().then(() => {
+            signal?.throwIfAborted();
+            return runSubtask(task, number);
+          })
+            .then(result => completed.set(number, result), error => { failure ??= { error }; })
+            .finally(() => running.delete(work));
+          running.add(work);
+        }
       }
       await Promise.race(running);
     }

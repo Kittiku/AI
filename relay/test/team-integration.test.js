@@ -98,7 +98,7 @@ const approve = { summary: 'Integrated review passed', findings: [] };
 const stepLog = job => server.store.steps(job.id).map(({ role, round, status }) => [role, round, status]);
 const snapshotFile = (context, name) => context.repo.files.find(file => file.path === name)?.content;
 
-async function runJob({ plan, contents, respond, parallel = 2, check = 'always' }) {
+async function runJob({ plan, contents, respond, parallel = 2, check = 'always', status = 'complete' }) {
   const repo = await mkdtemp(path.join(root, 'repo-'));
   await git(repo, 'init', '--quiet', '--initial-branch=main');
   await git(repo, 'config', 'core.autocrlf', 'false');
@@ -125,7 +125,7 @@ async function runJob({ plan, contents, respond, parallel = 2, check = 'always' 
   };
   job = await server.createJob({ title: 'Team integration', prompt: 'Update the project', repo, type: 'feature' });
   await server.drain();
-  assert.equal(job.status, 'complete', job.error);
+  assert.equal(job.status, status, job.error);
   return { job, repo: job.repo, base, calls };
 }
 
@@ -317,6 +317,62 @@ test('a skipped UX/UI stage has no AI usage until review assigns it a fix on the
   assert.equal(projectedStage(job, 'review').status, 'done');
   assert.equal(await git(repo, 'show', job.branch + ':frontend.txt'), 'frontend fix');
   await assertCleanWorktrees(job);
+});
+
+test('serial work waits for a forward dependency to pass its check on the role branch', async () => {
+  const plan = planFor([subtask('one.txt', [2]), subtask('two.txt')]);
+  const { job, calls } = await runJob({
+    plan, parallel: 1, contents: { 'one.txt': 'base\n', 'two.txt': 'base\n' },
+    async respond(call, job) {
+      if (call.kind === 'review') return approve;
+      const { number, files } = call.context.subtask;
+      assert.equal(await git(call.cwd, 'rev-parse', '--abbrev-ref', 'HEAD'), job.branch + '-backend');
+      if (number === 2) assert.deepEqual(job.team.backend[0].waitingOn, [2]);
+      if (call.kind === 'check') return pass;
+      if (number === 1) {
+        assert.equal(job.team.backend[1].status, 'passed');
+        assert.deepEqual(job.team.backend[0].waitingOn, []);
+        assert.equal(snapshotFile(call.context, 'two.txt'), 'change 2\n');
+      }
+      return change(files[0], 'change ' + number + '\n');
+    }
+  });
+  assert.deepEqual(calls.filter(call => call.context.subtask).map(call => [call.kind, call.context.subtask.number]),
+    [['edit', 2], ['check', 2], ['edit', 1], ['check', 1]]);
+  await assertCleanWorktrees(job);
+});
+
+test('serial work blocks a dependent when its prerequisite fails both checks', async () => {
+  const plan = planFor([subtask('one.txt'), subtask('two.txt', [1])]);
+  const { job, calls } = await runJob({
+    plan, parallel: 1, status: 'failed', contents: { 'one.txt': 'base\n', 'two.txt': 'base\n' },
+    respond(call) {
+      if (call.kind === 'check') return { verdict: 'fix', summary: 'Still broken', problems: ['Update one.txt'] };
+      const { number } = call.context.subtask;
+      assert.equal(number, 1);
+      return change('one.txt', call.context.problems?.length ? 'attempted fix\n' : 'first attempt\n');
+    }
+  });
+  assert.match(job.error, /#1 ยังไม่ผ่านการตรวจ/);
+  assert.deepEqual(calls.map(call => call.kind), ['plan', 'edit', 'check', 'edit', 'check']);
+  assert.equal(job.team.backend[0].status, 'warning');
+  assert.equal(job.team.backend[0].fixes, 1);
+});
+
+test('a dependency removed by the subtask cap blocks implementation in both roles', async () => {
+  const plan = {
+    ...planFor([subtask('backend.txt')]),
+    frontend: 'Update frontend files',
+    frontendTasks: [subtask('ui.txt', [5]), ...Array.from({ length: 4 }, () => subtask('ui.txt'))]
+  };
+  const { job, calls } = await runJob({
+    plan, status: 'failed', contents: { 'backend.txt': 'base\n', 'ui.txt': 'base\n' },
+    respond: () => assert.fail('implementation must wait for a valid plan')
+  });
+  assert.match(job.error, /UX\/UI งานย่อย #1 ต้องรอ #5.*เพดานงานย่อย 4 ชิ้น/);
+  assert.deepEqual(calls.map(call => call.kind), ['plan']);
+  assert.deepEqual(stepLog(job), [['plan', 0, 'done']]);
+  assert.equal(await git(job.worktree, 'rev-parse', 'HEAD'), job.base);
 });
 
 for (const { check, complexity, expected } of [

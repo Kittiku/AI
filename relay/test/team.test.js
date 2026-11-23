@@ -107,21 +107,25 @@ test('the scheduler fills free slots with independent tasks while a dependent wa
   assert.deepEqual(waiting, [[2, [1]], [2, []]]);
 });
 
-test('parallel = 1 follows the original plan order on the role branch', async () => {
+test('parallel = 1 waits for forward dependencies and writes directly to the role branch', async () => {
   const events = [];
   const results = await runSubtaskScheduler({
-    tasks: [{ dependsOn: [2] }, {}], teamParallel: 1, availableProviders: 3,
+    tasks: [{ dependsOn: [2] }, {}, {}], teamParallel: 1,
+    availableProviders: () => assert.fail('serial mode needs no provider count'),
     async runSubtask(_task, number) {
       events.push(['start', number]);
       await nextTurn();
       events.push(['done', number]);
       return number;
     },
-    onWaiting: () => assert.fail('legacy mode has no dependency waits'),
-    mergeSubtask: () => assert.fail('legacy mode writes directly to the role branch')
+    onWaiting(_task, waitingOn, number) { events.push(['waiting', number, waitingOn]); },
+    mergeSubtask: () => assert.fail('serial mode writes directly to the role branch')
   });
-  assert.deepEqual(results, [1, 2]);
-  assert.deepEqual(events, [['start', 1], ['done', 1], ['start', 2], ['done', 2]]);
+  assert.deepEqual(results, [1, 2, 3]);
+  assert.deepEqual(events, [
+    ['waiting', 1, [2]], ['start', 2], ['done', 2], ['waiting', 1, []],
+    ['start', 1], ['done', 1], ['start', 3], ['done', 3]
+  ]);
 });
 
 test('the scheduler caps active work at the number of ready providers', async () => {
@@ -144,6 +148,45 @@ test('the scheduler caps active work at the number of ready providers', async ()
     assert.deepEqual(merged, [1, 2, 3, 4]);
     assert.deepEqual(results, [1, 2, 3, 4]);
   }
+});
+
+test('provider availability is rechecked before dispatch without interrupting active subtasks', async () => {
+  const gates = Array.from({ length: 6 }, () => Promise.withResolvers());
+  const started = [];
+  const finished = [];
+  let available = 3;
+  const run = runSubtaskScheduler({
+    tasks: gates.map(() => ({})), teamParallel: 3,
+    availableProviders: () => available,
+    async runSubtask(_task, number) {
+      started.push(number);
+      await gates[number - 1].promise;
+      finished.push(number);
+      return number;
+    },
+    mergeSubtask() {}
+  });
+
+  await nextTurn();
+  assert.deepEqual(started, [1, 2, 3]);
+  available = 1;
+  gates[0].resolve();
+  await nextTurn();
+  assert.deepEqual(started, [1, 2, 3]);
+  gates[1].resolve();
+  await nextTurn();
+  assert.deepEqual(started, [1, 2, 3]);
+  gates[2].resolve();
+  await nextTurn();
+  assert.deepEqual(finished, [1, 2, 3]);
+  assert.deepEqual(started, [1, 2, 3, 4]);
+
+  available = 2;
+  gates[3].resolve();
+  await nextTurn();
+  assert.deepEqual(started, [1, 2, 3, 4, 5, 6]);
+  for (const gate of gates.slice(4)) gate.resolve();
+  assert.deepEqual(await run, [1, 2, 3, 4, 5, 6]);
 });
 
 test('forward dependencies and cycles still yield results in plan order', async () => {
@@ -195,6 +238,46 @@ test('a conflict reruns the task on the merged code before unlocking its depende
   assert.deepEqual(await run, ['isolated 1', 'rerun 2', 'isolated 3']);
   assert.deepEqual(branch, ['isolated 1', 'rerun 2', 'isolated 3']);
   assert.deepEqual(waiting, [[3, [1, 2]], [3, [2]], [3, []]]);
+});
+
+test('a conflict rerun waits for active siblings and pauses new work until it finishes', async () => {
+  const second = Promise.withResolvers();
+  const third = Promise.withResolvers();
+  const rerun = Promise.withResolvers();
+  const events = [];
+  const run = runSubtaskScheduler({
+    tasks: [{}, {}, {}, { dependsOn: [2] }], teamParallel: 2, availableProviders: 2,
+    async runSubtask(_task, number) {
+      events.push('start ' + number);
+      if (number === 2) await second.promise;
+      if (number === 3) await third.promise;
+      events.push('done ' + number);
+      return number;
+    },
+    mergeSubtask(_task, _result, number) {
+      events.push('merge ' + number);
+      if (number === 2) return { conflict: true };
+    },
+    async rerunSequential(_task, number) {
+      events.push('rerun ' + number);
+      await rerun.promise;
+      return 'rerun ' + number;
+    }
+  });
+
+  await nextTurn();
+  assert.deepEqual(events, ['start 1', 'done 1', 'start 2', 'merge 1', 'start 3']);
+  second.resolve();
+  await nextTurn();
+  assert.deepEqual(events.slice(-2), ['done 2', 'merge 2']);
+  assert.ok(!events.includes('rerun 2'));
+  third.resolve();
+  await nextTurn();
+  assert.deepEqual(events.slice(-2), ['done 3', 'rerun 2']);
+  assert.ok(!events.includes('start 4'));
+  rerun.resolve();
+  assert.deepEqual(await run, [1, 'rerun 2', 3, 4]);
+  assert.deepEqual(events.slice(-4), ['merge 3', 'start 4', 'done 4', 'merge 4']);
 });
 
 test('a failed check blocks dependents and lets already running work settle before cleanup', async () => {

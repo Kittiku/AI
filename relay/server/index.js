@@ -931,12 +931,21 @@ function subtasksFor(job, role) {
   if (!Array.isArray(planned)) return null;
   const selected = planned.map((task, index) => ({ task, number: index + 1 }))
     .filter(({ task }) => task?.title && task?.goal).slice(0, settings.maxSubtasks);
-  if (selected.length < (settings.parallel === 1 ? 2 : 1)) return null;
-  // Preserve dependency targets when an old plan contains an unusable task or exceeds the configured cap.
   const numbers = new Map(selected.map(({ number }, index) => [number, index + 1]));
-  return normalizeSubtasks(selected.map(({ task }) => ({
-    ...task, dependsOn: Array.isArray(task.dependsOn) ? task.dependsOn.map(number => numbers.get(number)) : []
-  })));
+  const tasks = selected.map(({ task, number }) => {
+    const dependencies = Array.isArray(task.dependsOn) ? task.dependsOn : [];
+    const missing = dependencies.find(dependency => Number.isInteger(dependency) &&
+      dependency >= 1 && dependency <= planned.length && !numbers.has(dependency));
+    if (missing !== undefined) {
+      const removed = planned[missing - 1];
+      const reason = removed?.title && removed?.goal
+        ? 'เกินเพดานงานย่อย ' + settings.maxSubtasks + ' ชิ้น'
+        : 'ขาดชื่อหรือเป้าหมาย';
+      throw Error(roles[role] + ' งานย่อย #' + number + ' ต้องรอ #' + missing + ' แต่ชิ้นที่รอ' + reason + ' กรุณาแก้แผนก่อนเริ่มงาน');
+    }
+    return { ...task, dependsOn: dependencies.map(dependency => numbers.get(dependency)) };
+  });
+  return tasks.length < (settings.parallel === 1 ? 2 : 1) ? null : normalizeSubtasks(tasks);
 }
 
 const subtaskCheckPrompt = parallel => 'You are the lead of this role. Check one finished subtask' + (parallel ? '' : ' before the next one starts') +
@@ -960,48 +969,41 @@ async function runTeam(job, role, cwd, branch, tracked, signal, tasks) {
   addEvent(job, roles[role], 'หัวหน้าแบ่งงานเป็น ' + items.length + ' งานย่อย: ' + items.map(item => item.id + '. ' + item.title).join(' · '));
 
   try {
-    if (!parallel) {
-      for (const item of items) {
-        await execute(item, cwd);
-        remember(item);
-        save();
-      }
-    } else {
+    if (parallel) {
       beginStage(job, role, 'subtask', branch, job.round || 0);
       setStage(job, role, { status: 'running', provider: null, startedAt: Date.now(), endedAt: null, waitUntil: null });
-      await runSubtaskScheduler({
-        tasks, teamParallel: settings.parallel,
-        availableProviders: routeCandidates(role, job.settings, job).filter(item => !item.blocked).length,
-        signal,
-        onWaiting(_task, waitingOn, number) {
-          Object.assign(items[number - 1], { status: waitingOn.length ? 'waiting' : 'pending', waitingOn });
-          save();
-        },
-        async runSubtask(_task, number) {
-          const subtaskCwd = path.join(path.dirname(cwd), role + '-subtask-' + number);
-          temporary.set(number, subtaskCwd);
-          const start = await git(cwd, 'rev-parse', 'HEAD');
-          signal.throwIfAborted();
-          // A detached HEAD holds the subtask's commits until merge and leaves no temporary branch ref.
-          await git(job.repo, 'worktree', 'add', '--detach', subtaskCwd, start);
-          await linkDependencies(job, subtaskCwd);
-          return execute(items[number - 1], subtaskCwd);
-        },
-        async mergeSubtask(_task, tip, number) {
-          const outcome = tip ? await mergeWorktree(cwd, tip) : { conflict: false };
-          await removeWorktree(job.repo, temporary.get(number));
-          temporary.delete(number);
-          if (!outcome.conflict) remember(items[number - 1]);
-          return outcome;
-        },
-        async rerunSequential(_task, number) {
-          addEvent(job, 'รวมงาน', roles[role] + ' งานย่อย #' + number + ' แก้ไฟล์ชนกัน ให้ทำใหม่บนโค้ดที่รวมแล้ว');
-          const result = await execute(items[number - 1], cwd);
-          remember(items[number - 1]);
-          return result;
-        }
-      });
     }
+    await runSubtaskScheduler({
+      tasks, teamParallel: settings.parallel,
+      availableProviders: () => routeCandidates(role, job.settings, job).filter(item => !item.blocked).length,
+      signal,
+      onWaiting(_task, waitingOn, number) {
+        Object.assign(items[number - 1], { status: waitingOn.length ? 'waiting' : 'pending', waitingOn });
+        save();
+      },
+      async runSubtask(_task, number) {
+        if (!parallel) return executeOnRoleBranch(number);
+        const subtaskCwd = path.join(path.dirname(cwd), role + '-subtask-' + number);
+        temporary.set(number, subtaskCwd);
+        const start = await git(cwd, 'rev-parse', 'HEAD');
+        signal.throwIfAborted();
+        // A detached HEAD holds the subtask's commits until merge and leaves no temporary branch ref.
+        await git(job.repo, 'worktree', 'add', '--detach', subtaskCwd, start);
+        await linkDependencies(job, subtaskCwd);
+        return execute(items[number - 1], subtaskCwd);
+      },
+      async mergeSubtask(_task, tip, number) {
+        const outcome = tip ? await mergeWorktree(cwd, tip) : { conflict: false };
+        await removeWorktree(job.repo, temporary.get(number));
+        temporary.delete(number);
+        if (!outcome.conflict) remember(items[number - 1]);
+        return outcome;
+      },
+      rerunSequential(_task, number) {
+        addEvent(job, 'รวมงาน', roles[role] + ' งานย่อย #' + number + ' แก้ไฟล์ชนกัน ให้ทำใหม่บนโค้ดที่รวมแล้ว');
+        return executeOnRoleBranch(number);
+      }
+    });
     const head = await git(cwd, 'rev-parse', 'HEAD');
     if (parallel) {
       const changedFiles = monitorFiles(await changedFileNames(cwd, job.base, head));
@@ -1028,18 +1030,25 @@ async function runTeam(job, role, cwd, branch, tracked, signal, tasks) {
     lastProvider = item.provider ?? lastProvider;
   }
 
+  async function executeOnRoleBranch(number) {
+    const item = items[number - 1];
+    const result = await execute(item, cwd);
+    remember(item);
+    return result;
+  }
+
   async function execute(item, worktree) {
     signal.throwIfAborted();
     checkDeadline(job);
     const label = item.id + '/' + items.length;
     const brief = {
       subtask: { number: item.id, of: items.length, title: item.title, goal: item.goal, files: item.files, acceptance: item.acceptance,
-        ...(parallel ? { dependsOn: item.dependsOn } : {}) },
+        ...(parallel || item.dependsOn.length ? { dependsOn: item.dependsOn } : {}) },
       finishedSubtasks: done.slice()
     };
-    const instructions = parallel
+    const instructions = worktree !== cwd
       ? ' Do only this subtask. The current code includes the subtasks it depends on. Other independent subtasks may run concurrently.'
-      : ' Do only this subtask; earlier subtasks are already in the code and later ones will follow.';
+      : ' Do only this subtask. The current code includes the finished subtasks listed in the context.';
     const subtaskPrompt = '\nThis is subtask ' + label + ' of your role: ' + item.title + '.' + instructions + ' Goal: ' + item.goal + '\nAcceptance: ' + item.acceptance;
     const startCommit = await git(worktree, 'rev-parse', 'HEAD');
     const routeKey = parallel ? Symbol('subtask ' + role + ' ' + item.id) : undefined;
@@ -1077,7 +1086,7 @@ async function runTeam(job, role, cwd, branch, tracked, signal, tasks) {
           if (item.fixes >= 1) {
             item.status = 'warning';
             item.check += (item.check ? ' · ' : '') + 'ยังเหลือ: ' + verdict.problems.slice(0, 5).join(' / ');
-            if (parallel && prerequisites.has(item.id)) {
+            if (prerequisites.has(item.id)) {
               throw Error(roles[role] + ' งานย่อย #' + item.id + ' ยังไม่ผ่านการตรวจหลังแก้ 1 รอบ จึงเริ่มงานที่รอชิ้นนี้ไม่ได้');
             }
             addEvent(job, roles[role], 'งานย่อย ' + label + ' ยังไม่ผ่านหลังแก้ 1 รอบ ส่งต่อให้รีวิวรวมตัดสิน');
@@ -1131,9 +1140,11 @@ async function clearSubtaskWorktrees(repo, workRoot) {
 // When the two changed the same lines, the second role redoes its part on top of the combined code.
 async function build(job, signal, workRoot, integrated, tracked) {
   const order = job.single ? ['backend'] : ['backend', 'frontend'];
+  // Validate both role plans before either role starts implementation.
+  const roleTasks = order.map(role => subtasksFor(job, role));
   job.team = {};
   if (job.single) skipRole(job, 'frontend', isNoWorkRole(job.plan, 'frontend') ? NO_WORK_NOTE : 'งานประเภทนี้ใช้ AI ลงมือทำตัวเดียว');
-  const results = await Promise.allSettled(order.map(async role => {
+  const results = await Promise.allSettled(order.map(async (role, index) => {
     signal.throwIfAborted();
     if (isNoWorkRole(job.plan, role)) {
       skipRole(job, role, NO_WORK_NOTE);
@@ -1148,7 +1159,7 @@ async function build(job, signal, workRoot, integrated, tracked) {
       created = true;
       await linkDependencies(job, cwd);
       signal.throwIfAborted();
-      const tasks = subtasksFor(job, role);
+      const tasks = roleTasks[index];
       const merge = Boolean(tasks && job.settings.team.parallel > 1);
       const tip = tasks
         ? await runTeam(job, role, cwd, branch, tracked, signal, tasks)
