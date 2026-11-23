@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { lstat, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, readFile, readlink, realpath, rm, rmdir, symlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 const execute = promisify(execFile);
@@ -31,26 +31,128 @@ function validFile(name) {
 // the rest of the repo fills a smaller budget. `omittedPaths` lists source files left out.
 export const isSafePath = validFile;
 
-// Working-tree changes as a Map of path -> two-letter status ("??" = new file). Renames report the new path.
-export async function statusEntries(cwd) {
-  const tokens = (await git(cwd, 'status', '--porcelain', '-uall', '-z')).split('\0');
-  const entries = new Map();
-  for (let index = 0; index < tokens.length; index++) {
-    const token = tokens[index];
-    if (token.length < 4) continue;
-    const code = token.slice(0, 2);
-    entries.set(token.slice(3), code);
-    if (code[0] === 'R' || code[0] === 'C') index++;
+const missing = error => {
+  if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return null;
+  throw error;
+};
+
+async function worktreePath(cwd, name) {
+  const parts = name.split('/');
+  if (parts.some(part => !part || /^(?:\.|\.\.|\.git)$/i.test(part) ||
+      (process.platform === 'win32' && (/[\\:]/.test(part) || /[. ]$/.test(part))))) {
+    throw Error('พาธใน worktree ใช้ไม่ได้: ' + name);
   }
-  return entries;
+  let target = cwd;
+  for (const part of parts.slice(0, -1)) {
+    target = path.join(target, part);
+    if ((await lstat(target).catch(missing))?.isSymbolicLink()) return null;
+  }
+  return path.join(target, parts.at(-1));
 }
 
-// Puts the given paths back to how HEAD has them: new files are removed, changed or deleted files restored.
-export async function revertPaths(cwd, entries) {
-  for (const [name, code] of entries) {
-    const target = path.join(cwd, ...name.split('/'));
-    if (code === '??') { await rm(target, { force: true }).catch(() => {}); continue; }
-    await git(cwd, 'checkout', 'HEAD', '--', name).catch(() => rm(target, { force: true }).catch(() => {}));
+async function readWorktreeFile(cwd, name) {
+  const target = await worktreePath(cwd, name);
+  const info = target && await lstat(target).catch(missing);
+  if (!info || info.isDirectory()) return null;
+  if (info.isSymbolicLink()) return { link: await readlink(target) };
+  if (!info.isFile()) throw Error('สำรองไฟล์ใน worktree ไม่ได้: ' + name);
+  return { content: await readFile(target), mode: info.mode & 0o777 };
+}
+
+// Save the exact on-disk bytes of already dirty files, including untracked files from checks.
+// Git supplies the original index entries, independently of the files on disk.
+export async function attemptState(cwd, before) {
+  const tokens = (await git(cwd, 'status', '--porcelain=v2', '--branch', '--no-renames', '-uall', '-z')).split('\0');
+  const files = new Map();
+  let head;
+  for (const token of tokens) {
+    if (token.startsWith('# branch.oid ')) head = token.slice(13);
+    if (token.startsWith('? ')) {
+      const name = token.slice(2);
+      if (!files.has(name)) files.set(name, { head: null, index: null });
+    }
+    if (token.startsWith('u ')) throw Error('พบไฟล์ที่ยังแก้ conflict ไม่เสร็จใน worktree');
+    if (!token.startsWith('1 ')) continue;
+    const fields = token.split(' ', 8);
+    const [, , submodule, headMode, indexMode, , headOid, indexOid] = fields;
+    if (submodule.startsWith('S')) throw Error('พบ submodule ที่เปลี่ยนใน worktree');
+    const name = token.slice(fields.join(' ').length + 1);
+    files.set(name, {
+      head: headMode === '000000' ? null : [headMode, headOid],
+      index: indexMode === '000000' ? null : [indexMode, indexOid]
+    });
+  }
+  for (const [name, entry] of files) {
+    if (!before || before.files.has(name)) entry.file = await readWorktreeFile(cwd, name);
+  }
+  return { head, files };
+}
+
+function sameWorktreeFile(first, second) {
+  if (first === second) return true;
+  if (!first || !second) return false;
+  if (first.link !== undefined) return first.link === second.link;
+  return first.mode === second.mode && second.content?.equals(first.content);
+}
+
+function sameIndex(first, second) {
+  return first?.[0] === second?.[0] && first?.[1] === second?.[1];
+}
+
+export function attemptChanges(before, after) {
+  if (before.head !== after.head) throw Error('HEAD ของ worktree เปลี่ยนระหว่างการลอง');
+  return [...new Set([...before.files.keys(), ...after.files.keys()])].filter(name => {
+    const first = before.files.get(name);
+    const second = after.files.get(name);
+    return !first || !second || !sameIndex(first.index, second.index) || !sameWorktreeFile(first.file, second.file);
+  });
+}
+
+export async function restoreAttempt(cwd, before) {
+  const after = await attemptState(cwd, before);
+  const changed = attemptChanges(before, after);
+  const restoreIndex = [];
+  const restoreFiles = [];
+  for (const name of changed) {
+    const first = before.files.get(name);
+    const second = after.files.get(name);
+    const originalIndex = first ? first.index : second.head;
+    const currentIndex = second ? second.index : first.head;
+    if (!sameIndex(originalIndex, currentIndex)) {
+      if (originalIndex) restoreIndex.push([name, originalIndex]);
+      else await git(cwd, '--literal-pathspecs', 'update-index', '--force-remove', '--', name);
+    }
+    if (first && second && sameWorktreeFile(first.file, second.file)) continue;
+    if (first ? first.file : second.head) {
+      restoreFiles.push([name, first]);
+    } else {
+      const target = await worktreePath(cwd, name);
+      const info = target && await lstat(target).catch(missing);
+      if (info && !info.isDirectory()) await rm(target);
+    }
+  }
+  for (const [name, [mode, oid]] of restoreIndex) {
+    await git(cwd, 'update-index', '--add', '--cacheinfo', mode, oid, name);
+  }
+  for (const [name, entry] of restoreFiles) {
+    const target = await worktreePath(cwd, name);
+    if (!target) throw Error('พบ symbolic link ในพาธ: ' + name);
+    const info = await lstat(target).catch(missing);
+    if (info?.isDirectory()) await rmdir(target);
+    if (!entry) {
+      await git(cwd, '--literal-pathspecs', 'restore', '--source=HEAD', '--worktree', '--', name);
+    } else {
+      if (info && !info.isDirectory()) await rm(target);
+      await mkdir(path.dirname(target), { recursive: true });
+      if (entry.file.link !== undefined) await symlink(entry.file.link, target);
+      else {
+        await writeFile(target, entry.file.content);
+        await chmod(target, entry.file.mode);
+      }
+    }
+  }
+  if (attemptChanges(before, await attemptState(cwd, before)).length) {
+    throw Error('worktree ยังมีไฟล์จากการลองก่อนหน้า');
   }
 }
 

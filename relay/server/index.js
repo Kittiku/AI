@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { realpath } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
-import { applyEdits, applyFiles, checkpoint, git, isSafePath, repository, revertPaths, snapshot, statusEntries } from './git.js';
+import { applyEdits, applyFiles, attemptChanges, attemptState, checkpoint, git, isSafePath, repository, restoreAttempt, snapshot } from './git.js';
 import { editSchema, generate, names, pacificDay, planSchema, quota, refreshClaudeCode, refreshCodex, reviewSchema, USAGE } from './providers.js';
 import { openStore } from './store.js';
 import { closeMonitorStages, createMonitor, liveStage, monitorFiles, recordMonitor } from './monitor.js';
@@ -230,7 +230,7 @@ async function call(job, role, cwd, task, context, schema, signal, accept, optio
 
   async function attempt(provider, extra) {
     const write = Boolean(options.edit && job.settings.agentEdits !== false && (provider === 'claudecode' || provider === 'codex'));
-    const before = write ? await statusEntries(cwd) : null;
+    const before = write ? await attemptState(cwd) : null;
     signal.throwIfAborted();
     addEvent(job, roles[role], (extra ? 'ตัวที่กำหนดไว้ใช้ไม่ได้ ลองใช้ ' : 'มอบหมายให้ ') + names[provider], provider);
     const startedAt = Date.now();
@@ -238,7 +238,6 @@ async function call(job, role, cwd, task, context, schema, signal, accept, optio
     track(job, role, { status: 'running', action, provider, startedAt, endedAt: null, waitUntil: null, changedFiles: null },
       provider === job.settings.routes[role][0] ? 'started' : 'provider_fallback');
     const step = store.startStep({ jobId: job.id, role, provider, round });
-    let changed = new Map();
     let day;
     try {
       if (provider === 'gemini') {
@@ -251,13 +250,11 @@ async function call(job, role, cwd, task, context, schema, signal, accept, optio
         '\nUSER TASK\n' + job.prompt + '\nCONTEXT\n' + context, schema, signal, () => { day = null; }, { write });
       addUsage(job, response[USAGE]);
       signal.throwIfAborted();
-      if (write) {
-        const after = await statusEntries(cwd);
-        changed = new Map([...after].filter(([name, code]) => before.get(name) !== code));
-      }
-      const problem = accept ? await accept(response, { write, changed: [...changed.keys()] }) : '';
+      const after = write ? await attemptState(cwd, before) : null;
+      const changed = write ? attemptChanges(before, after) : [];
+      const problem = accept ? await accept(response, { write, changed }) : '';
       if (problem) { store.finishStep(step, { status: 'rejected', usage: response[USAGE], error: problem }); throw Object.assign(Error(problem), { recorded: true }); }
-      response[CHANGED] = [...changed.keys()];
+      response[CHANGED] = changed.filter(name => after.files.has(name));
       store.finishStep(step, { status: 'done', usage: response[USAGE] });
       addEvent(job, roles[role], response.summary || 'สร้างแผนและ API contract แล้ว', provider);
       if (options.edit) track(job, role, { action: 'apply_result' });
@@ -268,12 +265,7 @@ async function call(job, role, cwd, task, context, schema, signal, accept, optio
       // Verify the rollback before the next attempt can use this worktree.
       if (write) {
         try {
-          const after = await statusEntries(cwd);
-          await revertPaths(cwd, [...after].filter(([name, code]) => before.get(name) !== code));
-          const restored = await statusEntries(cwd);
-          if (restored.size !== before.size || [...restored].some(([name, code]) => before.get(name) !== code)) {
-            throw Error('worktree ยังมีไฟล์จากการลองก่อนหน้า');
-          }
+          await restoreAttempt(cwd, before);
         } catch (rollbackError) {
           signal.throwIfAborted();
           throw Error('ย้อนการแก้ไฟล์ของ ' + names[provider] + ' ไม่สำเร็จ: ' + rollbackError.message);
@@ -340,11 +332,13 @@ function rememberJob(job) {
 // Approval gates pause the worker until the user decides in the app or through MCP.
 const approvals = new Map();
 const budgetGates = new Map();
+let lastApprovalRequestedAt = 0;
 
 async function requestApproval(job, kind, message, signal, stages) {
   signal.throwIfAborted();
   const started = Date.now();
-  job.approval = { kind, message, requestedAt: started };
+  lastApprovalRequestedAt = Math.max(started, lastApprovalRequestedAt + 1);
+  job.approval = { kind, message, requestedAt: lastApprovalRequestedAt };
   job.status = 'waiting_approval';
   const previousStages = new Map();
   function addStage(key) {
@@ -888,13 +882,20 @@ app.get('/api/jobs/:id/summary', async (req, res) => {
 });
 app.post('/api/jobs/:id/approve', (req, res) => {
   const job = state.jobs.find(item => item.id === req.params.id);
+  const approval = job?.approval;
   const resolve = job && approvals.get(job.id)?.resolve;
-  if (!job || job.status !== 'waiting_approval' || !resolve) return res.status(409).json({ error: 'งานนี้ไม่ได้รออนุมัติ' });
-  const { decision, note } = req.body || {};
+  if (job?.status !== 'waiting_approval' || !approval || !resolve) return res.status(409).json({ error: 'งานนี้ไม่ได้รออนุมัติ' });
+  const { decision, note, kind, requestedAt } = req.body || {};
+  // MCP clients can still answer without an identifier. If supplied, both fields must match.
+  if ((kind !== undefined || requestedAt !== undefined) &&
+      (kind !== approval.kind || requestedAt !== approval.requestedAt)) {
+    return res.status(409).json({ error: 'คำขออนุมัติเปลี่ยนแล้ว กรุณาตรวจคำขอล่าสุด' });
+  }
   if (!['approve', 'revise', 'reject'].includes(decision)) throw Error('decision ต้องเป็น approve, revise หรือ reject');
-  if (decision === 'revise' && job.approval?.kind !== 'plan') throw Error('ขอแก้ได้เฉพาะตอนตรวจแผน');
+  if (decision === 'revise' && approval.kind !== 'plan') throw Error('ขอแก้ได้เฉพาะตอนตรวจแผน');
   const text = typeof note === 'string' ? note.trim().slice(0, 4000) : '';
   if (decision === 'revise' && !text) throw Error('บอกด้วยว่าต้องการให้แก้แผนตรงไหน');
+  approvals.delete(job.id);
   resolve({ decision, note: text });
   res.json({ ok: true });
 });
