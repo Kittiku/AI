@@ -319,6 +319,28 @@ test('a skipped UX/UI stage has no AI usage until review assigns it a fix on the
   await assertCleanWorktrees(job);
 });
 
+for (const parallel of [1, 2, 3]) {
+  test(`one planned subtask uses the normal role edit with team.parallel=${parallel}`, async () => {
+    const plan = planFor([subtask('backend.txt')], 'hard');
+    const { job, calls, repo } = await runJob({
+      plan, parallel, contents: { 'backend.txt': 'base\n' },
+      async respond(call, job) {
+        if (call.kind === 'review') return approve;
+        assert.equal(call.role, 'backend');
+        assert.equal(call.context.subtask, undefined);
+        assert.equal(await git(call.cwd, 'rev-parse', '--abbrev-ref', 'HEAD'), job.branch + '-backend');
+        return change('backend.txt', 'backend update\n');
+      }
+    });
+
+    assert.deepEqual(calls.map(call => call.kind), ['plan', 'edit', 'review']);
+    assert.deepEqual(stepLog(job), [['plan', 0, 'done'], ['backend', 0, 'done'], ['review', 0, 'done']]);
+    assert.equal(job.team.backend, undefined);
+    assert.equal(await git(repo, 'show', job.branch + ':backend.txt'), 'backend update');
+    await assertCleanWorktrees(job);
+  });
+}
+
 test('serial work waits for a forward dependency to pass its check on the role branch', async () => {
   const plan = planFor([subtask('one.txt', [2]), subtask('two.txt')]);
   const { job, calls } = await runJob({

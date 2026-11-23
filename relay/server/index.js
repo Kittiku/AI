@@ -945,7 +945,7 @@ function subtasksFor(job, role) {
     }
     return { ...task, dependsOn: dependencies.map(dependency => numbers.get(dependency)) };
   });
-  return tasks.length < (settings.parallel === 1 ? 2 : 1) ? null : normalizeSubtasks(tasks);
+  return tasks.length < 2 ? null : normalizeSubtasks(tasks);
 }
 
 const subtaskCheckPrompt = parallel => 'You are the lead of this role. Check one finished subtask' + (parallel ? '' : ' before the next one starts') +
