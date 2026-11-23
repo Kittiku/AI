@@ -145,7 +145,7 @@ function Stepper({ job, inactive }) {
       <span className="stage-dot" aria-hidden="true">{stage.status === 'done' ? <Check size={14} /> : stage.status === 'failed' ? <X size={14} /> : null}</span>
       <div>
         <strong>{stageName(job, stage.key)}</strong>
-        <small>{stage.status === 'skipped' ? stage.skippedText || 'ไม่ได้ทำ' : stageStatus[stage.status] || stage.status}
+        <small>{stage.status === 'skipped' ? stage.skippedText || (stage.note ? 'ข้าม · ' + stage.note : 'ไม่ได้ทำ') : stageStatus[stage.status] || stage.status}
           {stage.status === 'waiting' && stage.waitUntil ? ' ถึง ' + time(stage.waitUntil) : ''}
           {stage.provider && stage.status !== 'waiting' ? ' · ' + providerName(stage.provider) : ''}
           {stage.startedAt && stage.status !== 'pending' ? ' · ' + duration((stage.endedAt || now) - stage.startedAt) : ''}
@@ -328,7 +328,7 @@ function monitorStageStatus(stage) {
   if (stage.status === 'waiting') {
     return stage.action === 'wait_approval' ? 'รออนุมัติ' : stage.action === 'wait_quota' ? 'รอโควตา' : 'กำลังรอ';
   }
-  if (stage.status === 'skipped') return stage.key === 'checks' ? 'ข้ามการทดสอบ' : 'ข้ามขั้นนี้';
+  if (stage.status === 'skipped') return stage.key === 'checks' ? 'ข้ามการทดสอบ' : stage.note ? 'ข้าม · ' + stage.note : 'ข้ามขั้นนี้';
   return stageStatus[stage.status] || 'ยังไม่มีข้อมูล';
 }
 
@@ -336,9 +336,11 @@ function implementationStage(roles) {
   const statusOrder = ['running', 'retrying', 'waiting', 'failed', 'warning', 'cancelled', 'pending', 'done', 'skipped'];
   const stage = statusOrder.map(status => roles.find(role => role.status === status)).find(Boolean);
   const running = roles.filter(role => role.status === 'running').length;
+  const skipped = roles.length > 1 ? roles.filter(role => role.status === 'skipped' && role.note) : [];
+  const label = running && roles.length > 1 ? 'กำลังทำ ' + running + '/' + roles.length + ' ส่วน' : monitorStageStatus(stage || {});
   return {
     key: 'work', status: stage?.status,
-    label: running && roles.length > 1 ? 'กำลังทำ ' + running + '/' + roles.length + ' ส่วน' : monitorStageStatus(stage || {})
+    label: skipped.length && skipped.length < roles.length ? label + ' · ข้าม ' + skipped.map(role => monitorStageNames[role.key]).join(', ') : label
   };
 }
 
@@ -383,15 +385,16 @@ function MonitorFiles({ label, files, unknown, empty }) {
 function MonitorRole({ stage, single, activities }) {
   const activity = activities.find(item => item.stageKey === stage.key);
   const Icon = stage.key === 'frontend' ? Layers : CodeXml;
+  const skippedNote = stage.status === 'skipped' && stage.note ? stage.note : null;
   return <article className={'monitor-role ' + stage.status}>
     <header>
       <h3><Icon size={18} aria-hidden="true" />{single ? 'ลงมือทำ' : monitorStageNames[stage.key]}</h3>
-      <span className="monitor-role-status">{monitorStageStatus(stage)}</span>
+      <span className="monitor-role-status">{skippedNote ? 'ข้ามขั้นนี้' : monitorStageStatus(stage)}</span>
     </header>
-    <p className="monitor-role-action">
+    {skippedNote ? <p className="monitor-role-note" role="note">{skippedNote}</p> : <p className="monitor-role-action">
       {monitorActions[stage.action] || monitorStageStatus(stage)}
       {stage.waitUntil ? <> ถึง <time dateTime={new Date(stage.waitUntil).toISOString()}>{dateTime(stage.waitUntil)}</time></> : null}
-    </p>
+    </p>}
     {activity ? <p className="monitor-role-activity">
       <time dateTime={new Date(activity.at).toISOString()}>{monitorTime(activity.at)}</time> <MonitorActivity activity={activity} />
     </p> : null}
@@ -996,8 +999,23 @@ function MergePanel({ job, updated }) {
 const complexityNames = { simple: 'ง่าย ทำรวดเดียว', medium: 'กลาง แบ่งงานย่อย', hard: 'ยาก แบ่งงานย่อยมากขึ้น' };
 const subtaskStatus = {
   pending: ['รอคิว', ''], running: ['กำลังทำ', 'running'], checking: ['หัวหน้ากำลังตรวจ', 'running'], fixing: ['แก้ตามที่หัวหน้าตรวจ', 'warn'],
-  passed: ['ผ่าน', 'ok'], warning: ['ยังมีปัญหา', 'warn'], skipped: ['ไม่มีงาน', '']
+  passed: ['ผ่าน', 'ok'], warning: ['ยังมีปัญหา', 'warn'], skipped: ['ไม่มีงาน', ''], done: ['เสร็จ', 'ok'],
+  waiting: ['รอชิ้นอื่น', 'waiting'], merging: ['กำลังรวมงาน', 'running'], rerun: ['รวมแล้วชนกัน ทำใหม่', 'warn'],
+  failed: ['ล้มเหลว', 'bad'], cancelled: ['หยุดแล้ว', '']
 };
+const subtaskFinished = new Set(['passed', 'skipped', 'done']);
+const subtaskActive = new Set(['running', 'checking', 'fixing', 'merging', 'rerun']);
+const subtaskNumber = (item, index) => Number.isInteger(item.id) ? item.id : Number.isInteger(Number(item.id)) && String(item.id).trim() ? Number(item.id) : index + 1;
+
+// Which 1-based subtasks this one still waits for: waitingOn from the server, or unfinished dependsOn as a fallback.
+function waitingFor(item, items) {
+  if (Array.isArray(item.waitingOn) && item.waitingOn.length) return item.waitingOn;
+  if (!['pending', 'waiting'].includes(item.status || 'pending') || !Array.isArray(item.dependsOn)) return [];
+  return item.dependsOn.filter(number => {
+    const index = items.findIndex((other, i) => subtaskNumber(other, i) === number);
+    return index >= 0 && !subtaskFinished.has(items[index].status);
+  });
+}
 
 // Team view: each role's lead, its subtasks in order, who did each one and what the lead's check said.
 function TeamTree({ job }) {
@@ -1007,16 +1025,32 @@ function TeamTree({ job }) {
     <div className="card-head"><h2>ทีมงาน</h2>{job.plan?.complexity ? <span className="chip">{complexityNames[job.plan.complexity]}</span> : null}</div>
     <div className={'team-groups' + (groups.length === 1 ? ' single' : '')}>
       {groups.map(([role, items]) => {
-        const passed = items.filter(item => ['passed', 'skipped'].includes(item.status)).length;
+        const passed = items.filter(item => subtaskFinished.has(item.status)).length;
+        const active = items.filter(item => subtaskActive.has(item.status)).length;
+        const waiting = items.filter(item => waitingFor(item, items).length).length;
         return <div key={role} className="team-group">
-          <header><strong>{job.single ? 'ผู้ลงมือ' : role === 'frontend' ? 'UX/UI' : 'Backend'}</strong><small>หัวหน้าแบ่ง {items.length} งานย่อย · ผ่านแล้ว {passed}</small></header>
+          <header><strong>{job.single ? 'ผู้ลงมือ' : role === 'frontend' ? 'UX/UI' : 'Backend'}</strong>
+            <small>หัวหน้าแบ่ง {items.length} งานย่อย · ผ่านแล้ว {passed}</small>
+            {active > 1 || waiting ? <span className="team-badges">
+              {active > 1 ? <span className="team-badge parallel">ทำพร้อมกัน {active} ชิ้น</span> : null}
+              {waiting ? <span className="team-badge waiting">รอชิ้นอื่น {waiting}</span> : null}
+            </span> : null}
+          </header>
           <ol className="subtasks">
-            {items.map(item => {
-              const [text, tone] = subtaskStatus[item.status] || [item.status, ''];
-              return <li key={item.id} className={'subtask ' + (tone || 'idle')}>
-                <span className="subtask-no">{item.id}</span>
+            {items.map((item, index) => {
+              const waits = waitingFor(item, items);
+              const [text, tone] = waits.length ? ['รอ #' + waits.join(', #'), 'waiting'] : subtaskStatus[item.status] || [item.status, ''];
+              const parallel = active > 1 && subtaskActive.has(item.status);
+              const deps = Array.isArray(item.dependsOn) ? item.dependsOn : [];
+              return <li key={item.id ?? index} className={'subtask ' + (tone || 'idle') + (parallel ? ' parallel' : '')}>
+                <span className="subtask-no">{subtaskNumber(item, index)}</span>
                 <div className="subtask-body">
-                  <div className="subtask-line"><strong>{item.title}</strong><em className={'subtask-status ' + tone}>{text}</em></div>
+                  <div className="subtask-line"><strong>{item.title}</strong><em className={'subtask-status ' + tone}
+                    title={waits.length ? 'เริ่มได้เมื่องานย่อย #' + waits.join(', #') + ' ผ่านการตรวจแล้ว' : undefined}>{text}</em></div>
+                  {parallel || (deps.length && !waits.length && !subtaskFinished.has(item.status)) ? <div className="subtask-flags">
+                    {parallel ? <span className="subtask-flag parallel">ทำพร้อมกัน</span> : null}
+                    {deps.length && !waits.length && !subtaskFinished.has(item.status) ? <span className="subtask-flag">ต่อจาก #{deps.join(', #')}</span> : null}
+                  </div> : null}
                   <div className="subtask-who">
                     {item.provider && item.provider !== 'reused' ? <span><ProviderIcon id={item.provider} size={12} /> ทำโดย {providerName(item.provider)}</span> : null}
                     {item.checker ? <span><ProviderIcon id={item.checker} size={12} /> ตรวจโดย {providerName(item.checker)}</span> : null}
@@ -1329,6 +1363,8 @@ function JobDetail({ job, projectName, monitor, approvalRequested, onApproval, o
     catch (error) { setError(error.message); }
   }
   const assigned = Object.entries(job.stages || {}).filter(([, stage]) => Object.hasOwn(providers, stage.provider));
+  const skippedRoles = ['backend', 'frontend'].map(key => [key, job.stages?.[key]])
+    .filter(([key, stage]) => stage?.status === 'skipped' && stage.note && !(job.single && key === 'frontend'));
   const manualChecks = job.card?.acceptance?.filter(item => item.check === 'manual') || [];
   return <>
     <button type="button" className="back" onClick={back}><ChevronLeft size={16} /> กลับไปภาพรวม</button>
@@ -1384,6 +1420,8 @@ function JobDetail({ job, projectName, monitor, approvalRequested, onApproval, o
             <summary><span className={'check-dot ' + (check.code === 0 ? 'ok' : check.code === null ? 'off' : 'bad')} />{check.label}<em>{check.code === 0 ? 'ผ่าน' : check.code === null ? 'ไม่ได้รัน' : 'ไม่ผ่าน'}</em></summary><pre>{check.output}</pre></details>)}</div> : null}
           {assigned.length ? <div className="fact"><h3>AI ที่รับงาน</h3><div className="chips">{assigned.map(([key, stage]) =>
             <span key={key} className="chip"><ProviderIcon id={stage.provider} size={12} />{stageName(job, key)} · {providerName(stage.provider)}</span>)}</div></div> : null}
+          {skippedRoles.length ? <div className="fact"><h3>ส่วนที่ข้าม</h3><ul className="skipped-roles">{skippedRoles.map(([key, stage]) =>
+            <li key={key}><span className="skipped-chip">{stageName(job, key)}</span> {stage.note}</li>)}</ul></div> : null}
           <details className="fact" open={job.prompt.length < 500}><summary><h3>โจทย์</h3></summary><p className="preline">{job.prompt}</p></details>
           {job.plan ? <details className="fact"><summary><h3>แผนงาน</h3></summary>
             <h4>ข้อตกลงระหว่างส่วน</h4><p className="preline">{job.plan.contract}</p><h4>เกณฑ์รับงาน</h4><p className="preline">{job.plan.acceptance}</p></details> : null}
