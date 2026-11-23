@@ -433,6 +433,49 @@ function CopyButton({ text, children }) {
   return <Button icon={copied ? Check : Copy} onClick={copy}>{copied ? 'คัดลอกแล้ว' : children}</Button>;
 }
 
+// Merge in two steps: check first (target branch, uncommitted files, predicted conflicts), then confirm.
+function MergePanel({ job, updated }) {
+  const [check, setCheck] = useState(null);
+  const [cleanupAfter, setCleanupAfter] = useState(true);
+  const [busyState, setBusyState] = useState('');
+  const [error, setError] = useState('');
+  async function prepare() {
+    setBusyState('check'); setError('');
+    try { setCheck(await api('/jobs/' + job.id + '/merge-check')); } catch (error) { setError(error.message); } finally { setBusyState(''); }
+  }
+  async function merge() {
+    setBusyState('merge'); setError('');
+    try { updated(await api('/jobs/' + job.id + '/merge', 'POST', { target: check.target, cleanup: cleanupAfter })); setCheck(null); }
+    catch (error) { setError(error.message); if (error.data?.check) setCheck(error.data.check); }
+    finally { setBusyState(''); }
+  }
+  if (!check) return <div className="merge-panel">
+    <Button primary icon={GitBranch} onClick={prepare} disabled={Boolean(busyState)}>{busyState ? 'กำลังตรวจ…' : 'Merge เข้า repo'}</Button>
+    {error ? <p role="alert" className="error">{error}</p> : null}
+  </div>;
+  const blocked = check.blockers.length > 0;
+  return <div className={'merge-panel open' + (blocked ? ' blocked' : '')}>
+    <strong>{check.alreadyMerged ? 'branch นี้อยู่ใน ' + check.target + ' แล้ว' : 'Merge ' + job.branch + ' → ' + check.target}</strong>
+    {check.stat ? <small>{check.stat}</small> : null}
+    <ul>
+      {check.alreadyMerged ? <li>ไม่ต้อง merge ซ้ำ Relay จะบันทึกว่า merge แล้ว</li> :
+        check.fastForward ? <li>fast-forward: ไม่มี commit ใหม่บน {check.target} ระหว่างทาง จึงไม่มีทางชนกัน</li> :
+        !check.conflicts.length ? <li>{check.target} มี commit ใหม่ระหว่างทาง Relay จะสร้าง merge commit ให้ จำลองแล้วไม่ชนกัน</li> : null}
+      {check.otherBranch ? <li className="warn-text">งานนี้เริ่มจาก {check.expected} แต่ตอนนี้ repo อยู่บน {check.target}</li> : null}
+      {check.blockers.map(item => <li key={item} className="bad-text">{item}</li>)}
+      {check.dirty.length ? <li className="files">{check.dirty.join(', ')}</li> : null}
+      {check.conflicts.length ? <li className="files">ไฟล์ที่จะชน: {check.conflicts.join(', ')}</li> : null}
+    </ul>
+    {blocked ? null : <label className="checkbox"><input type="checkbox" checked={cleanupAfter} onChange={event => setCleanupAfter(event.target.checked)} />หลัง merge ล้าง worktree และลบ branch ของงานนี้</label>}
+    {error ? <p role="alert" className="error">{error}</p> : null}
+    <div className="action-row">
+      {blocked ? <Button onClick={prepare} disabled={Boolean(busyState)}>ตรวจอีกครั้ง</Button> :
+        <Button primary icon={Check} onClick={merge} disabled={Boolean(busyState)}>{busyState === 'merge' ? 'กำลัง merge…' : check.alreadyMerged ? 'บันทึกว่า merge แล้ว' : 'ยืนยัน merge เข้า ' + check.target}</Button>}
+      <Button onClick={() => { setCheck(null); setError(''); }} disabled={busyState === 'merge'}>ยกเลิก</Button>
+    </div>
+  </div>;
+}
+
 function JobActions({ job, updated, removed, setError }) {
   const [working, setWorking] = useState(false);
   const hasBranch = Boolean(job.worktree || job.branchKept);
@@ -441,16 +484,25 @@ function JobActions({ job, updated, removed, setError }) {
     try { await task(); } catch (error) { setError(error.message); } finally { setWorking(false); }
   }
   const mergeCommand = 'git -C ' + quote(job.repo) + ' merge ' + job.branch;
+  const merged = job.merged;
+  const undoCommand = merged && (merged.fastForward && merged.before ? 'git -C ' + quote(job.repo) + ' revert --no-edit ' + merged.before.slice(0, 10) + '..' + merged.commit.slice(0, 10)
+    : 'git -C ' + quote(job.repo) + ' revert --no-edit -m 1 ' + merged.commit.slice(0, 10));
   return <div className="job-actions">
     <h3>ขั้นต่อไป</h3>
+    {merged ? <div className="merged-box">
+      <p><Check size={16} aria-hidden="true" /> merge เข้า <code>{merged.into}</code> แล้วเมื่อ {dateTime(merged.at)} · commit <code>{merged.commit.slice(0, 7)}</code>{merged.fastForward ? ' (fast-forward)' : ''}</p>
+      {merged.before !== null ? <><small>ถ้าต้องการย้อน ใช้คำสั่งนี้ จะได้ commit ใหม่ที่ยกเลิกการเปลี่ยนแปลง ประวัติเดิมไม่หาย</small>
+        <div className="action-row"><CopyButton text={undoCommand}>คัดลอกคำสั่งย้อน</CopyButton></div></> : null}
+    </div> : null}
+    {hasBranch && !merged ? <MergePanel job={job} updated={updated} /> : null}
     {hasBranch ? <>
-      <p>ตรวจ diff แล้ว merge branch <code>{job.branch}</code> เข้า repo ของคุณ</p>
+      {merged ? null : <p>หรือ merge เองด้วย Git: branch <code>{job.branch}</code></p>}
       <div className="action-row">
         <CopyButton text={job.branch}>คัดลอกชื่อ branch</CopyButton>
-        <CopyButton text={mergeCommand}>คัดลอกคำสั่ง merge</CopyButton>
+        {merged ? null : <CopyButton text={mergeCommand}>คัดลอกคำสั่ง merge</CopyButton>}
         {job.worktree ? <Button icon={FolderOpen} disabled={working} onClick={() => run(() => api('/jobs/' + job.id + '/open', 'POST'))}>เปิดโฟลเดอร์</Button> : null}
       </div>
-    </> : <p>{job.cleanedAt ? 'ล้าง worktree และ branch ของงานนี้แล้ว' : 'งานนี้ไม่มี branch ผลลัพธ์'}</p>}
+    </> : merged ? null : <p>{job.cleanedAt ? 'ล้าง worktree และ branch ของงานนี้แล้ว' : 'งานนี้ไม่มี branch ผลลัพธ์'}</p>}
     <div className="action-row">
       {job.worktree ? <Button icon={Trash} disabled={working} onClick={() => run(async () => {
         if (confirm('ลบโฟลเดอร์ worktree ของงานนี้? branch ' + job.branch + ' ยังอยู่ใน repo')) updated(await api('/jobs/' + job.id + '/cleanup', 'POST', {}));
@@ -512,7 +564,7 @@ function JobDetail({ job, back, retry, updated, removed }) {
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const busy = busyStatuses.has(job.status);
-  const hasResult = Boolean(job.worktree || job.branchKept);
+  const hasResult = Boolean(job.worktree || job.branchKept || job.merged);
   async function showDiff(file) {
     setTab('diff'); setError(''); setFocus(file || null);
     if (diff && !busy && file) return;

@@ -1,6 +1,7 @@
 import express from 'express';
 import spawn from 'cross-spawn';
-import { spawn as spawnShell } from 'node:child_process';
+import { execFile, spawn as spawnShell } from 'node:child_process';
+import { promisify } from 'node:util';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
@@ -499,14 +500,14 @@ app.post('/api/cards', async (req, res) => {
 app.get('/api/jobs/:id/summary', async (req, res) => {
   const job = state.jobs.find(item => item.id === req.params.id);
   if (!job) return res.status(404).json({ error: 'ไม่พบงานนี้' });
-  const hasResult = Boolean(job.worktree || job.branchKept);
+  const hasResult = Boolean(resultRef(job));
   const [stat, diff] = hasResult ? await Promise.all([
-    git(job.repo, 'diff', '--stat', job.base, job.branch, '--').catch(() => ''),
-    git(job.repo, 'diff', '--no-ext-diff', job.base, job.branch, '--').catch(() => '')
+    git(job.repo, 'diff', '--stat', job.base, resultRef(job), '--').catch(() => ''),
+    git(job.repo, 'diff', '--no-ext-diff', job.base, resultRef(job), '--').catch(() => '')
   ]) : ['', ''];
   const limit = Math.min(Number(req.query.diffChars) || 20_000, 200_000);
-  res.json({ id: job.id, title: job.title, status: job.status, error: job.error || null, repo: job.repo, branch: hasResult ? job.branch : null,
-    mergeCommand: hasResult ? `git -C "${job.repo}" merge ${job.branch}` : null,
+  res.json({ id: job.id, title: job.title, status: job.status, error: job.error || null, repo: job.repo, branch: job.worktree || job.branchKept ? job.branch : null, merged: job.merged || null,
+    mergeCommand: (job.worktree || job.branchKept) && !job.merged ? `git -C "${job.repo}" merge ${job.branch}` : null,
     stages: job.stages || {}, review: job.review || null,
     checks: (job.checks || []).map(item => ({ label: item.label, code: item.code, output: item.output.slice(-1500) })),
     usage: job.usage || null, startedAt: job.startedAt || null, finishedAt: job.finishedAt || null,
@@ -519,11 +520,12 @@ async function createJob({ title, prompt, repo, runChecks, routes, fromJob, extr
   if (![title, prompt, repo].every(value => typeof value === 'string' && value.trim()) ||
     title.length > 100 || prompt.length > maxPrompt || repo.length > 500) throw Error('กรอกชื่องาน โจทย์ และพาธ Git repo ให้ครบ');
   const { root: repoRoot, base } = await repository(repo.trim());
+  const startBranch = await git(repoRoot, 'rev-parse', '--abbrev-ref', 'HEAD').catch(() => 'HEAD');
   if (unsafeRoot(repoRoot)) throw Error('Git repo นี้อยู่ที่ ' + repoRoot + ' ซึ่งเป็นโฟลเดอร์ผู้ใช้หรือ root ของไดรฟ์ เพิ่มโฟลเดอร์งานในหน้าโปรเจกต์เพื่อสร้าง repo แยก');
   const id = randomUUID();
   const settings = structuredClone(state.settings);
   if (routes) settings.routes = readRoutes(routes);
-  const job = { id, repo: repoRoot, base, branch: 'relay/' + id.slice(0, 12), title: title.trim(),
+  const job = { id, repo: repoRoot, base, baseBranch: startBranch === 'HEAD' ? null : startBranch, branch: 'relay/' + id.slice(0, 12), title: title.trim(),
     prompt: prompt.trim(), runChecks: runChecks === true, settings, status: 'queued', events: [], createdAt: Date.now() };
   // Resuming reuses the earlier plan when the task, repo and HEAD are unchanged, so the plan step costs no quota.
   const source = typeof fromJob === 'string' && state.jobs.find(item => item.id === fromJob);
@@ -547,8 +549,8 @@ async function createJob({ title, prompt, repo, runChecks, routes, fromJob, extr
 }
 app.get('/api/jobs/:id/diff', async (req, res) => {
   const job = state.jobs.find(item => item.id === req.params.id);
-  if (!job?.worktree && !job?.branchKept) return res.status(404).json({ error: 'ยังไม่มีผลลัพธ์ของงานนี้' });
-  const diff = await git(job.repo, 'diff', '--no-ext-diff', job.base, job.branch, '--');
+  if (!job || !resultRef(job)) return res.status(404).json({ error: 'ยังไม่มีผลลัพธ์ของงานนี้' });
+  const diff = await git(job.repo, 'diff', '--no-ext-diff', job.base, resultRef(job), '--');
   res.json({ diff: diff.slice(0, 300_000), truncated: diff.length > 300_000 });
 });
 app.post('/api/repo/check', async (req, res) => {
@@ -670,6 +672,74 @@ app.delete('/api/projects/:id', (req, res) => {
 });
 
 const findJob = id => state.jobs.find(item => item.id === id);
+// The result lives on the job branch; after a merge deleted it, the recorded tip commit still shows the diff.
+const resultRef = job => job.worktree || job.branchKept ? job.branch : job.merged?.tip || null;
+
+// Merging writes to the user's own checkout, so it runs plain git: the user's hooks and identity apply.
+const runGit = promisify(execFile);
+const userGit = async (cwd, ...args) => (await runGit('git', args, { cwd, timeout: 120_000, maxBuffer: 8 * 1024 * 1024, windowsHide: true })).stdout.trim();
+const isAncestor = (cwd, a, b) => git(cwd, 'merge-base', '--is-ancestor', a, b).then(() => true, () => false);
+
+async function mergeCheck(job) {
+  if (!job.worktree && !job.branchKept) throw Error('งานนี้ไม่มี branch ผลลัพธ์ให้ merge');
+  const target = await git(job.repo, 'rev-parse', '--abbrev-ref', 'HEAD');
+  const dirty = (await git(job.repo, 'status', '--porcelain', '--untracked-files=no')).split('\n').filter(Boolean).map(line => line.slice(3));
+  const alreadyMerged = await isAncestor(job.repo, job.branch, 'HEAD');
+  const fastForward = !alreadyMerged && await isAncestor(job.repo, 'HEAD', job.branch);
+  let conflicts = [];
+  if (!alreadyMerged && !fastForward) {
+    // merge-tree simulates the merge without touching the checkout; exit code 1 means conflicts.
+    try { await git(job.repo, 'merge-tree', '--write-tree', '--name-only', '--no-messages', 'HEAD', job.branch); }
+    catch (error) { conflicts = String(error.stdout || '').split('\n').slice(1).map(line => line.trim()).filter(Boolean); }
+  }
+  const stat = await git(job.repo, 'diff', '--shortstat', 'HEAD...' + job.branch).catch(() => '');
+  const blockers = [];
+  if (target === 'HEAD') blockers.push('repo ไม่ได้อยู่บน branch ใด (detached HEAD) สลับไปที่ branch ที่จะรับงานก่อน');
+  if (dirty.length) blockers.push('repo มีไฟล์ที่แก้แล้วยังไม่ commit ' + dirty.length + ' ไฟล์ ให้ commit หรือ stash ก่อน');
+  if (conflicts.length) blockers.push('merge แล้วจะชนกันใน ' + conflicts.length + ' ไฟล์ ต้องแก้เองใน Git');
+  return { target, expected: job.baseBranch || null, otherBranch: Boolean(job.baseBranch && job.baseBranch !== target), dirty: dirty.slice(0, 20),
+    alreadyMerged, fastForward, conflicts: conflicts.slice(0, 20), stat, blockers };
+}
+
+app.get('/api/jobs/:id/merge-check', async (req, res) => {
+  const job = findJob(req.params.id);
+  if (!job) return res.status(404).json({ error: 'ไม่พบงานนี้' });
+  if (busy(job)) return res.status(409).json({ error: 'งานยังทำไม่เสร็จ' });
+  res.json(await mergeCheck(job));
+});
+
+app.post('/api/jobs/:id/merge', async (req, res) => {
+  const job = findJob(req.params.id);
+  if (!job) return res.status(404).json({ error: 'ไม่พบงานนี้' });
+  if (busy(job)) return res.status(409).json({ error: 'งานยังทำไม่เสร็จ' });
+  const check = await mergeCheck(job);
+  // The client confirms the branch it showed the user; if the checkout changed since, stop.
+  if (req.body?.target !== check.target) return res.status(409).json({ error: 'branch ของ repo เปลี่ยนไปเป็น ' + check.target + ' ตรวจอีกครั้งก่อน merge', check });
+  if (check.blockers.length) return res.status(409).json({ error: check.blockers.join(' · '), check });
+  const tip = await git(job.repo, 'rev-parse', job.branch);
+  const headBefore = await git(job.repo, 'rev-parse', 'HEAD');
+  if (!check.alreadyMerged) {
+    const identity = await git(job.repo, 'config', 'user.name').catch(() => '') ? [] : ['-c', 'user.name=Relay', '-c', 'user.email=relay@localhost'];
+    try {
+      await userGit(job.repo, ...identity, 'merge', '--no-edit', '-m', 'Merge ' + job.branch + ': ' + job.title, job.branch);
+    } catch (error) {
+      const conflicted = await git(job.repo, 'diff', '--name-only', '--diff-filter=U').catch(() => '');
+      await userGit(job.repo, 'merge', '--abort').catch(() => {});
+      addEvent(job, 'Merge', 'merge ไม่สำเร็จ ยกเลิกแล้ว repo กลับเป็นเหมือนเดิม: ' + (conflicted || error.stderr || error.message).toString().slice(0, 300));
+      return res.status(409).json({ error: 'merge ไม่สำเร็จ Relay ยกเลิกให้แล้ว repo กลับเป็นเหมือนเดิม' + (conflicted ? ' (ไฟล์ที่ชน: ' + conflicted.split('\n').join(', ') + ')' : ''), check });
+    }
+  }
+  const commit = await git(job.repo, 'rev-parse', 'HEAD');
+  job.merged = { at: Date.now(), into: check.target, commit, tip, fastForward: check.fastForward, before: check.alreadyMerged ? null : headBefore };
+  addEvent(job, 'Merge', (check.alreadyMerged ? 'branch นี้อยู่ใน ' : 'merge เข้า ') + check.target + ' แล้ว (' + commit.slice(0, 7) + (check.fastForward ? ', fast-forward' : '') + ')');
+  if (req.body?.cleanup) {
+    await cleanup(job, false);
+    await git(job.repo, 'branch', '-d', job.branch).then(() => { job.branchKept = false; }).catch(() => {});
+    addEvent(job, 'Merge', 'ล้าง worktree และลบ branch ' + job.branch + ' แล้ว');
+  }
+  save();
+  res.json(job);
+});
 const busy = job => ['queued', 'running', 'stopping'].includes(job.status);
 async function cleanup(job, deleteBranch) {
   // Remove every folder for this job (including role worktrees left by a failed removal), then let git forget them.
