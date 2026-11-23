@@ -4,7 +4,7 @@ import '@fontsource-variable/inter';
 import '@fontsource-variable/noto-sans-thai';
 import {
   ArrowRight, ChartPie, Check, ChevronLeft, ClipboardList, CodeXml, Copy, FlaskConical, FolderGit2, FolderOpen, FolderPlus,
-  GitBranch, Layers, Plus, RefreshCw, RotateCcw, Settings, Sparkle, Terminal, Trash, X
+  TriangleExclamationPoint, CircleCheck, Clock, GitBranch, Layers, LayoutDashboard, Plus, RefreshCw, RotateCcw, Settings, Sparkle, Terminal, Trash, X
 } from 'lucide-react';
 import './style.css';
 
@@ -14,8 +14,15 @@ const providers = {
   codex: { name: 'Codex', company: 'OpenAI', icon: CodeXml }
 };
 const pages = [
-  ['queue', 'คิวงาน', Layers], ['projects', 'โปรเจกต์', FolderGit2], ['quota', 'โควตา AI', ChartPie], ['settings', 'ตั้งค่า', Settings]
+  ['queue', 'ภาพรวม', LayoutDashboard], ['projects', 'โปรเจกต์', FolderGit2], ['quota', 'โควตา AI', ChartPie], ['settings', 'ตั้งค่า', Settings]
 ];
+const pageInfo = {
+  queue: ['ภาพรวม', 'งานที่กำลังทำ สิ่งที่รอคุณ และคิวทั้งหมด'],
+  projects: ['โปรเจกต์', 'โฟลเดอร์งานที่บันทึกไว้ คำสั่งทดสอบ และบันทึกที่ AI อ่านทุกงาน'],
+  quota: ['โควตา AI', 'โควตาคงเหลือ เวลารีเซ็ต และระดับที่กันไว้ของแต่ละ AI'],
+  settings: ['ตั้งค่า', 'การจ่ายงาน โควตา การอนุมัติ งบ และการทำงานต่อเนื่อง'],
+  job: ['รายละเอียดงาน', 'ติดตามความคืบหน้า ตรวจผล และ merge']
+};
 const statusLabels = {
   queued: 'รอเริ่ม', running: 'กำลังดำเนินการ', stopping: 'กำลังหยุด', complete: 'พร้อมตรวจผล',
   needs_review: 'ต้องตรวจเพิ่ม', failed: 'งานติดขัด', cancelled: 'หยุดแล้ว', interrupted: 'ถูกขัดจังหวะ', waiting_approval: 'รออนุมัติ'
@@ -470,8 +477,51 @@ function LiveMonitor({ monitor, job, fallbackJob, saved, onDetails, onApproval, 
       {roles.length ? <div className={'monitor-roles' + (roles.length === 1 ? ' single' : '')} key={job.id}>
         {roles.map(stage => <MonitorRole key={stage.key} stage={stage} single={job.single} activities={job.activities} />)}
       </div> : null}
-      {job.activities.length ? <MonitorActivityList key={job.id} job={job} expanded={Boolean(fallbackJob)} /> : null}
+      {job.activities.length ? <MonitorActivityList key={job.id} job={job} expanded={Boolean(fallbackJob) && !saved} /> : null}
     </> : children}
+  </section>;
+}
+
+// Four numbers that answer "what needs me now?"; each tile jumps to the matching list.
+function Kpis({ jobs, onFilter, onApproval }) {
+  const running = jobs.filter(job => ['running', 'stopping'].includes(job.status)).length;
+  const waiting = jobs.filter(job => job.status === 'waiting_approval');
+  const queued = jobs.filter(job => job.status === 'queued').length;
+  const review = jobs.filter(job => doneStatuses.has(job.status) && !job.merged).length;
+  const tiles = [
+    { key: 'running', label: 'กำลังทำ', value: running, icon: Layers, tone: running ? 'brand' : '', action: () => onFilter('running') },
+    { key: 'waiting', label: 'รอคุณอนุมัติ', value: waiting.length, icon: TriangleExclamationPoint, tone: waiting.length ? 'warn' : '',
+      action: () => waiting.length ? onApproval(waiting[0].id) : onFilter('running') },
+    { key: 'queued', label: 'รอคิว', value: queued, icon: Clock, tone: '', action: () => onFilter('queued') },
+    { key: 'review', label: 'รอตรวจและ merge', value: review, icon: CircleCheck, tone: review ? 'success' : '', action: () => onFilter('done') }
+  ];
+  return <div className="kpis">{tiles.map(({ key, label, value, icon: Icon, tone, action }) =>
+    <button key={key} type="button" className={'kpi ' + tone} onClick={action}>
+      <span className="kpi-icon"><Icon size={18} aria-hidden="true" /></span>
+      <span><strong>{value}</strong><small>{label}</small></span>
+    </button>)}</div>;
+}
+
+// One line per AI: connection, the tightest quota window and when it resets.
+function AiStatus({ quotas, reserve, onMore }) {
+  const now = Date.now();
+  return <section className="card ai-status">
+    <header className="card-head"><h2>AI ที่พร้อมใช้</h2><button type="button" className="link" onClick={onMore}>ดูโควตาทั้งหมด</button></header>
+    <ul>{Object.entries(providers).map(([id, model]) => {
+      const info = quotas?.[id];
+      const windows = (info?.windows || []).filter(window => !window.resetAt || window.resetAt > now).sort((a, b) => a.remaining - b.remaining);
+      const tight = windows[0];
+      const low = tight && tight.remaining <= (reserve[id] ?? 0);
+      return <li key={id}>
+        <ProviderIcon id={id} size={16} />
+        <div className="ai-status-main">
+          <div className="ai-status-line"><strong>{model.name}</strong>
+            <span className={'dot ' + (info?.cooldownUntil > now ? 'warn' : info?.ready ? 'ok' : 'off')}>{info?.cooldownUntil > now ? 'พักถึง ' + time(info.cooldownUntil) : info?.ready ? 'พร้อม' : 'ไม่พร้อม'}</span></div>
+          {tight ? <div className="mini-bar" title={tight.label}><span className={id + (low ? ' low' : '')} style={{ width: tight.remaining + '%' }} /></div> : null}
+          <small>{tight ? Math.round(tight.remaining) + '% · ' + tight.label + (tight.resetAt ? ' · รีเซ็ต ' + time(tight.resetAt) : '') : info?.note || 'ไม่มีข้อมูลโควตา'}</small>
+        </div>
+      </li>;
+    })}</ul>
   </section>;
 }
 
@@ -479,23 +529,27 @@ function jobProviders(job) {
   return [...new Set(Object.values(job.stages || {}).map(stage => stage.provider).filter(id => providers[id]))];
 }
 
-function Queue({ jobs, filter, setFilter, select, create, hasProjects, addProject }) {
+function Queue({ jobs, projects = [], filter, setFilter, select, create, hasProjects, addProject }) {
   const filters = [['all', 'ทั้งหมด'], ['running', 'กำลังทำ'], ['queued', 'รอเริ่ม'], ['done', 'เสร็จแล้ว'], ['stuck', 'ติดขัด']];
-  const match = job => filter === 'all' || (filter === 'running' && ['running', 'stopping', 'waiting_approval'].includes(job.status)) ||
-    job.status === filter || (filter === 'done' && doneStatuses.has(job.status)) || (filter === 'stuck' && stuckStatuses.has(job.status));
-  const items = [...jobs].reverse().filter(match);
+  const matches = (job, id) => id === 'all' || (id === 'running' && ['running', 'stopping', 'waiting_approval'].includes(job.status)) ||
+    job.status === id || (id === 'done' && doneStatuses.has(job.status)) || (id === 'stuck' && stuckStatuses.has(job.status));
+  const items = [...jobs].reverse().filter(job => matches(job, filter));
+  const projectOf = job => projects.find(project => samePath(project.path, job.repo))?.name || repoName(job.repo);
   return <section className="card queue">
-    <h2>งานในคิว</h2>
-    <div className="filters" aria-label="ตัวกรองคิว">{filters.map(([id, label]) =>
-      <button key={id} type="button" aria-pressed={filter === id} onClick={() => setFilter(id)}>{label}</button>)}</div>
+    <header className="card-head"><h2>งานทั้งหมด</h2></header>
+    <div className="filters" aria-label="ตัวกรองคิว">{filters.map(([id, label]) => {
+      const count = jobs.filter(job => matches(job, id)).length;
+      return <button key={id} type="button" aria-pressed={filter === id} onClick={() => setFilter(id)}>{label}{count ? <span className="count">{count}</span> : null}</button>;
+    })}</div>
     {items.length ? <ul className="jobs">{items.map(job => <li key={job.id}>
-      <button className="job-row" onClick={() => select(job.id)}>
+      <button className={'job-row is-' + job.status} onClick={() => select(job.id)}>
         <span className="job-main">
           <strong>{job.title}</strong>
-          <small>{repoName(job.repo)} · สร้าง {dateTime(job.createdAt)}{job.startedAt ? ' · ใช้เวลา ' + jobDuration(job) : ''}</small>
+          <small>{projectOf(job)} · {dateTime(job.createdAt)}{job.startedAt ? ' · ' + jobDuration(job) : ''}</small>
         </span>
-        <span className="job-ais">{jobProviders(job).map(id => <span key={id} title={providers[id].name}><ProviderIcon id={id} size={14} /></span>)}</span>
-        <span className={'status ' + job.status}>{statusLabels[job.status]}</span><ArrowRight size={17} aria-hidden="true" />
+        <span className="job-ais">{jobProviders(job).map(id => <span key={id} title={providers[id].name}><ProviderIcon id={id} size={13} /></span>)}</span>
+        <span className="job-tags">{job.merged ? <span className="tag merged">merge แล้ว</span> : null}<span className={'status ' + job.status}>{statusLabels[job.status]}</span></span>
+        <ArrowRight className="job-arrow" size={16} aria-hidden="true" />
       </button>
     </li>)}</ul> : <div className="empty">
       <span className="terminal"><Terminal size={48} strokeWidth={1.75} aria-hidden="true" /></span>
@@ -669,13 +723,14 @@ function RoutingPreview({ refreshKey }) {
   return <div className="routing-preview">
     <h3>ถ้าสั่งงานตอนนี้ Relay จะเลือก</h3>
     <div className="table-scroll"><table className="steps">
-      <thead><tr><th>ขั้น</th><th>อันดับ 1</th><th>อันดับ 2</th><th>อันดับ 3</th><th>เหตุผลที่เลือกอันดับ 1</th></tr></thead>
+      <thead><tr><th>ขั้น</th><th>อันดับ 1</th><th>อันดับ 2</th><th>อันดับ 3</th></tr></thead>
       <tbody>{Object.entries(roleNames).map(([role, label]) => {
         const { ranking, skipped } = data.roles[role];
         return <tr key={role}>
           <td>{label}</td>
-          {[0, 1, 2].map(index => <td key={index}>{ranking[index] ? <><strong>{providerName(ranking[index].provider)}</strong> {ranking[index].score} <ScoreBars row={ranking[index]} /></> : '–'}</td>)}
-          <td className="wrap">{ranking[0]?.reason || 'ไม่มี AI ที่พร้อมใช้'}{skipped.length ? <small>ข้าม: {skipped.map(item => providerName(item.provider) + ' (' + item.reason + ')').join(', ')}</small> : null}</td>
+          {[0, 1, 2].map(index => <td key={index} className={index === 0 ? 'wrap' : undefined}>{ranking[index] ? <><strong>{providerName(ranking[index].provider)}</strong> {ranking[index].score} <ScoreBars row={ranking[index]} /></> : index ? '–' : 'ไม่มี AI ที่พร้อมใช้'}
+            {index === 0 && ranking[0]?.reason ? <small>{ranking[0].reason}</small> : null}
+            {index === 0 && skipped.length ? <small>ข้าม: {skipped.map(item => providerName(item.provider) + ' (' + item.reason + ')').join(', ')}</small> : null}</td>)}
         </tr>;
       })}</tbody>
     </table></div>
@@ -687,6 +742,7 @@ function SettingsForm({ initial, changed, quotas, onDirty }) {
   const [draft, setDraft] = useState(initial);
   const [notice, setNotice] = useState(null);
   const [saving, setSaving] = useState(false);
+  const [section, setSection] = useState('routing');
   const dirty = JSON.stringify(draft) !== JSON.stringify(initial);
   const duplicate = hasDuplicate(draft.routes);
   const setAuto = (key, value) => setDraft(current => ({ ...current, auto: { ...current.auto, [key]: value } }));
@@ -706,7 +762,14 @@ function SettingsForm({ initial, changed, quotas, onDirty }) {
   const routing = draft.routing || { mode: 'auto', profile: 'balanced', minSamples: 5 };
   const setRouting = (key, value) => setDraft(current => ({ ...current, routing: { ...routing, [key]: value } }));
   const table = <RouteTable routes={draft.routes} quotas={quotas} label="การมอบหมายงาน" onChange={(role, index, value) => setDraft(current => ({ ...current, routes: updateRoutes(current.routes, role, index, value) }))} />;
-  return <form className="card settings" onSubmit={submit}>
+  const sections = [['routing', 'การจ่ายงาน', 'Relay เลือก AI ให้แต่ละขั้นอย่างไร'], ['quota', 'โควตาและรอบแก้', 'กันโควตาไว้ใช้รีวิว และจำนวนรอบแก้'],
+    ['edit', 'การแก้โค้ดและอนุมัติ', 'ให้ AI แก้ไฟล์เอง และจุดหยุดรออนุมัติ'], ['budget', 'งบ', 'หยุดรออนุมัติเมื่อถึงงบ'], ['auto', 'ทำงานต่อเนื่อง', 'ลองซ้ำ รอโควตา และเวลาสูงสุด']];
+  const show = key => section === key;
+  return <form className="settings-layout" onSubmit={submit}>
+    <nav className="card settings-nav" aria-label="หมวดการตั้งค่า">{sections.map(([key, label, hint]) =>
+      <button key={key} type="button" aria-current={section === key ? 'page' : undefined} onClick={() => setSection(key)}><strong>{label}</strong><small>{hint}</small></button>)}</nav>
+    <div className="card settings">
+    {show('routing') ? <>
     <h2>การจ่ายงาน</h2>
     <div className="filters" aria-label="โหมดการจ่ายงาน">
       <button type="button" aria-pressed={routing.mode === 'auto'} onClick={() => setRouting('mode', 'auto')}>อัตโนมัติ (Relay เลือกให้)</button>
@@ -726,6 +789,8 @@ function SettingsForm({ initial, changed, quotas, onDirty }) {
       <p className="muted">Relay ใช้ตัวหลักก่อน ถ้าตัวหลักยังไม่เชื่อมต่อ โควตาต่ำกว่าที่กันไว้ หรือเรียกไม่สำเร็จ จะเปลี่ยนไปใช้ตัวสำรอง</p>
       {table}
     </>}
+    </> : null}
+    {show('quota') ? <>
     <h2>โควตาและรอบแก้</h2>
     <p className="muted">ในขั้นวางแผน Backend และ UX/UI Relay จะข้าม AI ที่โควตาคงเหลือต่ำกว่าค่านี้ เพื่อเก็บโควตาไว้ใช้ในขั้นรีวิว หลอดโควตาจะมีเส้นบอกระดับนี้</p>
     <div className="settings-grid">
@@ -733,17 +798,23 @@ function SettingsForm({ initial, changed, quotas, onDirty }) {
       <label>เพดาน Gemini ต่อวัน (0 = ยังไม่ระบุ)<input type="number" required min="0" max="1000000" value={draft.geminiDailyLimit} onChange={event => setDraft({ ...draft, geminiDailyLimit: Number(event.target.value) })} /></label>
       <label>จำนวนรอบแก้สูงสุด<input type="number" required min="0" max="6" value={draft.maxRounds} onChange={event => setDraft({ ...draft, maxRounds: Number(event.target.value) })} /></label>
     </div>
-    <h2 className="section-gap">การแก้โค้ดและการอนุมัติ</h2>
+    </> : null}
+    {show('edit') ? <>
+    <h2>การแก้โค้ดและการอนุมัติ</h2>
     <label className="checkbox"><input type="checkbox" checked={draft.agentEdits !== false} onChange={event => setDraft({ ...draft, agentEdits: event.target.checked })} />ให้ Claude Code และ Codex แก้ไฟล์เองใน worktree ของงาน (เห็นทั้ง repo แก้ไฟล์ใหญ่ได้ตรงจุด) Gemini ยังส่งผลเป็น JSON</label>
     <label className="checkbox"><input type="checkbox" checked={draft.approvals?.afterPlan} onChange={event => setDraft({ ...draft, approvals: { ...draft.approvals, afterPlan: event.target.checked } })} />ทุกงาน: หยุดให้ฉันอนุมัติแผนก่อนลงมือแก้โค้ด</label>
-    <h2 className="section-gap">งบ</h2>
+    </> : null}
+    {show('budget') ? <>
+    <h2>งบ</h2>
     <p className="muted">เมื่อถึงงบ Relay จะหยุดงานและรอคุณอนุมัติก่อนเรียก AI ต่อ ใส่ 0 ถ้าไม่จำกัด Task Card ตั้งงบเฉพาะงานได้ด้วย routing.budget_usd</p>
     <div className="settings-grid">
       <label>งบต่องาน (USD)<input type="number" required min="0" max="10000" step="0.01" value={draft.budget?.perJobUsd ?? 0} onChange={event => setBudget('perJobUsd', Number(event.target.value))} /></label>
       <label>งบต่อวัน (USD)<input type="number" required min="0" max="10000" step="0.01" value={draft.budget?.dailyUsd ?? 0} onChange={event => setBudget('dailyUsd', Number(event.target.value))} /></label>
     </div>
     <label className="checkbox"><input type="checkbox" checked={draft.budget?.countSubscription !== false} onChange={event => setBudget('countSubscription', event.target.checked)} />นับมูลค่าเทียบ API ของงานที่ใช้ subscription ด้วย (ถ้าไม่ติ๊ก นับเฉพาะเงินที่จ่ายจริงผ่าน API)</label>
-    <h2 className="section-gap">โหมดอัตโนมัติ</h2>
+    </> : null}
+    {show('auto') ? <>
+    <h2>ทำงานต่อเนื่อง (โหมดอัตโนมัติ)</h2>
     <p className="muted">สั่งครั้งเดียวแล้วให้ Relay จัดการจนจบ: ลอง AI ตัวอื่นเมื่อทำไม่ได้ รอโควตาแทนการหยุด ลองขั้นที่ล้มใหม่ และส่ง error จากการทดสอบให้ AI แก้จนผ่านหรือครบจำนวนรอบ ผลงานยังอยู่บน branch ให้คุณตรวจก่อน merge เสมอ</p>
     <label className="checkbox"><input type="checkbox" checked={draft.auto.allProviders} onChange={event => setAuto('allProviders', event.target.checked)} />ถ้าตัวหลักและตัวสำรองทำไม่ได้ ให้ลอง AI ตัวอื่นที่เชื่อมต่ออยู่</label>
     <div className="settings-grid">
@@ -751,10 +822,14 @@ function SettingsForm({ initial, changed, quotas, onDirty }) {
       <label>ลองขั้นที่ล้มใหม่ (ครั้ง)<input type="number" required min="0" max="5" value={draft.auto.retries} onChange={event => setAuto('retries', Number(event.target.value))} /></label>
       <label>เวลาสูงสุดต่องาน (นาที)<input type="number" required min="10" max="1440" value={draft.auto.maxJobMinutes} onChange={event => setAuto('maxJobMinutes', Number(event.target.value))} /></label>
     </div>
-    <div className="form-actions"><button className="button primary" type="submit" disabled={saving || !dirty || duplicate}>บันทึกการตั้งค่า</button>
-      {dirty ? <Button onClick={() => { setDraft(initial); setNotice(null); }}>ยกเลิกการแก้</Button> : null}
+    </> : null}
+    <div className={'form-actions save-bar' + (dirty ? ' dirty' : '')}>
       {notice ? <span role="status" className={notice.error ? 'error' : 'success'}>{notice.text}</span> :
-        dirty ? <span role="status" className="warn-text">มีการแก้ที่ยังไม่บันทึก</span> : null}</div>
+        dirty ? <span role="status" className="warn-text">มีการแก้ที่ยังไม่บันทึก</span> : <span className="muted">บันทึกแล้ว</span>}
+      <span className="spacer" />
+      {dirty ? <Button onClick={() => { setDraft(initial); setNotice(null); }}>ยกเลิกการแก้</Button> : null}
+      <button className="button primary" type="submit" disabled={saving || !dirty || duplicate}>บันทึกการตั้งค่า</button></div>
+    </div>
   </form>;
 }
 
@@ -1017,6 +1092,20 @@ function RoutingView({ job }) {
   </div>;
 }
 
+// History line: long AI summaries are clamped to three lines until clicked.
+function EventItem({ event }) {
+  const [open, setOpen] = useState(false);
+  const long = (event.detail || '').length > 220;
+  return <li className={event.provider ? 'by-' + event.provider : ''}>
+    <span className="event-time">{time(event.at)}</span>
+    <div>
+      <strong>{event.title}{event.provider ? <em>{providerName(event.provider)}</em> : null}</strong>
+      <p className={long && !open ? 'clamp' : ''}>{event.detail}</p>
+      {long ? <button type="button" className="link small" onClick={() => setOpen(value => !value)}>{open ? 'ย่อ' : 'อ่านต่อ'}</button> : null}
+    </div>
+  </li>;
+}
+
 function JobDetail({ job, projectName, monitor, approvalRequested, onApproval, onApprovalFocused, back, retry, updated, removed }) {
   const [tab, setTab] = useState('events');
   const [diff, setDiff] = useState(null);
@@ -1056,12 +1145,27 @@ function JobDetail({ job, projectName, monitor, approvalRequested, onApproval, o
     try { updated(await api('/jobs/' + job.id + '/cancel', 'POST')); }
     catch (error) { setError(error.message); }
   }
-  const assigned = Object.entries(job.stages || {}).filter(([, stage]) => stage.provider);
+  const assigned = Object.entries(job.stages || {}).filter(([, stage]) => Object.hasOwn(providers, stage.provider));
+  const manualChecks = job.card?.acceptance?.filter(item => item.check === 'manual') || [];
   return <>
-    <button type="button" className="back" onClick={back}><ChevronLeft size={18} /> กลับไปคิวงาน</button>
-    <div className="heading detail-heading"><div><h1>{job.title}</h1>
-      <p>{job.repo} · สร้าง {dateTime(job.createdAt)}{job.startedAt ? ' · ใช้เวลา ' + jobDuration(job) : ''}{job.resumedFrom ? ' · ใช้แผนจากงานเดิม' : ''}</p></div>
-      <span className={'status ' + status}>{statusLabels[status]}</span></div>
+    <button type="button" className="back" onClick={back}><ChevronLeft size={16} /> กลับไปภาพรวม</button>
+    <header className="job-header card">
+      <div className="job-header-main">
+        <div className="job-title-row"><h1>{job.title}</h1><span className={'status ' + status}>{statusLabels[status]}</span>
+          {job.merged ? <span className="tag merged">merge แล้ว</span> : null}</div>
+        <p className="job-meta">
+          <span>{projectName}</span><span>{jobTypes[job.type || 'feature']}</span><span>สร้าง {dateTime(job.createdAt)}</span>
+          {job.startedAt ? <span>ใช้เวลา {jobDuration(job)}</span> : null}{job.card ? <span>{job.source && job.source !== 'card' ? 'Task Card · ' + (sourceNames[job.source] || job.source) : 'Task Card'}</span> : null}
+          {job.resumedFrom ? <span>ทำต่อจากงานเดิม</span> : null}
+        </p>
+      </div>
+      <div className="job-header-actions">
+        {['queued', 'running', 'waiting_approval'].includes(job.status) ? <Button danger icon={X} onClick={cancel}>หยุดงาน</Button> : null}
+        {!busy && stuckStatuses.has(job.status) && job.plan ? <Button primary icon={RotateCcw} onClick={() => retry(job)}>ทำต่อจากจุดที่ค้าง</Button> : null}
+        {!busy ? <Button icon={RotateCcw} onClick={() => retry({ ...job, plan: undefined, id: undefined })}>สั่งงานนี้อีกครั้ง</Button> : null}
+      </div>
+    </header>
+    {job.error ? <p className="error banner" role="alert"><TriangleExclamationPoint size={16} aria-hidden="true" /> {job.error}</p> : null}
     <LiveMonitor monitor={monitor} job={liveJob ?? savedJob} saved={!liveJob && Boolean(savedJob)}
       fallbackJob={{ ...job, status, finishedAt, projectName }} onApproval={onApproval}>
       <div className="monitor-legacy-progress">
@@ -1072,36 +1176,37 @@ function JobDetail({ job, projectName, monitor, approvalRequested, onApproval, o
     {showApproval ? <ApprovalPanel key={job.approval.kind + ':' + job.approval.requestedAt} job={job} panelRef={approvalRef} /> : null}
     <div className="detail-grid">
       <section className="card detail">
-        <div className="filters"><button aria-pressed={tab === 'events'} onClick={() => { setTab('events'); setError(''); }}>ประวัติการทำงาน</button>
+        <div className="filters tabs"><button aria-pressed={tab === 'events'} onClick={() => { setTab('events'); setError(''); }}>ประวัติการทำงาน</button>
           <button aria-pressed={tab === 'diff'} onClick={() => showDiff()} disabled={!hasResult}>Git diff</button>
           <button aria-pressed={tab === 'usage'} onClick={() => { setTab('usage'); setError(''); }}>การใช้ AI</button>
           {job.routing?.length ? <button aria-pressed={tab === 'routing'} onClick={() => { setTab('routing'); setError(''); }}>การจ่ายงาน</button> : null}</div>
         {error ? <p role="alert" className="error">{error}</p> : null}
         {tab === 'routing' ? <RoutingView job={job} /> : tab === 'usage' ? <UsageView job={job} /> :
           tab === 'diff' ? loading ? <p>กำลังโหลด diff…</p> : diff ? <DiffView diff={diff} focus={focus} /> : null :
-          <ol className="events">{job.events.length ? [...job.events].reverse().map((event, i) => <li key={job.events.length - i}><span>{time(event.at)}</span><div><strong>{event.title}{event.provider ? ' · ' + providerName(event.provider) : ''}</strong><p>{event.detail}</p></div></li>) : <li><p>รอเริ่มงาน</p></li>}</ol>}
+          <ol className="events timeline">{job.events.length ? [...job.events].reverse().map((event, i) => <EventItem key={job.events.length - i} event={event} />) : <li><p>รอเริ่มงาน</p></li>}</ol>}
       </section>
-      <aside className="card detail facts">
-        {!busy ? <JobActions job={job} updated={updated} removed={removed} setError={setError} /> : null}
-        <h2>รายละเอียดงาน</h2>
-        <p className="muted">ประเภท: {jobTypes[job.type || 'feature']}</p>
-        {job.scope ? <p className="muted">Scope: {job.scope.include?.length ? 'แก้ได้เฉพาะ ' + job.scope.include.join(', ') : ''}{job.scope.exclude?.length ? ' · ห้ามแก้ ' + job.scope.exclude.join(', ') : ''}</p> : null}
-        {job.card ? <p className="source-badge">มาจาก Task Card · {sourceNames[job.source] || job.source}{job.budgetUsd != null ? ' · งบ $' + job.budgetUsd : ''}</p> : null}
-        {job.card?.acceptance?.some(item => item.check === 'manual') ? <><h3>ต้องตรวจเองหลังส่งมอบ</h3>
-          <ul>{job.card.acceptance.filter(item => item.check === 'manual').map(item => <li key={item.text}>{item.text}</li>)}</ul></> : null}
-        <p className="preline">{job.prompt}</p>
-        {job.error ? <p className="error">{job.error}</p> : null}
-        {assigned.length ? <><h3>AI ที่รับงาน</h3><ul className="assigned">{assigned.map(([key, stage]) => <li key={key}>{stageNames[key]} · {providerName(stage.provider)}</li>)}</ul></> : null}
-        {job.branch && hasResult ? <><h3>Branch ผลลัพธ์</h3><code>{job.branch}</code>{job.worktree ? <small>{job.worktree}</small> : null}</> : null}
-        {job.plan ? <><h3>API contract</h3><p className="preline">{job.plan.contract}</p><h3>เกณฑ์รับงาน</h3><p className="preline">{job.plan.acceptance}</p></> : null}
-        {job.review ? <><h3>ผลรีวิว</h3><p className="preline">{job.review.summary}</p>
-          {job.review.findings.length ? <ul>{job.review.findings.map((item, index) => <li key={index}>{roleNames[item.owner]} · <Finding text={item.detail} openFile={file => hasResult && showDiff(file)} /></li>)}</ul> : null}</> : null}
-        {job.checks?.length ? <><h3>ผลทดสอบ</h3>{job.checks.map(check => <details key={check.label}><summary>{check.label} · {check.code === 0 ? 'ผ่าน' : 'ตรวจเพิ่ม'}</summary><pre>{check.output}</pre></details>)}</> : null}
-        <div className="action-row">
-          {['queued', 'running'].includes(job.status) ? <Button onClick={cancel}>หยุดงาน</Button> : null}
-          {!busy && stuckStatuses.has(job.status) && job.plan ? <Button primary icon={RotateCcw} onClick={() => retry(job)}>ทำต่อจากจุดที่ค้าง</Button> : null}
-          {!busy ? <Button icon={RotateCcw} onClick={() => retry({ ...job, plan: undefined, id: undefined })}>สร้างงานจากโจทย์นี้</Button> : null}
-        </div>
+      <aside className="facts-column">
+        {!busy ? <section className="card detail"><JobActions job={job} updated={updated} removed={removed} setError={setError} /></section> : null}
+        <section className="card detail facts">
+          <h2>สรุปงาน</h2>
+          {manualChecks.length ? <div className="callout warn"><strong>ต้องตรวจเองหลังส่งมอบ</strong>
+            <ul>{manualChecks.map(item => <li key={item.text}>{item.text}</li>)}</ul></div> : null}
+          {job.review ? <div className={'callout ' + (job.review.findings.length ? 'warn' : 'ok')}>
+            <strong>{job.review.findings.length ? 'ผลรีวิว: เหลือ ' + job.review.findings.length + ' ข้อ' : 'ผลรีวิว: ไม่พบปัญหา'}</strong>
+            <p className="preline">{job.review.summary}</p>
+            {job.review.findings.length ? <ul>{job.review.findings.map((item, index) => <li key={index}><b>{roleNames[item.owner]}</b> · <Finding text={item.detail} openFile={file => hasResult && showDiff(file)} /></li>)}</ul> : null}
+          </div> : null}
+          {job.checks?.length ? <div className="fact"><h3>ผลทดสอบ</h3>{job.checks.map(check => <details key={check.label} className="check">
+            <summary><span className={'check-dot ' + (check.code === 0 ? 'ok' : check.code === null ? 'off' : 'bad')} />{check.label}<em>{check.code === 0 ? 'ผ่าน' : check.code === null ? 'ไม่ได้รัน' : 'ไม่ผ่าน'}</em></summary><pre>{check.output}</pre></details>)}</div> : null}
+          {assigned.length ? <div className="fact"><h3>AI ที่รับงาน</h3><div className="chips">{assigned.map(([key, stage]) =>
+            <span key={key} className="chip"><ProviderIcon id={stage.provider} size={12} />{stageName(job, key)} · {providerName(stage.provider)}</span>)}</div></div> : null}
+          <details className="fact" open={job.prompt.length < 500}><summary><h3>โจทย์</h3></summary><p className="preline">{job.prompt}</p></details>
+          {job.plan ? <details className="fact"><summary><h3>แผนงาน</h3></summary>
+            <h4>ข้อตกลงระหว่างส่วน</h4><p className="preline">{job.plan.contract}</p><h4>เกณฑ์รับงาน</h4><p className="preline">{job.plan.acceptance}</p></details> : null}
+          {job.scope ? <div className="fact"><h3>Scope</h3><p>{job.scope.include?.length ? 'แก้ได้เฉพาะ ' + job.scope.include.join(', ') : ''}{job.scope.exclude?.length ? ' · ห้ามแก้ ' + job.scope.exclude.join(', ') : ''}</p></div> : null}
+          {job.branch && hasResult ? <div className="fact"><h3>Branch ผลลัพธ์</h3><code>{job.branch}</code>{job.worktree ? <small>{job.worktree}</small> : null}</div> : null}
+          {job.budgetUsd != null ? <div className="fact"><h3>งบ</h3><p>{'$' + job.budgetUsd}</p></div> : null}
+        </section>
       </aside>
     </div>
   </>;
@@ -1247,7 +1352,7 @@ function ProjectsPage({ projects, jobs, createJob, added, removed, select }) {
     finally { setPending(false); }
   }
   return <>
-    <div className="heading"><h1>โปรเจกต์</h1><p>บันทึกโฟลเดอร์งานที่ใช้บ่อย แล้วสร้างงานจากโปรเจกต์ได้ทันที</p></div>
+
     <form className="card add-project" onSubmit={add}>
       <h2>เพิ่มโปรเจกต์</h2>
       <div className="add-row">
@@ -1383,17 +1488,25 @@ function App() {
     jobs.filter(item => item.status === 'waiting_approval').length;
   const queuedCount = currentSnapshot?.queuedCount ?? jobs.filter(item => item.status === 'queued').length;
   const reserve = data?.settings.reserve ?? {};
+  const pageKey = job ? 'job' : page;
+  const waitingJobs = jobs.filter(item => item.status === 'waiting_approval').length;
+  const activeJobs = jobs.filter(item => ['running', 'stopping', 'waiting_approval'].includes(item.status)).length;
+  const badges = { queue: waitingJobs ? { value: waitingJobs, tone: 'warn' } : activeJobs ? { value: activeJobs, tone: 'brand' } : null,
+    projects: projects.length ? { value: projects.length, tone: '' } : null };
   const cards = detailed => <div className="providers">{Object.keys(providers).map(id => <ProviderCard id={id} key={id} info={data?.quotas[id]} detailed={detailed} reserve={reserve[id] ?? 0} />)}</div>;
   return <div className="shell">
     <aside className="sidebar">
-      <button className="brand" onClick={() => open('queue')}><img src="/relay.svg" alt="" width="42" height="42" />Relay</button>
-      <nav aria-label="เมนูหลัก">{pages.map(([id, label, Icon]) => <button key={id} type="button" aria-current={page === id ? 'page' : undefined} onClick={() => open(id)}><Icon size={22} aria-hidden="true" /><span>{label}</span></button>)}</nav>
+      <button className="brand" onClick={() => open('queue')}><img src="/relay.svg" alt="" width="34" height="34" /><span>Relay</span></button>
+      <nav aria-label="เมนูหลัก">{pages.map(([id, label, Icon]) => <button key={id} type="button" aria-current={page === id && !job ? 'page' : undefined} onClick={() => open(id)}>
+        <Icon size={19} aria-hidden="true" /><span>{label}</span>{badges[id] ? <i className={'nav-badge ' + badges[id].tone}>{badges[id].value}</i> : null}</button>)}</nav>
       <footer><span className={data && !networkError ? 'live' : ''} /><div>Local Server · {networkError ? 'ออฟไลน์' : data ? 'พร้อมใช้งาน' : 'กำลังเชื่อมต่อ'}<small>{location.host}</small></div></footer>
     </aside>
     <div className="workspace">
-      <header className="topbar"><div className="topbar-status" role="status">
-        {runningCount ? <span className="pulse" aria-hidden="true" /> : null}
-        {runningCount ? 'กำลังทำ ' + runningCount + ' งาน' : 'ไม่มีงานที่กำลังทำ'}{waitingCount ? ' · รออนุมัติ ' + waitingCount : ''}{queuedCount ? ' · รอ ' + queuedCount : ''}</div>
+      <header className="topbar">
+        <div className="page-title"><h1>{pageInfo[pageKey][0]}</h1><p>{pageInfo[pageKey][1]}</p></div>
+        <div className="topbar-status" role="status">
+          {runningCount ? <span className="pulse" aria-hidden="true" /> : <span className="idle-dot" aria-hidden="true" />}
+          {runningCount ? 'กำลังทำ ' + runningCount + ' งาน' : 'ว่าง'}{waitingCount ? ' · รออนุมัติ ' + waitingCount : ''}{queuedCount ? ' · รอ ' + queuedCount : ''}</div>
         <div className="actions"><Button icon={RefreshCw} onClick={refresh} disabled={refreshing}>{refreshing ? 'กำลังรีเฟรช' : 'รีเฟรชโควตา'}</Button><Button primary icon={Plus} onClick={() => setDialog({})} disabled={!data}>สร้างงาน</Button></div>
       </header>
       <main>
@@ -1401,15 +1514,19 @@ function App() {
         {job ? <JobDetail key={job.id} job={job} projectName={projectName} monitor={monitor} approvalRequested={approvalTarget === job.id}
           onApproval={openApproval} onApprovalFocused={() => setApprovalTarget(null)} back={() => open('queue')}
           retry={setDialog} updated={updateJob} removed={removeJob} /> :
-          page === 'settings' ? <><div className="heading"><h1>ตั้งค่า</h1><p>เลือก AI ที่จะรับผิดชอบแต่ละขั้น</p></div>
+          page === 'settings' ? <>
             {data ? <SettingsForm initial={data.settings} quotas={data.quotas} onDirty={setSettingsDirty} changed={settings => setData(previous => ({ ...previous, settings }))} /> : null}</> :
           page === 'projects' ? <ProjectsPage projects={projects} jobs={jobs} createJob={repo => setDialog({ repo })} added={addProject} removed={removeProject} select={select} /> :
-          page === 'quota' ? <><div className="heading"><h1>โควตา AI</h1><p>ดูโควตาคงเหลือ เวลารีเซ็ต และระดับที่กันไว้ของแต่ละผู้ให้บริการ</p></div>{cards(true)}</> :
+          page === 'quota' ? <>{cards(true)}</> :
           <>
-            <div className="heading"><h1>คิวงาน AI</h1><p>สั่งงาน ติดตามผล และจัดสรรโควตาจากที่เดียว</p></div>
-            <LiveMonitor monitor={monitor} job={snapshot?.activeJob} onDetails={select} onApproval={openApproval} />
-            <Queue jobs={jobs} filter={filter} setFilter={setFilter} select={select} create={() => setDialog({})} hasProjects={projects.length > 0} addProject={() => open('projects')} />
-            {cards(false)}
+            <Kpis jobs={jobs} onFilter={setFilter} onApproval={openApproval} />
+            <div className="home-grid">
+              <div className="home-main">
+                <LiveMonitor monitor={monitor} job={snapshot?.activeJob} onDetails={select} onApproval={openApproval} />
+                <Queue jobs={jobs} projects={projects} filter={filter} setFilter={setFilter} select={select} create={() => setDialog({})} hasProjects={projects.length > 0} addProject={() => open('projects')} />
+              </div>
+              <AiStatus quotas={data?.quotas} reserve={reserve} onMore={() => open('quota')} />
+            </div>
           </>}
       </main>
     </div>
