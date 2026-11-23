@@ -177,11 +177,33 @@ const monitorClock = new Intl.DateTimeFormat('th-TH', {
 });
 const monitorTime = at => monitorClock.format(at);
 
+function isMonitorJob(value) {
+  return Boolean(value?.id && Array.isArray(value.stages) && Array.isArray(value.activities));
+}
+
 function isMonitorSnapshot(value) {
   return Number.isFinite(value?.updatedAt) && Number.isInteger(value.queuedCount) &&
     (value.lastFinishedJob === null || Boolean(value.lastFinishedJob?.id)) &&
-    (value.activeJob === null || Boolean(value.activeJob?.id &&
-      Array.isArray(value.activeJob.stages) && Array.isArray(value.activeJob.activities)));
+    (value.activeJob === null || isMonitorJob(value.activeJob));
+}
+
+function useSavedJobMonitor(id, isLive, status, isStale) {
+  const [savedJob, setSavedJob] = useState(undefined);
+  useEffect(() => {
+    if (isLive) {
+      setSavedJob(undefined);
+      return;
+    }
+    const controller = new AbortController();
+    const { signal } = controller;
+    api('/jobs/' + encodeURIComponent(id) + '/monitor', 'GET', undefined, { signal, cache: 'no-store' }).then(result => {
+      if (!signal.aborted) setSavedJob(isMonitorJob(result) && result.id === id ? result : null);
+    }, () => {
+      if (!signal.aborted) setSavedJob(previous => previous ?? null);
+    });
+    return () => controller.abort();
+  }, [id, isLive, status, isStale]);
+  return savedJob;
 }
 
 function useMonitor() {
@@ -387,26 +409,29 @@ function MonitorActivityList({ job, expanded }) {
   </details>;
 }
 
-function LiveMonitor({ monitor, job, fallbackJob, onDetails, onApproval, children }) {
+function LiveMonitor({ monitor, job, fallbackJob, saved, onDetails, onApproval, children }) {
   const { snapshot, receivedAt, connection } = monitor;
   const [now, setNow] = useState(Date.now);
-  const ticking = Boolean(job?.startedAt) && connection !== 'stale';
+  const latest = snapshot?.lastFinishedJob;
+  const summary = job || fallbackJob || latest;
+  const finishedAt = summary?.finishedAt;
+  const ticking = Boolean(job?.startedAt) && !saved && finishedAt == null && connection !== 'stale';
   useEffect(() => {
     if (!ticking) return;
     setNow(Date.now());
     const timer = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(timer);
   }, [ticking]);
-  const latest = snapshot?.lastFinishedJob;
-  const summary = job || fallbackJob || latest;
   const roles = job?.stages.filter(stage => workKeys.has(stage.key) && !(job.single && stage.key === 'frontend')) || [];
-  const elapsed = summary?.startedAt == null ? '' : duration(Math.max(0,
-    (summary.finishedAt ?? (connection === 'stale' ? receivedAt ?? now : Math.max(now, receivedAt ?? 0))) - summary.startedAt));
-  const approval = job?.approval;
+  const elapsed = summary?.startedAt == null || (saved && finishedAt == null) ? '' : duration(Math.max(0,
+    (finishedAt ?? (connection === 'stale' ? receivedAt ?? now : Math.max(now, receivedAt ?? 0))) - summary.startedAt));
+  const approval = saved ? null : job?.approval;
   return <section className="card monitor" aria-label="ติดตามงานสด">
     <header className="monitor-header">
       <h2><span><Terminal size={19} aria-hidden="true" /></span>ติดตามงานสด</h2>
-      <span className={'monitor-connection ' + connection} role="status">{monitorConnections[connection]}</span>
+      <span className={'monitor-connection' + (saved ? '' : ' ' + connection)} role="status">
+        {saved ? 'ข้อมูลที่บันทึกไว้' : monitorConnections[connection]}
+      </span>
     </header>
     <div className="monitor-summary">
       <div className="monitor-job">
@@ -426,13 +451,13 @@ function LiveMonitor({ monitor, job, fallbackJob, onDetails, onApproval, childre
         </button> : null}
       </div>
       <dl className="monitor-metrics">
-        {job || elapsed ? <div><dt>เวลาที่ผ่านไป</dt><dd>{elapsed || '–'}</dd></div> : null}
-        {!job && summary?.finishedAt != null ? <div><dt>จบเมื่อ</dt><dd>{dateTime(summary.finishedAt)}</dd></div> : null}
-        <div><dt>ได้รับข้อมูลล่าสุด</dt><dd>{receivedAt == null ? '–' :
+        {(job && !saved) || elapsed ? <div><dt>เวลาที่ผ่านไป</dt><dd>{elapsed || '–'}</dd></div> : null}
+        {finishedAt != null ? <div><dt>จบเมื่อ</dt><dd>{dateTime(finishedAt)}</dd></div> : null}
+        {saved ? null : <><div><dt>ได้รับข้อมูลล่าสุด</dt><dd>{receivedAt == null ? '–' :
           <time dateTime={new Date(receivedAt).toISOString()} title={'ข้อมูลจากเซิร์ฟเวอร์ ' + dateTime(snapshot.updatedAt)}>
             {monitorTime(receivedAt)}
           </time>}</dd></div>
-        <div><dt>รอในคิว</dt><dd>{snapshot ? snapshot.queuedCount + ' งาน' : '–'}</dd></div>
+        <div><dt>รอในคิว</dt><dd>{snapshot ? snapshot.queuedCount + ' งาน' : '–'}</dd></div></>}
       </dl>
     </div>
     {approval ? <div className="monitor-approval">
@@ -914,8 +939,9 @@ function JobDetail({ job, projectName, monitor, approvalRequested, onApproval, o
   const { snapshot } = monitor;
   const liveJob = snapshot?.activeJob?.id === job.id ? snapshot.activeJob : null;
   const finishedJob = snapshot?.lastFinishedJob?.id === job.id ? snapshot.lastFinishedJob : null;
-  const status = liveJob?.status ?? finishedJob?.status ?? job.status;
-  const finishedAt = finishedJob?.finishedAt ?? job.finishedAt;
+  const savedJob = useSavedJobMonitor(job.id, Boolean(liveJob), finishedJob?.status ?? job.status, monitor.connection === 'stale');
+  const status = liveJob?.status ?? finishedJob?.status ?? savedJob?.status ?? job.status;
+  const finishedAt = finishedJob?.finishedAt ?? savedJob?.finishedAt ?? job.finishedAt;
   const busy = busyStatuses.has(status);
   const showApproval = job.status === 'waiting_approval' && Number.isFinite(job.approval?.requestedAt) &&
     (job.approval.kind !== 'plan' || Boolean(job.plan)) && (!snapshot || sameApproval(job.approval, liveJob?.approval));
@@ -945,9 +971,11 @@ function JobDetail({ job, projectName, monitor, approvalRequested, onApproval, o
     <div className="heading detail-heading"><div><h1>{job.title}</h1>
       <p>{job.repo} · สร้าง {dateTime(job.createdAt)}{job.startedAt ? ' · ใช้เวลา ' + jobDuration(job) : ''}{job.resumedFrom ? ' · ใช้แผนจากงานเดิม' : ''}</p></div>
       <span className={'status ' + status}>{statusLabels[status]}</span></div>
-    <LiveMonitor monitor={monitor} job={liveJob} fallbackJob={{ ...job, status, finishedAt, projectName }} onApproval={onApproval}>
+    <LiveMonitor monitor={monitor} job={liveJob ?? savedJob} saved={!liveJob && Boolean(savedJob)}
+      fallbackJob={{ ...job, status, finishedAt, projectName }} onApproval={onApproval}>
       <div className="monitor-legacy-progress">
-        <Stepper job={{ ...job, status }} inactive={Boolean(snapshot) || !busy || status === 'queued'} />
+        {savedJob === undefined ? <p className="muted" role="status">กำลังโหลดข้อมูลติดตามงาน…</p> :
+          <Stepper job={{ ...job, status }} inactive={Boolean(snapshot) || !busy || status === 'queued'} />}
       </div>
     </LiveMonitor>
     {showApproval ? <ApprovalPanel key={job.approval.kind + ':' + job.approval.requestedAt} job={job} panelRef={approvalRef} /> : null}
