@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { lstat, mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 const execute = promisify(execFile);
@@ -29,6 +29,31 @@ function validFile(name) {
 
 // Files named in `include` (the ones a role must edit) are sent in full up to a larger limit;
 // the rest of the repo fills a smaller budget. `omittedPaths` lists source files left out.
+export const isSafePath = validFile;
+
+// Working-tree changes as a Map of path -> two-letter status ("??" = new file). Renames report the new path.
+export async function statusEntries(cwd) {
+  const tokens = (await git(cwd, 'status', '--porcelain', '-uall', '-z')).split('\0');
+  const entries = new Map();
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index];
+    if (token.length < 4) continue;
+    const code = token.slice(0, 2);
+    entries.set(token.slice(3), code);
+    if (code[0] === 'R' || code[0] === 'C') index++;
+  }
+  return entries;
+}
+
+// Puts the given paths back to how HEAD has them: new files are removed, changed or deleted files restored.
+export async function revertPaths(cwd, entries) {
+  for (const [name, code] of entries) {
+    const target = path.join(cwd, ...name.split('/'));
+    if (code === '??') { await rm(target, { force: true }).catch(() => {}); continue; }
+    await git(cwd, 'checkout', 'HEAD', '--', name).catch(() => rm(target, { force: true }).catch(() => {}));
+  }
+}
+
 export async function snapshot(cwd, include = []) {
   const entries = (await git(cwd, 'ls-files', '--stage', '-z')).split('\0').filter(Boolean);
   const files = [];
@@ -38,7 +63,7 @@ export async function snapshot(cwd, include = []) {
     return /^100[67]/.test(entry) && validFile(name) ? [name] : [];
   });
   const wanted = new Set(include.map(name => String(name).replaceAll('\\', '/').replace(/^\.\//, '').toLowerCase()));
-  const priority = name => wanted.has(name.toLowerCase()) ? 0 : /(^|\/)(README\.md|package\.json|AGENTS\.md)$/i.test(name) ? 1 : 2;
+  const priority = name => wanted.has(name.toLowerCase()) ? 0 : /(^|\/)(README\.md|package\.json|AGENTS\.md|CLAUDE\.md)$/i.test(name) ? 1 : 2;
   list.sort((a, b) => priority(a) - priority(b));
   let includeBudget = 1_200_000;
   let budget = 125_000;

@@ -60,6 +60,18 @@ const tools = [
     run: async ({ job_id: id, diff_chars: chars = 20000 }) => relay('/jobs/' + encodeURIComponent(id) + '/summary?diffChars=' + chars)
   },
   {
+    name: 'relay_approve',
+    description: 'Answer a Relay job that is waiting for approval (status "waiting_approval"; relay_job_status shows the plan or budget question). ' +
+      'decision: "approve", "revise" (plan only; note says what to change) or "reject" (stops the job). ' +
+      'Only call after the user decided in this conversation; never approve on your own judgment.',
+    inputSchema: { type: 'object', properties: { job_id: { type: 'string' }, decision: { type: 'string', enum: ['approve', 'revise', 'reject'] }, note: { type: 'string', maxLength: 4000 } },
+      required: ['job_id', 'decision'], additionalProperties: false },
+    run: async ({ job_id: id, decision, note }) => {
+      await relay('/jobs/' + encodeURIComponent(id) + '/approve', 'POST', { decision, note });
+      return { ok: true, decision, next: 'Use relay_job_status to follow the job.' };
+    }
+  },
+  {
     name: 'relay_cancel_job',
     description: 'Stop a queued or running Relay job. Only call when the user asks to stop it.',
     inputSchema: { type: 'object', properties: { job_id: { type: 'string' } }, required: ['job_id'], additionalProperties: false },

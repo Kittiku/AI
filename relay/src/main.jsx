@@ -18,12 +18,14 @@ const pages = [
 ];
 const statusLabels = {
   queued: 'รอเริ่ม', running: 'กำลังดำเนินการ', stopping: 'กำลังหยุด', complete: 'พร้อมตรวจผล',
-  needs_review: 'ต้องตรวจเพิ่ม', failed: 'งานติดขัด', cancelled: 'หยุดแล้ว', interrupted: 'ถูกขัดจังหวะ'
+  needs_review: 'ต้องตรวจเพิ่ม', failed: 'งานติดขัด', cancelled: 'หยุดแล้ว', interrupted: 'ถูกขัดจังหวะ', waiting_approval: 'รออนุมัติ'
 };
+const jobTypes = { feature: 'ฟีเจอร์ใหม่ (Backend + UX/UI)', bugfix: 'แก้ bug (AI ตัวเดียว)', refactor: 'ปรับโครงสร้างโค้ด (AI ตัวเดียว)', docs: 'เอกสาร (AI ตัวเดียว)', other: 'อื่นๆ (Backend + UX/UI)' };
+const stageName = (job, key) => job.single && key === 'backend' ? 'ลงมือทำ' : stageNames[key];
 const roleNames = { plan: 'วางแผน', backend: 'Backend', frontend: 'UX/UI', review: 'รีวิว' };
 const stageNames = { plan: 'วางแผน', backend: 'Backend', frontend: 'UX/UI', checks: 'ทดสอบ', review: 'รีวิว' };
 const stageStatus = { pending: 'รอ', running: 'กำลังทำ', done: 'เสร็จ', warning: 'ตรวจเพิ่ม', failed: 'ล้มเหลว', cancelled: 'หยุด', waiting: 'รอโควตา', retrying: 'กำลังลองใหม่' };
-const busyStatuses = new Set(['queued', 'running', 'stopping']);
+const busyStatuses = new Set(['queued', 'running', 'stopping', 'waiting_approval']);
 const doneStatuses = new Set(['complete', 'needs_review']);
 const stuckStatuses = new Set(['failed', 'cancelled', 'interrupted']);
 const clock = new Intl.DateTimeFormat('th-TH', { timeZone: 'Asia/Bangkok', hour: '2-digit', minute: '2-digit' });
@@ -128,7 +130,7 @@ function Stepper({ job, compact }) {
     {stages.map(stage => <li key={stage.key} className={'stage ' + stage.status}>
       <span className="stage-dot" aria-hidden="true">{stage.status === 'done' ? <Check size={14} /> : stage.status === 'failed' ? <X size={14} /> : null}</span>
       <div>
-        <strong>{stageNames[stage.key]}</strong>
+        <strong>{stageName(job, stage.key)}</strong>
         <small>{stage.status === 'skipped' ? stage.skippedText || 'ไม่ได้ทำ' : stageStatus[stage.status] || stage.status}
           {stage.status === 'waiting' && stage.waitUntil ? ' ถึง ' + time(stage.waitUntil) : ''}
           {stage.provider && stage.status !== 'waiting' ? ' · ' + providerName(stage.provider) : ''}
@@ -176,7 +178,7 @@ function jobProviders(job) {
 
 function Queue({ jobs, filter, setFilter, select, create, hasProjects, addProject }) {
   const filters = [['all', 'ทั้งหมด'], ['running', 'กำลังทำ'], ['queued', 'รอเริ่ม'], ['done', 'เสร็จแล้ว'], ['stuck', 'ติดขัด']];
-  const match = job => filter === 'all' || (filter === 'running' && (job.status === 'running' || job.status === 'stopping')) ||
+  const match = job => filter === 'all' || (filter === 'running' && ['running', 'stopping', 'waiting_approval'].includes(job.status)) ||
     job.status === filter || (filter === 'done' && doneStatuses.has(job.status)) || (filter === 'stuck' && stuckStatuses.has(job.status));
   const items = [...jobs].reverse().filter(match);
   return <section className="card queue">
@@ -226,7 +228,8 @@ function NewJob({ close, created, previous, jobs, projects, settings, quotas }) 
   const initial = useMemo(() => {
     const draft = previous?.title ? null : readStorage(draftKey);
     const source = previous?.title ? previous : { ...draft, ...(previous?.repo ? { repo: previous.repo } : {}) };
-    return { title: source.title || '', repo: source.repo || '', prompt: source.prompt || '', runChecks: Boolean(source.runChecks) };
+    return { title: source.title || '', repo: source.repo || '', prompt: source.prompt || '', runChecks: Boolean(source.runChecks),
+      type: source.type || 'feature', approvePlan: Boolean(source.approvalGates?.includes('after_plan') ?? source.approvePlan) };
   }, [previous]);
   const [form, setForm] = useState(initial);
   const [override, setOverride] = useState(Boolean(previous?.settings) && JSON.stringify(previous.settings.routes) !== JSON.stringify(settings.routes));
@@ -269,7 +272,8 @@ function NewJob({ close, created, previous, jobs, projects, settings, quotas }) 
     try {
       if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission().catch(() => {});
       const job = mode === 'card' ? await api('/cards', 'POST', { card: { ...card, source: card.source || { kind: 'paste' } } }) :
-        await api('/jobs', 'POST', { ...form, routes: override ? routes : undefined, fromJob: previous?.id });
+        await api('/jobs', 'POST', { title: form.title, repo: form.repo, prompt: form.prompt, runChecks: form.runChecks, type: form.type,
+          approvals: form.approvePlan ? ['after_plan'] : [], routes: override ? routes : undefined, fromJob: previous?.id });
       if (!previous?.title) writeStorage(draftKey, null);
       created(job);
     } catch (error) { setError(error.message); setPending(false); }
@@ -311,6 +315,10 @@ function NewJob({ close, created, previous, jobs, projects, settings, quotas }) 
       {canReusePlan ? <p className="repo-info">{resumable ?
         'ทำต่อจากจุดที่ค้างได้ ถ้า repo ยังอยู่ที่ commit เดิม Relay จะใช้แผนและผล Backend / UX/UI เดิม แล้วไปขั้นทดสอบและรีวิวต่อ' :
         'ใช้แผนจากงานเดิมได้ ถ้า repo ยังอยู่ที่ commit เดิม Relay จะข้ามขั้นวางแผนเพื่อประหยัดโควตา'}</p> : null}
+      <label>ประเภทงาน<select value={form.type} onChange={event => set('type', event.target.value)}>
+        {Object.entries(jobTypes).map(([id, label]) => <option key={id} value={id}>{label}</option>)}
+      </select></label>
+      <label className="checkbox"><input type="checkbox" checked={form.approvePlan} onChange={event => set('approvePlan', event.target.checked)} />หยุดให้ฉันตรวจและอนุมัติแผนก่อนลงมือแก้โค้ด</label>
       <label className="checkbox"><input type="checkbox" name="runChecks" checked={form.runChecks} onChange={event => set('runChecks', event.target.checked)} />
         {chosenProject?.checks?.length ? 'รันคำสั่งทดสอบของโปรเจกต์ (' + chosenProject.checks.length + ' คำสั่ง) และให้ AI แก้จนผ่าน' : 'รัน npm test และ build ที่มีใน repo นี้ และให้ AI แก้จนผ่าน'}</label>
       <small>เลือกสำหรับ repo ที่คุณไว้วางใจ แอปอาจติดตั้ง dependencies จาก lockfile และรันโค้ดที่เพิ่งแก้บนเครื่อง</small>
@@ -332,6 +340,7 @@ function SettingsForm({ initial, changed, quotas, onDirty }) {
   const dirty = JSON.stringify(draft) !== JSON.stringify(initial);
   const duplicate = hasDuplicate(draft.routes);
   const setAuto = (key, value) => setDraft(current => ({ ...current, auto: { ...current.auto, [key]: value } }));
+  const setBudget = (key, value) => setDraft(current => ({ ...current, budget: { ...current.budget, [key]: value } }));
   useEffect(() => { onDirty(dirty); }, [dirty, onDirty]);
   useEffect(() => () => onDirty(false), [onDirty]);
   async function submit(event) {
@@ -355,6 +364,16 @@ function SettingsForm({ initial, changed, quotas, onDirty }) {
       <label>เพดาน Gemini ต่อวัน (0 = ยังไม่ระบุ)<input type="number" required min="0" max="1000000" value={draft.geminiDailyLimit} onChange={event => setDraft({ ...draft, geminiDailyLimit: Number(event.target.value) })} /></label>
       <label>จำนวนรอบแก้สูงสุด<input type="number" required min="0" max="6" value={draft.maxRounds} onChange={event => setDraft({ ...draft, maxRounds: Number(event.target.value) })} /></label>
     </div>
+    <h2 className="section-gap">การแก้โค้ดและการอนุมัติ</h2>
+    <label className="checkbox"><input type="checkbox" checked={draft.agentEdits !== false} onChange={event => setDraft({ ...draft, agentEdits: event.target.checked })} />ให้ Claude Code และ Codex แก้ไฟล์เองใน worktree ของงาน (เห็นทั้ง repo แก้ไฟล์ใหญ่ได้ตรงจุด) Gemini ยังส่งผลเป็น JSON</label>
+    <label className="checkbox"><input type="checkbox" checked={draft.approvals?.afterPlan} onChange={event => setDraft({ ...draft, approvals: { ...draft.approvals, afterPlan: event.target.checked } })} />ทุกงาน: หยุดให้ฉันอนุมัติแผนก่อนลงมือแก้โค้ด</label>
+    <h2 className="section-gap">งบ</h2>
+    <p className="muted">เมื่อถึงงบ Relay จะหยุดงานและรอคุณอนุมัติก่อนเรียก AI ต่อ ใส่ 0 ถ้าไม่จำกัด Task Card ตั้งงบเฉพาะงานได้ด้วย routing.budget_usd</p>
+    <div className="settings-grid">
+      <label>งบต่องาน (USD)<input type="number" required min="0" max="10000" step="0.01" value={draft.budget?.perJobUsd ?? 0} onChange={event => setBudget('perJobUsd', Number(event.target.value))} /></label>
+      <label>งบต่อวัน (USD)<input type="number" required min="0" max="10000" step="0.01" value={draft.budget?.dailyUsd ?? 0} onChange={event => setBudget('dailyUsd', Number(event.target.value))} /></label>
+    </div>
+    <label className="checkbox"><input type="checkbox" checked={draft.budget?.countSubscription !== false} onChange={event => setBudget('countSubscription', event.target.checked)} />นับมูลค่าเทียบ API ของงานที่ใช้ subscription ด้วย (ถ้าไม่ติ๊ก นับเฉพาะเงินที่จ่ายจริงผ่าน API)</label>
     <h2 className="section-gap">โหมดอัตโนมัติ</h2>
     <p className="muted">สั่งครั้งเดียวแล้วให้ Relay จัดการจนจบ: ลอง AI ตัวอื่นเมื่อทำไม่ได้ รอโควตาแทนการหยุด ลองขั้นที่ล้มใหม่ และส่ง error จากการทดสอบให้ AI แก้จนผ่านหรือครบจำนวนรอบ ผลงานยังอยู่บน branch ให้คุณตรวจก่อน merge เสมอ</p>
     <label className="checkbox"><input type="checkbox" checked={draft.auto.allProviders} onChange={event => setAuto('allProviders', event.target.checked)} />ถ้าตัวหลักและตัวสำรองทำไม่ได้ ให้ลอง AI ตัวอื่นที่เชื่อมต่ออยู่</label>
@@ -557,6 +576,39 @@ function UsageView({ job }) {
   </div>;
 }
 
+// Shown while a job waits: the plan to approve, revise or reject, or a budget question.
+function ApprovalPanel({ job }) {
+  const [note, setNote] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const plan = job.approval.kind === 'plan' ? job.plan : null;
+  async function decide(decision) {
+    if (decision === 'revise' && !note.trim()) { setError('บอกด้วยว่าต้องการให้แก้แผนตรงไหน'); return; }
+    if (decision === 'reject' && !confirm('หยุดงานนี้?')) return;
+    setBusy(true); setError('');
+    try { await api('/jobs/' + job.id + '/approve', 'POST', { decision, note }); setNote(''); }
+    catch (error) { setError(error.message); }
+    finally { setBusy(false); }
+  }
+  return <section className="card approval-panel" role="region" aria-label="รออนุมัติ">
+    <h2>{plan ? 'ตรวจแผนก่อนลงมือ' : 'ถึงงบที่ตั้งไว้'}</h2>
+    <p>{job.approval.message}</p>
+    {plan ? <div className="plan-view">
+      <div><h3>{job.single ? 'สิ่งที่จะทำ' : 'Backend'}</h3><p className="preline">{plan.backend}</p>{plan.backendFiles?.length ? <small>ไฟล์: {plan.backendFiles.join(', ')}</small> : null}</div>
+      {job.single ? null : <div><h3>UX/UI</h3><p className="preline">{plan.frontend}</p>{plan.frontendFiles?.length ? <small>ไฟล์: {plan.frontendFiles.join(', ')}</small> : null}</div>}
+      <div><h3>ข้อตกลงระหว่างส่วน</h3><p className="preline">{plan.contract}</p></div>
+      <div><h3>เกณฑ์รับงาน</h3><p className="preline">{plan.acceptance}</p></div>
+    </div> : null}
+    {plan ? <label>หมายเหตุ (ต้องใส่ถ้าขอแก้แผน)<textarea rows={3} value={note} onChange={event => setNote(event.target.value)} placeholder="เช่น อย่าแตะไฟล์ CSS ของหน้า Records" /></label> : null}
+    {error ? <p role="alert" className="error">{error}</p> : null}
+    <div className="action-row">
+      <Button primary icon={Check} disabled={busy} onClick={() => decide('approve')}>{plan ? 'อนุมัติแผน' : 'อนุมัติให้ทำต่อ'}</Button>
+      {plan ? <Button icon={RotateCcw} disabled={busy} onClick={() => decide('revise')}>ขอแก้แผน</Button> : null}
+      <Button danger icon={X} disabled={busy} onClick={() => decide('reject')}>{plan ? 'ไม่อนุมัติ หยุดงาน' : 'หยุดงาน'}</Button>
+    </div>
+  </section>;
+}
+
 function JobDetail({ job, back, retry, updated, removed }) {
   const [tab, setTab] = useState('events');
   const [diff, setDiff] = useState(null);
@@ -583,6 +635,7 @@ function JobDetail({ job, back, retry, updated, removed }) {
     <div className="heading detail-heading"><div><h1>{job.title}</h1>
       <p>{job.repo} · สร้าง {dateTime(job.createdAt)}{job.startedAt ? ' · ใช้เวลา ' + jobDuration(job) : ''}{job.resumedFrom ? ' · ใช้แผนจากงานเดิม' : ''}</p></div>
       <span className={'status ' + job.status}>{statusLabels[job.status]}</span></div>
+    {job.status === 'waiting_approval' && job.approval ? <ApprovalPanel job={job} /> : null}
     <section className="card progress-card"><Stepper job={job} /></section>
     <div className="detail-grid">
       <section className="card detail">
@@ -597,6 +650,8 @@ function JobDetail({ job, back, retry, updated, removed }) {
       <aside className="card detail facts">
         {!busy ? <JobActions job={job} updated={updated} removed={removed} setError={setError} /> : null}
         <h2>รายละเอียดงาน</h2>
+        <p className="muted">ประเภท: {jobTypes[job.type || 'feature']}</p>
+        {job.scope ? <p className="muted">Scope: {job.scope.include?.length ? 'แก้ได้เฉพาะ ' + job.scope.include.join(', ') : ''}{job.scope.exclude?.length ? ' · ห้ามแก้ ' + job.scope.exclude.join(', ') : ''}</p> : null}
         {job.card ? <p className="source-badge">มาจาก Task Card · {sourceNames[job.source] || job.source}{job.budgetUsd != null ? ' · งบ $' + job.budgetUsd : ''}</p> : null}
         {job.card?.acceptance?.some(item => item.check === 'manual') ? <><h3>ต้องตรวจเองหลังส่งมอบ</h3>
           <ul>{job.card.acceptance.filter(item => item.check === 'manual').map(item => <li key={item.text}>{item.text}</li>)}</ul></> : null}
@@ -616,6 +671,28 @@ function JobDetail({ job, back, retry, updated, removed }) {
       </aside>
     </div>
   </>;
+}
+
+// Notes the AIs read on every job in this project: how to run it, conventions, things to avoid.
+function NotesEditor({ project, updated }) {
+  const [editing, setEditing] = useState(false);
+  const [text, setText] = useState('');
+  const [error, setError] = useState('');
+  async function save() {
+    setError('');
+    try { updated(await api('/projects/' + project.id, 'PUT', { notes: text })); setEditing(false); }
+    catch (error) { setError(error.message); }
+  }
+  if (!editing) return <div className="checks-list">
+    <strong>บันทึกของโปรเจกต์</strong>{project.notes ? <p className="preline notes-text">{project.notes}</p> : <span> · ยังไม่มี</span>}
+    <div><button type="button" className="link" onClick={() => { setText(project.notes || ''); setEditing(true); }}>{project.notes ? 'แก้บันทึก' : 'เขียนบันทึกให้ AI'}</button></div>
+  </div>;
+  return <div className="checks-editor">
+    <label>บันทึกที่ AI อ่านทุกงานในโปรเจกต์นี้ เช่น วิธีรัน ข้อตกลงในโค้ด สิ่งที่ห้ามทำ
+      <textarea rows={5} maxLength={4000} value={text} placeholder={'แอป Flask รันด้วย run_web_app.bat พอร์ต 6001\nข้อมูลรูปอยู่ใน Report Images (ห้ามแก้)\nใช้ธีมพาสเทล รองรับธีมมืด'} onChange={event => setText(event.target.value)} /></label>
+    {error ? <p role="alert" className="error">{error}</p> : null}
+    <div className="action-row"><Button primary onClick={save}>บันทึก</Button><Button onClick={() => setEditing(false)}>ยกเลิก</Button></div>
+  </div>;
 }
 
 function ChecksEditor({ project, updated }) {
@@ -666,6 +743,10 @@ function ProjectCard({ project, info, jobs, createJob, removed, select, updated 
       งานทั้งหมด {projectJobs.length} · ล่าสุด <button type="button" className="link" onClick={() => select(latest.id)}>{latest.title}</button>
       <span className={'status ' + latest.status}>{statusLabels[latest.status]}</span></> : 'ยังไม่มีงานในโปรเจกต์นี้'}</p>
     <ChecksEditor project={project} updated={updated} />
+    <NotesEditor project={project} updated={updated} />
+    {project.memory?.length ? <details className="memory"><summary>งานล่าสุดที่ AI จำได้ ({project.memory.length})</summary>
+      <ul>{project.memory.slice(0, 5).map(item => <li key={item.jobId}><strong>{item.title}</strong> · {statusLabels[item.status]} · {dateTime(item.at)}
+        {item.summary ? <small>{item.summary}</small> : null}</li>)}</ul></details> : null}
     {error ? <p role="alert" className="error">{error}</p> : null}
     <div className="action-row">
       <Button primary icon={Plus} onClick={() => createJob(project.path)} disabled={info && !info.ok}>สร้างงาน</Button>
@@ -775,7 +856,8 @@ function useJobAlerts(jobs) {
     if (previous.current) {
       for (const job of jobs) {
         const before = previous.current[job.id];
-        if (before && busyStatuses.has(before) && !busyStatuses.has(job.status)) {
+        const asks = job.status === 'waiting_approval' && before !== 'waiting_approval';
+        if (before && ((busyStatuses.has(before) && !busyStatuses.has(job.status)) || asks)) {
           if (document.hidden) setUnseen(count => count + 1);
           if ('Notification' in window && Notification.permission === 'granted' && document.hidden) {
             try { new Notification('Relay · ' + statusLabels[job.status], { body: job.title, icon: '/relay.svg' }); } catch {}
@@ -792,9 +874,10 @@ function useJobAlerts(jobs) {
     return () => { document.removeEventListener('visibilitychange', seen); window.removeEventListener('focus', seen); };
   }, []);
   const running = jobs?.filter(job => job.status === 'running' || job.status === 'stopping').length || 0;
+  const waiting = jobs?.filter(job => job.status === 'waiting_approval').length || 0;
   useEffect(() => {
-    document.title = (unseen ? '(✓ ' + unseen + ') ' : running ? '(⏳) ' : '') + 'Relay';
-  }, [unseen, running]);
+    document.title = (waiting ? '(❗ ' + waiting + ') ' : unseen ? '(✓ ' + unseen + ') ' : running ? '(⏳) ' : '') + 'Relay';
+  }, [unseen, running, waiting]);
 }
 
 function App() {
@@ -849,7 +932,8 @@ function App() {
   const addProject = project => setData(previous => ({ ...previous, projects: [...previous.projects.filter(item => item.id !== project.id), project] }));
   const removeProject = id => setData(previous => ({ ...previous, projects: previous.projects.filter(item => item.id !== id) }));
   const job = jobs.find(item => item.id === selection);
-  const runningCount = jobs.filter(item => item.status === 'running' || item.status === 'stopping').length;
+  const runningCount = jobs.filter(item => ['running', 'stopping', 'waiting_approval'].includes(item.status)).length;
+  const waitingCount = jobs.filter(item => item.status === 'waiting_approval').length;
   const queuedCount = jobs.filter(item => item.status === 'queued').length;
   const reserve = data?.settings.reserve ?? {};
   const cards = detailed => <div className="providers">{Object.keys(providers).map(id => <ProviderCard id={id} key={id} info={data?.quotas[id]} detailed={detailed} reserve={reserve[id] ?? 0} />)}</div>;
@@ -862,7 +946,7 @@ function App() {
     <div className="workspace">
       <header className="topbar"><div className="topbar-status" role="status">
         {runningCount ? <span className="pulse" aria-hidden="true" /> : null}
-        {runningCount ? 'กำลังทำ ' + runningCount + ' งาน' : 'ไม่มีงานที่กำลังทำ'}{queuedCount ? ' · รอ ' + queuedCount : ''}</div>
+        {runningCount ? 'กำลังทำ ' + runningCount + ' งาน' : 'ไม่มีงานที่กำลังทำ'}{waitingCount ? ' · รออนุมัติ ' + waitingCount : ''}{queuedCount ? ' · รอ ' + queuedCount : ''}</div>
         <div className="actions"><Button icon={RefreshCw} onClick={refresh} disabled={refreshing}>{refreshing ? 'กำลังรีเฟรช' : 'รีเฟรชโควตา'}</Button><Button primary icon={Plus} onClick={() => setDialog({})} disabled={!data}>สร้างงาน</Button></div>
       </header>
       <main>

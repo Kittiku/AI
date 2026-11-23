@@ -136,7 +136,7 @@ async function withCodex(cwd, signal, task) {
 }
 
 let lastCodexModel;
-async function codexTurn(cwd, prompt, schema, signal) {
+async function codexTurn(cwd, prompt, schema, signal, write = false) {
   return withCodex(cwd, signal, async rpc => {
     const { data: models } = await rpc.request('model/list', { includeHidden: false, limit: 50 });
     const modelIds = models.map(model => model.model ?? model.id);
@@ -147,7 +147,7 @@ async function codexTurn(cwd, prompt, schema, signal) {
     for (const model of candidates) {
       signal.throwIfAborted();
       try {
-        const output = await runCodexModel(rpc, cwd, model, prompt, schema);
+        const output = await runCodexModel(rpc, cwd, model, prompt, schema, write);
         lastCodexModel = model;
         return output;
       } catch (error) {
@@ -158,9 +158,10 @@ async function codexTurn(cwd, prompt, schema, signal) {
   });
 }
 
-async function runCodexModel(rpc, cwd, model, prompt, schema) {
+// write: Codex may change files inside cwd (its workspace-write sandbox); otherwise it can only read.
+async function runCodexModel(rpc, cwd, model, prompt, schema, write = false) {
   const { thread } = await rpc.request('thread/start', {
-    cwd, model, sandbox: 'read-only', approvalPolicy: 'never', ephemeral: true
+    cwd, model, sandbox: write ? 'workspace-write' : 'read-only', approvalPolicy: 'never', ephemeral: true
   });
   let output = '';
   const completion = new Promise((resolve, reject) => {
@@ -192,10 +193,13 @@ function runClaudeCode(args, { cwd, input = '', signal }) {
   });
 }
 
-async function claudeCodeTurn(cwd, prompt, schema, signal) {
-  const args = ['-p', 'Complete the Relay request provided on stdin. Use the files in the current directory only as read-only reference.',
+// write: Claude Code may also use Edit and Write on files in cwd; it still has no shell.
+async function claudeCodeTurn(cwd, prompt, schema, signal, write = false) {
+  const tools = write ? claudeCodeTools + ',Edit,Write' : claudeCodeTools;
+  const args = ['-p', write ? 'Complete the Relay request provided on stdin. Edit files only inside the current directory.' :
+    'Complete the Relay request provided on stdin. Use the files in the current directory only as read-only reference.',
     '--output-format', 'json', '--json-schema', JSON.stringify(schema),
-    '--tools', claudeCodeTools, '--allowedTools', claudeCodeTools,
+    '--tools', tools, '--allowedTools', tools, ...(write ? ['--permission-mode', 'acceptEdits'] : []),
     '--max-turns', String(Number(process.env.RELAY_CLAUDE_CODE_MAX_TURNS) || 40), '--no-session-persistence'];
   if (process.env.RELAY_CLAUDE_CODE_MODEL) args.push('--model', process.env.RELAY_CLAUDE_CODE_MODEL);
   const { code, stdout, stderr } = await runClaudeCode(args, { cwd, input: prompt, signal });
@@ -496,7 +500,7 @@ export function quota(settings, usage, now = Date.now()) {
   };
 }
 
-export async function generate(provider, cwd, prompt, schema, jobSignal, onUsage) {
+export async function generate(provider, cwd, prompt, schema, jobSignal, onUsage, { write = false } = {}) {
   if (provider === 'gemini' && !geminiCli.updatedAt) await refreshGemini(cwd);
   const useCli = provider === 'gemini' && shouldUseCli();
   // Agents that read the repo themselves (Claude Code, Codex, Gemini CLI) get 15 minutes; one-shot API calls get 4.
@@ -505,7 +509,7 @@ export async function generate(provider, cwd, prompt, schema, jobSignal, onUsage
   let output;
   let usage = null;
   if (provider === 'claudecode') {
-    const result = await claudeCodeTurn(cwd, prompt, schema, signal);
+    const result = await claudeCodeTurn(cwd, prompt, schema, signal, write);
     if (!validate(result, schema)) throw Error(names[provider] + ' ส่งข้อมูลไม่ตรงกับรูปแบบที่กำหนด');
     return result;
   }
@@ -515,7 +519,7 @@ export async function generate(provider, cwd, prompt, schema, jobSignal, onUsage
     return result;
   }
   if (provider === 'codex') {
-    output = await codexTurn(cwd, prompt, schema, signal);
+    output = await codexTurn(cwd, prompt, schema, signal, write);
   } else {
     const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(geminiApiModel)}:generateContent`, {
       method: 'POST', signal,

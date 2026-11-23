@@ -163,6 +163,22 @@ input[type="checkbox"] { accent-color: var(--accent); }
 .facts .button { margin-top: 14px; }
 .facts small { color: var(--muted); display: block; overflow-wrap: anywhere; margin-top: 3px; }
 .preline { white-space: pre-wrap; }
+.approval-panel { padding: 16px 18px; margin-bottom: 17px; border-color: #e7c27a; background: #fffaf0; }
+.approval-panel h2 { font-size: 22px; letter-spacing: -.02em; }
+.approval-panel > p { margin-top: 6px; color: #5c4618; }
+.approval-panel label { margin-top: 12px; }
+.plan-view { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; margin-top: 12px; }
+.plan-view > div { background: #fff; border: 1px solid #efe1c2; border-radius: 9px; padding: 10px 12px; min-width: 0; }
+.plan-view h3 { font-size: 15px; margin-bottom: 4px; }
+.plan-view p { font-size: 14px; color: #30364a; line-height: 1.5; overflow-wrap: anywhere; }
+.plan-view small { display: block; margin-top: 6px; color: var(--muted); font-size: 12.5px; overflow-wrap: anywhere; }
+.notes-text { margin-top: 4px; color: var(--ink); font-size: 13px; max-height: 8.5em; overflow: auto; }
+.memory { margin-top: 10px; font-size: 13px; }
+.memory ul { padding-left: 18px; margin-top: 6px; }
+.memory li { color: var(--muted); margin-top: 4px; }
+.memory li strong { color: var(--ink); }
+.memory li small { display: block; overflow-wrap: anywhere; }
+.status.waiting_approval { background: #fff1d6; color: #7a4a00; }
 .merge-panel { margin: 10px 0 12px; }
 .merge-panel.open { padding: 12px 14px; border: 1px solid #c9d8ef; background: #f4f8fe; border-radius: 10px; }
 .merge-panel.blocked { border-color: #f0c4c4; background: #fff6f6; }

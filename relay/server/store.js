@@ -106,9 +106,16 @@ export function openStore(dataDir) {
     db.prepare("UPDATE steps SET status = 'interrupted', ended_at = ? WHERE status = 'running'").run(Date.now());
   }
 
+  // Spend since a time, for the daily budget. Subscription rows count only when asked to.
+  function spendSince(since, includeSubscription) {
+    const row = db.prepare("SELECT COALESCE(SUM(cost_usd), 0) AS total FROM steps WHERE started_at >= ? AND (billing = 'api' OR ?)")
+      .get(since, includeSubscription ? 1 : 0);
+    return row.total;
+  }
+
   function steps(jobId) {
     return db.prepare('SELECT * FROM steps WHERE job_id = ? ORDER BY id').all(jobId);
   }
 
-  return { load, persist, startStep, finishStep, closeOpenSteps, steps };
+  return { load, persist, startStep, finishStep, closeOpenSteps, steps, spendSince };
 }

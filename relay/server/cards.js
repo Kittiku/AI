@@ -40,6 +40,10 @@ export const taskCardSchema = {
         budget_usd: { type: 'number', minimum: 0, description: 'Recorded with the job; not enforced yet.' }
       }
     },
+    approvals: {
+      type: 'array', maxItems: 3, items: { type: 'string', enum: ['after_plan'] },
+      description: 'after_plan: Relay stops after planning and waits for the user to approve, revise or reject the plan.'
+    },
     source: {
       type: 'object', additionalProperties: false,
       properties: { kind: { type: 'string', maxLength: 40 }, note: { type: 'string', maxLength: 500 } }
@@ -118,5 +122,35 @@ export function cardToJob(card, settings) {
       routes[role] = [provider, primary !== provider ? primary : fallback === provider ? '' : fallback];
     }
   }
-  return { title: card.title.trim(), prompt, commands, routes, budgetUsd: card.routing?.budget_usd ?? null };
+  const scope = include.length || exclude.length ? { include, exclude } : null;
+  return { title: card.title.trim(), prompt, commands, routes, budgetUsd: card.routing?.budget_usd ?? null,
+    type: card.type || 'feature', scope, approvals: card.approvals || [] };
+}
+
+// Scope check for changed paths. A pattern without wildcards matches that file or everything under that folder;
+// "*" stays inside one folder, "**" crosses folders. Matching ignores case, like Windows paths.
+function matcher(pattern) {
+  let glob = pattern.replaceAll('\\', '/').replace(/^\.\//, '').trim();
+  if (glob.endsWith('/')) glob += '**';
+  if (!/[*?]/.test(glob)) { const lower = glob.toLowerCase(); return name => name === lower || name.startsWith(lower + '/'); }
+  let source = '';
+  for (let index = 0; index < glob.length; index++) {
+    const char = glob[index];
+    if (char === '*' && glob[index + 1] === '*') { source += '.*'; index++; if (glob[index + 1] === '/') index++; }
+    else if (char === '*') source += '[^/]*';
+    else if (char === '?') source += '[^/]';
+    else source += char.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+  }
+  const regex = new RegExp('^' + source + '$', 'i');
+  return name => regex.test(name);
+}
+
+export function outOfScope(scope, paths) {
+  if (!scope) return [];
+  const include = (scope.include || []).map(matcher);
+  const exclude = (scope.exclude || []).map(matcher);
+  return paths.filter(name => {
+    const lower = name.replaceAll('\\', '/').toLowerCase();
+    return exclude.some(test => test(lower)) || (include.length > 0 && !include.some(test => test(lower)));
+  });
 }
