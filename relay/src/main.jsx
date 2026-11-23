@@ -165,7 +165,8 @@ const monitorActions = {
   prepare_worktree: 'เตรียม worktree', plan: 'จัดทำแผน', implement: 'ลงมือแก้ไฟล์',
   integrate: 'รวมผลจากแต่ละส่วน', run_check: 'รันคำสั่งทดสอบ', review: 'ตรวจผลการแก้ไข',
   fix_review: 'แก้ตามรีวิว', apply_result: 'นำผลไปใช้', wait_quota: 'รอโควตา AI',
-  wait_approval: 'รอการอนุมัติ', retry: 'ลองใหม่', finish: 'ส่งมอบงาน'
+  wait_approval: 'รอการอนุมัติ', retry: 'ลองใหม่', finish: 'ส่งมอบงาน',
+  subtask: 'ทำงานย่อย', fix_subtask: 'แก้งานย่อยตามที่หัวหน้าตรวจ', check_subtask: 'หัวหน้าตรวจงานย่อย'
 };
 const monitorActivities = {
   started: 'เริ่มทำงาน', provider_fallback: 'เปลี่ยนไปใช้ AI สำรอง', quota_wait: 'รอโควตา AI',
@@ -803,6 +804,18 @@ function SettingsForm({ initial, changed, quotas, onDirty }) {
     <h2>การแก้โค้ดและการอนุมัติ</h2>
     <label className="checkbox"><input type="checkbox" checked={draft.agentEdits !== false} onChange={event => setDraft({ ...draft, agentEdits: event.target.checked })} />ให้ Claude Code และ Codex แก้ไฟล์เองใน worktree ของงาน (เห็นทั้ง repo แก้ไฟล์ใหญ่ได้ตรงจุด) Gemini ยังส่งผลเป็น JSON</label>
     <label className="checkbox"><input type="checkbox" checked={draft.approvals?.afterPlan} onChange={event => setDraft({ ...draft, approvals: { ...draft.approvals, afterPlan: event.target.checked } })} />ทุกงาน: หยุดให้ฉันอนุมัติแผนก่อนลงมือแก้โค้ด</label>
+    <h2 className="section-gap">ทำงานเป็นทีม</h2>
+    <p className="muted">คนวางแผนประเมินความยากของงาน งานง่ายทำรวดเดียวแบบเดิม งานกลางและยากจะแบ่งงานของแต่ละฝั่งเป็นงานย่อย ทำทีละชิ้น และหัวหน้า (AI อีกตัว) ตรวจแต่ละชิ้นก่อนไปชิ้นต่อไป ถ้าไม่ผ่านส่งกลับให้แก้ 1 รอบ ใช้ AI มากขึ้นตามจำนวนงานย่อย</p>
+    <div className="settings-grid">
+      <label>แบ่งงานย่อย
+        <select value={draft.team?.mode ?? 'auto'} onChange={event => setDraft({ ...draft, team: { maxSubtasks: 4, ...draft.team, mode: event.target.value } })}>
+          <option value="auto">อัตโนมัติตามความยาก</option>
+          <option value="off">ปิด ทำทั้งฝั่งรวดเดียว</option>
+        </select>
+      </label>
+      <label>งานย่อยสูงสุดต่อฝั่ง<input type="number" required min="2" max="6" disabled={draft.team?.mode === 'off'} value={draft.team?.maxSubtasks ?? 4}
+        onChange={event => setDraft({ ...draft, team: { mode: 'auto', ...draft.team, maxSubtasks: Number(event.target.value) } })} /></label>
+    </div>
     </> : null}
     {show('budget') ? <>
     <h2>งบ</h2>
@@ -937,6 +950,46 @@ function MergePanel({ job, updated }) {
       <Button onClick={() => { setCheck(null); setError(''); }} disabled={busyState === 'merge'}>ยกเลิก</Button>
     </div>
   </div>;
+}
+
+const complexityNames = { simple: 'ง่าย ทำรวดเดียว', medium: 'กลาง แบ่งงานย่อย', hard: 'ยาก แบ่งงานย่อยมากขึ้น' };
+const subtaskStatus = {
+  pending: ['รอคิว', ''], running: ['กำลังทำ', 'running'], checking: ['หัวหน้ากำลังตรวจ', 'running'], fixing: ['แก้ตามที่หัวหน้าตรวจ', 'warn'],
+  passed: ['ผ่าน', 'ok'], warning: ['ยังมีปัญหา', 'warn'], skipped: ['ไม่มีงาน', '']
+};
+
+// Team view: each role's lead, its subtasks in order, who did each one and what the lead's check said.
+function TeamTree({ job }) {
+  const groups = Object.entries(job.team || {}).filter(([, items]) => items?.length);
+  if (!groups.length) return null;
+  return <section className="card team" aria-label="ทีมงาน">
+    <div className="card-head"><h2>ทีมงาน</h2>{job.plan?.complexity ? <span className="chip">{complexityNames[job.plan.complexity]}</span> : null}</div>
+    <div className={'team-groups' + (groups.length === 1 ? ' single' : '')}>
+      {groups.map(([role, items]) => {
+        const passed = items.filter(item => ['passed', 'skipped'].includes(item.status)).length;
+        return <div key={role} className="team-group">
+          <header><strong>{job.single ? 'ผู้ลงมือ' : role === 'frontend' ? 'UX/UI' : 'Backend'}</strong><small>หัวหน้าแบ่ง {items.length} งานย่อย · ผ่านแล้ว {passed}</small></header>
+          <ol className="subtasks">
+            {items.map(item => {
+              const [text, tone] = subtaskStatus[item.status] || [item.status, ''];
+              return <li key={item.id} className={'subtask ' + (tone || 'idle')}>
+                <span className="subtask-no">{item.id}</span>
+                <div className="subtask-body">
+                  <div className="subtask-line"><strong>{item.title}</strong><em className={'subtask-status ' + tone}>{text}</em></div>
+                  <div className="subtask-who">
+                    {item.provider && item.provider !== 'reused' ? <span><ProviderIcon id={item.provider} size={12} /> ทำโดย {providerName(item.provider)}</span> : null}
+                    {item.checker ? <span><ProviderIcon id={item.checker} size={12} /> ตรวจโดย {providerName(item.checker)}</span> : null}
+                    {item.fixes ? <span>แก้ {item.fixes} รอบ</span> : null}
+                  </div>
+                  {item.check ? <p className="subtask-check">{item.check}</p> : item.summary ? <p className="subtask-check">{item.summary}</p> : null}
+                </div>
+              </li>;
+            })}
+          </ol>
+        </div>;
+      })}
+    </div>
+  </section>;
 }
 
 // A ready-to-paste brief for a Claude Code session: where the work is, what is still wrong, and what done means.
@@ -1135,7 +1188,12 @@ function ApprovalPanel({ job, panelRef }) {
       {job.single ? null : <div><h3>UX/UI</h3><p className="preline">{plan.frontend}</p>{plan.frontendFiles?.length ? <small>ไฟล์: {plan.frontendFiles.join(', ')}</small> : null}</div>}
       <div><h3>ข้อตกลงระหว่างส่วน</h3><p className="preline">{plan.contract}</p></div>
       <div><h3>เกณฑ์รับงาน</h3><p className="preline">{plan.acceptance}</p></div>
+      {['backend', 'frontend'].map(role => plan[role + 'Tasks']?.length >= 2 ? <div key={role} className="plan-tasks">
+        <h3>งานย่อย {job.single ? '' : role === 'backend' ? 'Backend' : 'UX/UI'} ({plan[role + 'Tasks'].length})</h3>
+        <ol>{plan[role + 'Tasks'].map((task, index) => <li key={index}><strong>{task.title}</strong><p>{task.goal}</p>{task.files?.length ? <small>ไฟล์: {task.files.join(', ')}</small> : null}</li>)}</ol>
+      </div> : null)}
     </div> : null}
+    {plan?.complexity ? <p className="muted">ความยากที่ประเมิน: {complexityNames[plan.complexity] || plan.complexity}</p> : null}
     {plan ? <label>หมายเหตุ (ต้องใส่ถ้าขอแก้แผน)<textarea rows={3} value={note} onChange={event => setNote(event.target.value)} placeholder="เช่น อย่าแตะไฟล์ CSS ของหน้า Records" /></label> : null}
     {error ? <p role="alert" className="error">{error}</p> : null}
     <div className="action-row">
@@ -1250,6 +1308,7 @@ function JobDetail({ job, projectName, monitor, approvalRequested, onApproval, o
       </div>
     </LiveMonitor>
     {showApproval ? <ApprovalPanel key={job.approval.kind + ':' + job.approval.requestedAt} job={job} panelRef={approvalRef} /> : null}
+    <TeamTree job={job} />
     <div className="detail-grid">
       <section className="card detail">
         <div className="filters tabs"><button aria-pressed={tab === 'events'} onClick={() => { setTab('events'); setError(''); }}>ประวัติการทำงาน</button>

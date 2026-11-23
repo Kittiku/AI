@@ -379,6 +379,35 @@ details.fact summary::marker { color: var(--muted); }
 .plan-view p { font-size: 13px; color: var(--ink-2); line-height: 1.55; overflow-wrap: anywhere; }
 .plan-view small { display: block; margin-top: 6px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
 
+/* Team tree: each role's lead and its ordered subtasks */
+.team { padding: 16px 18px; margin-bottom: 16px; }
+.team-groups { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-top: 12px; }
+.team-groups.single { grid-template-columns: minmax(0, 1fr); }
+.team-group { min-width: 0; border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; background: var(--surface-2); }
+.team-group header { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 4px 10px; }
+.team-group header strong { font-size: 14px; }
+.team-group header small { color: var(--muted); font-size: 12px; }
+.subtasks { list-style: none; padding: 0; margin-top: 10px; display: grid; gap: 0; }
+.subtask { position: relative; display: flex; gap: 10px; padding: 0 0 12px; }
+.subtask:last-child { padding-bottom: 0; }
+.subtask:not(:last-child)::before { content: ""; position: absolute; left: 11px; top: 24px; bottom: 0; width: 2px; background: var(--line-strong); }
+.subtask-no { flex: 0 0 24px; height: 24px; border-radius: 50%; display: grid; place-items: center; font-size: 12px; font-weight: 700; background: #fff; border: 2px solid #c3c8d3; color: var(--ink-2); z-index: 1; }
+.subtask.ok .subtask-no { background: var(--ok); border-color: var(--ok); color: #fff; }
+.subtask.running .subtask-no { border-color: var(--brand); color: var(--brand-ink); box-shadow: 0 0 0 3px var(--brand-soft); }
+.subtask.warn .subtask-no { background: #f59e0b; border-color: #f59e0b; color: #fff; }
+.subtask-body { min-width: 0; flex: 1; padding-top: 2px; }
+.subtask-line { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.subtask-line strong { font-size: 13.5px; overflow-wrap: anywhere; }
+.subtask-status { flex: none; font-style: normal; font-size: 11.5px; font-weight: 650; color: var(--muted); }
+.subtask-status.ok { color: var(--ok); } .subtask-status.warn { color: var(--warn); } .subtask-status.running { color: var(--brand-ink); }
+.subtask-who { display: flex; flex-wrap: wrap; gap: 2px 12px; margin-top: 3px; font-size: 12px; color: var(--muted); }
+.subtask-who span { display: inline-flex; align-items: center; gap: 5px; }
+.subtask-who .provider-icon { width: 18px; height: 18px; border-radius: 5px; }
+.subtask-check { margin-top: 4px; font-size: 12.5px; color: var(--ink-2); line-height: 1.5; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.plan-tasks ol { margin: 4px 0 0; padding-left: 18px; }
+.plan-tasks li { margin-top: 6px; font-size: 13px; }
+.plan-tasks li p { margin-top: 1px; }
+
 .diff-summary { font-size: 13px; color: var(--muted); margin-bottom: 8px; }
 .plus { color: var(--ok); font-weight: 650; margin-left: 6px; }
 .minus { color: var(--bad); font-weight: 650; margin-left: 4px; }
@@ -555,6 +584,7 @@ details.fact summary::marker { color: var(--muted); }
   .monitor-step small { margin: 0; }
   .monitor-step:not(:last-child)::after { display: none; }
   .monitor-roles { grid-template-columns: minmax(0, 1fr); gap: 8px; }
+  .team-groups { grid-template-columns: minmax(0, 1fr); }
   .job-header { flex-direction: column; }
   .job-header-actions { justify-content: flex-start; }
 }

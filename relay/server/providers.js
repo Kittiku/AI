@@ -53,7 +53,13 @@ let claudeCodeBilling = 'subscription';
 const makeObject = fields => ({ type: 'object', properties: fields, required: Object.keys(fields), additionalProperties: false });
 const string = { type: 'string' };
 const paths = { type: 'array', items: string };
-export const planSchema = makeObject({ backend: string, frontend: string, contract: string, acceptance: string, backendFiles: paths, frontendFiles: paths });
+// Subtasks: the lead of a role splits its work into ordered pieces; each piece gets a goal, files and its own acceptance.
+const subtask = makeObject({ title: string, goal: string, files: paths, acceptance: string });
+export const planSchema = makeObject({ backend: string, frontend: string, contract: string, acceptance: string, backendFiles: paths, frontendFiles: paths,
+  complexity: { type: 'string', enum: ['simple', 'medium', 'hard'] },
+  backendTasks: { type: 'array', items: subtask }, frontendTasks: { type: 'array', items: subtask } });
+// The lead's check of one subtask before the next one starts.
+export const subtaskCheckSchema = makeObject({ verdict: { type: 'string', enum: ['pass', 'fix'] }, summary: string, problems: { type: 'array', items: string } });
 export const editSchema = makeObject({
   summary: string,
   status: { type: 'string', enum: ['done', 'no_work', 'blocked'] },
