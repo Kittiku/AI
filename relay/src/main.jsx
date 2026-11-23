@@ -1554,6 +1554,14 @@ function useJobAlerts(jobs) {
   }, [unseen, running, waiting]);
 }
 
+function isEditableTarget(node) {
+  const element = node?.nodeType === 1 ? node : node?.parentElement;
+  if (!element) return false;
+  if (element.isContentEditable || element.closest?.('input, textarea, select')) return true;
+  const editable = element.closest?.('[contenteditable]');
+  return Boolean(editable && editable.getAttribute('contenteditable')?.toLowerCase() !== 'false');
+}
+
 function App() {
   const [data, setData] = useState(null);
   const monitor = useMonitor();
@@ -1590,6 +1598,20 @@ function App() {
     window.addEventListener('beforeunload', warn);
     return () => window.removeEventListener('beforeunload', warn);
   }, [settingsDirty]);
+  const hasData = Boolean(data);
+  useEffect(() => {
+    if (!hasData || dialog) return;
+    const onKeyDown = event => {
+      if (event.defaultPrevented || event.repeat || event.isComposing || event.ctrlKey || event.altKey || event.metaKey) return;
+      if (event.key?.toLowerCase() !== 'n') return;
+      if (isEditableTarget(event.target) || isEditableTarget(document.activeElement)) return;
+      if (document.querySelector('dialog[open], [role="dialog"], [aria-modal="true"]')) return;
+      event.preventDefault();
+      setDialog({});
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [hasData, dialog]);
   useJobAlerts(data?.jobs);
   const leaveSettings = () => !settingsDirty || confirm('ออกจากหน้าตั้งค่าโดยไม่บันทึก?');
   function open(next) { if (next !== page && !leaveSettings()) return; setPage(next); setSelection(null); setApprovalTarget(null); }
@@ -1642,7 +1664,7 @@ function App() {
         <div className="topbar-status" role="status">
           {runningCount ? <span className="pulse" aria-hidden="true" /> : <span className="idle-dot" aria-hidden="true" />}
           {runningCount ? 'กำลังทำ ' + runningCount + ' งาน' : 'ว่าง'}{waitingCount ? ' · รออนุมัติ ' + waitingCount : ''}{queuedCount ? ' · รอ ' + queuedCount : ''}</div>
-        <div className="actions"><Button icon={RefreshCw} onClick={refresh} disabled={refreshing}>{refreshing ? 'กำลังรีเฟรช' : 'รีเฟรชโควตา'}</Button><Button primary icon={Plus} onClick={() => setDialog({})} disabled={!data}>สร้างงาน</Button></div>
+        <div className="actions"><Button icon={RefreshCw} onClick={refresh} disabled={refreshing}>{refreshing ? 'กำลังรีเฟรช' : 'รีเฟรชโควตา'}</Button><Button primary icon={Plus} onClick={() => setDialog({})} disabled={!data} title="สร้างงาน (N)" aria-keyshortcuts="n">สร้างงาน</Button></div>
       </header>
       <main>
         {networkError ? <p className="error banner" role="alert">{networkError}</p> : null}
