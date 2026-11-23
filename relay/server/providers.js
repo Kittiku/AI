@@ -302,7 +302,47 @@ function parseAgyOutput(stdout) {
 let geminiCli = { ready: false, backend: null, updatedAt: null, note: 'กำลังตรวจการเชื่อมต่อ Gemini / Antigravity CLI' };
 let geminiCliInFlight;
 
-async function geminiCliTurn(cwd, prompt, schema, signal, onUsage) {
+// Keep the entire encoded CLI request below the size that has caused silent truncation.
+export function fitGeminiCliInput(context, encode, limit = 88_000) {
+  const data = context ? JSON.parse(context) : null;
+  const repo = data?.repo;
+  const needed = new Set(repo?.requiredPaths || []);
+  const required = repo?.files.filter(file => needed.has(file.path)) || [];
+  const contextError = message => Object.assign(
+    Error(message + ' ระบบจะลอง AI ตัวถัดไปที่พร้อมใช้'),
+    { code: 'RELAY_CONTEXT_TOO_LARGE' }
+  );
+  const oversized = () => contextError('บริบทเกินขนาดที่ส่งให้ Gemini CLI ได้ครบ');
+  if (required.length !== needed.size) throw contextError('ข้อมูลไฟล์ที่ต้องใช้สำหรับ Gemini CLI ไม่ครบ');
+  const fits = input => Buffer.byteLength(input) <= limit;
+  const input = encode(context);
+  if (fits(input)) return input;
+  if (!repo?.files.length) throw oversized();
+
+  const optional = repo.files.filter(file => !needed.has(file.path));
+  function withOptional(count) {
+    const files = [...required, ...optional.slice(0, count)];
+    return encode(JSON.stringify({ ...data, repo: {
+      ...repo, files, omitted: repo.omitted + optional.length - count,
+      omittedPaths: [...new Set([...optional.slice(count).map(file => file.path), ...repo.omittedPaths])].slice(0, 100)
+    } }));
+  }
+  let packed = withOptional(0);
+  if (!fits(packed)) throw oversized();
+  let low = 0;
+  let high = optional.length;
+  while (low < high) {
+    const count = Math.floor((low + high + 1) / 2);
+    const candidate = withOptional(count);
+    if (fits(candidate)) { low = count; packed = candidate; }
+    else high = count - 1;
+  }
+  return packed;
+}
+
+const withContext = (prompt, context) => context ? prompt + '\nCONTEXT\n' + context : prompt;
+
+async function geminiCliTurn(cwd, prompt, context, schema, signal, onUsage) {
   const backend = geminiCli.backend || 'agy';
   const binary = backend === 'agy' ? agyBinary : geminiBinary;
   const label = backend === 'agy' ? 'Antigravity CLI (agy)' : 'Gemini CLI';
@@ -315,9 +355,9 @@ async function geminiCliTurn(cwd, prompt, schema, signal, onUsage) {
   const args = useStream
     ? ['--input-format', 'stream-json', '--output-format', 'stream-json', '--json-schema', JSON.stringify(schema), '--disable-slash-commands']
     : ['-p', instruction, '--output-format', 'json'];
-  const input = useStream
-    ? JSON.stringify({ event: 'user', message: { content: instruction + '\n\n' + prompt } }) + '\n'
-    : prompt;
+  const input = fitGeminiCliInput(context, packed => useStream
+    ? JSON.stringify({ event: 'user', message: { content: instruction + '\n\n' + withContext(prompt, packed) } }) + '\n'
+    : withContext(prompt, packed));
   if (geminiCliModel) args.push('--model', geminiCliModel);
   const { code, stdout, stderr } = await runCliBinary(binary, args, {
     cwd,
@@ -506,7 +546,7 @@ export function quota(settings, usage, now = Date.now()) {
   };
 }
 
-export async function generate(provider, cwd, prompt, schema, jobSignal, onUsage, { write = false } = {}) {
+export async function generate(provider, cwd, prompt, schema, jobSignal, onUsage, { write = false, context } = {}) {
   if (provider === 'gemini' && !geminiCli.updatedAt) await refreshGemini(cwd);
   const useCli = provider === 'gemini' && shouldUseCli();
   // Agents that read the repo themselves (Claude Code, Codex, Gemini CLI) get 15 minutes; one-shot API calls get 4.
@@ -515,23 +555,23 @@ export async function generate(provider, cwd, prompt, schema, jobSignal, onUsage
   let output;
   let usage = null;
   if (provider === 'claudecode') {
-    const result = await claudeCodeTurn(cwd, prompt, schema, signal, write);
+    const result = await claudeCodeTurn(cwd, withContext(prompt, context), schema, signal, write);
     if (!validate(result, schema)) throw Error(names[provider] + ' ส่งข้อมูลไม่ตรงกับรูปแบบที่กำหนด');
     return result;
   }
   if (provider === 'gemini' && useCli) {
-    const result = await geminiCliTurn(cwd, prompt, schema, signal, onUsage);
+    const result = await geminiCliTurn(cwd, prompt, context, schema, signal, onUsage);
     if (!validate(result, schema)) throw Error(names[provider] + ' ส่งข้อมูลไม่ตรงกับรูปแบบที่กำหนด');
     return result;
   }
   if (provider === 'codex') {
-    output = await codexTurn(cwd, prompt, schema, signal, write);
+    output = await codexTurn(cwd, withContext(prompt, context), schema, signal, write);
   } else {
     const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(geminiApiModel)}:generateContent`, {
       method: 'POST', signal,
       headers: { 'content-type': 'application/json', 'x-goog-api-key': geminiKey },
       body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
+        contents: [{ parts: [{ text: withContext(prompt, context) }] }],
         generationConfig: { responseMimeType: 'application/json', responseJsonSchema: schema, maxOutputTokens: 20000 }
       })
     });

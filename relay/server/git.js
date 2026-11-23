@@ -189,7 +189,9 @@ export async function snapshot(cwd, include = []) {
     files.push({ path: name, content });
     if (named) includeBudget -= info.size; else budget -= info.size;
   }
-  return JSON.stringify({ trackedPaths: list.slice(0, 400), files, omitted: list.length - files.length, omittedPaths: omittedPaths.slice(0, 100) });
+  const requiredPaths = list.filter(name => wanted.has(name.toLowerCase()) && sourceFile.test(name) &&
+    !/(^|\/)(package-lock\.json|pnpm-lock\.yaml)$/i.test(name));
+  return JSON.stringify({ trackedPaths: list.slice(0, 400), files, requiredPaths, omitted: list.length - files.length, omittedPaths: omittedPaths.slice(0, 100) });
 }
 
 // Find/replace edits let an AI change part of a large file without resending all of it.

@@ -242,6 +242,7 @@ async function callCore(job, role, cwd, task, context, schema, signal, accept, o
   if (role === 'review' || !publicQuotas().codex.ready) await refreshCodex(root);
   if ((job.settings.routing?.mode === 'auto' || job.settings.auto?.allProviders || job.settings.routes[role].includes('claudecode')) && !publicQuotas().claudecode.ready) await refreshClaudeCode(root);
   let lastError;
+  const contextLimitedProviders = new Set();
   let retriesLeft = job.settings.auto?.retries ?? 0;
   for (;;) {
     checkDeadline(job);
@@ -260,15 +261,16 @@ async function callCore(job, role, cwd, task, context, schema, signal, accept, o
     for (const candidate of candidates) {
       const { provider, blocked, extra, waitUntil: until } = candidate;
       signal.throwIfAborted();
+      if (contextLimitedProviders.has(provider)) continue;
       await budgetGate(job, role, signal);
       if (blocked) {
         if (until) waitUntil = Math.min(waitUntil ?? until, until);
         if (!extra || until) addEvent(job, label, 'ข้าม ' + names[provider] + ' · ' + blocked, provider);
         continue;
       }
-      tried = true;
       const response = await attempt(provider, extra, candidate, entry);
       if (response) return response;
+      if (!contextLimitedProviders.has(provider)) tried = true;
     }
     const auto = job.settings.auto || {};
     const now = Date.now();
@@ -320,7 +322,7 @@ async function callCore(job, role, cwd, task, context, schema, signal, accept, o
       }
       const text = typeof task === 'function' ? task({ write }) : task;
       const response = await generate(provider, cwd, toolInstructions + '\n' + text +
-        '\nUSER TASK\n' + job.prompt + '\nCONTEXT\n' + context, schema, signal, () => { day = null; }, { write });
+        '\nUSER TASK\n' + job.prompt, schema, signal, () => { day = null; }, { write, context });
       addUsage(job, response[USAGE]);
       signal.throwIfAborted();
       const after = write ? await attemptState(cwd, before) : null;
@@ -334,7 +336,10 @@ async function callCore(job, role, cwd, task, context, schema, signal, accept, o
       return response;
     } catch (error) {
       if (day) { state.usage[day]--; save(); }
-      if (!error.recorded) store.finishStep(step, { status: signal.aborted ? 'cancelled' : 'failed', error: error.message });
+      const contextLimited = error.code === 'RELAY_CONTEXT_TOO_LARGE';
+      if (!error.recorded) store.finishStep(step, {
+        status: signal.aborted ? 'cancelled' : contextLimited ? 'skipped' : 'failed', error: error.message
+      });
       // Verify the rollback before the next attempt can use this worktree.
       if (write) {
         try {
@@ -346,6 +351,7 @@ async function callCore(job, role, cwd, task, context, schema, signal, accept, o
       }
       signal.throwIfAborted();
       lastError = error;
+      if (contextLimited) contextLimitedProviders.add(provider);
       if (error.cooldown) cooldowns[provider] = Date.now() + error.cooldown;
       addEvent(job, label, error.message.slice(0, 800), provider);
       stageFail();
@@ -837,7 +843,9 @@ async function editOn(job, role, cwd, tracked, signal, {
   branch, message, action = 'implement', prompt = '', context = {}, findingsText = '', onOutput
 }) {
   beginStage(job, role, action, branch, job.round || 0);
-  const repo = JSON.parse(await snapshot(cwd, filesFor(job, role, tracked, findingsText)));
+  const priorChanges = context.subtask ? await changedFileNames(cwd, job.base, 'HEAD') : [];
+  const requiredFiles = [...(context.subtask?.files || []), ...(priorChanges || []), ...filesFor(job, role, tracked, findingsText)];
+  const repo = JSON.parse(await snapshot(cwd, requiredFiles));
   const output = await call(job, role, cwd, ({ write }) => (write ? agentEditPrompt(job, role) : editPrompt(role) + scopeText(job)) + prompt,
     JSON.stringify({ plan: job.plan, project: projectMemory(job), ...context, repo }), editSchema, signal,
     (response, attempt) => checkEdits(job, cwd, response, attempt), { edit: true, action });
