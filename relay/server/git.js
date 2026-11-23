@@ -9,6 +9,29 @@ export const git = async (cwd, ...args) => (await execute('git', [
   '-c', 'commit.gpgSign=false', ...args
 ], { cwd, timeout: 45_000, maxBuffer: 8 * 1024 * 1024, windowsHide: true })).stdout.trimEnd();
 
+// Merge in a Relay worktree. Only a content conflict is eligible for an AI rerun.
+export async function mergeWorktree(cwd, tip) {
+  try {
+    await git(cwd, '-c', 'user.name=Relay', '-c', 'user.email=relay@localhost',
+      '-c', 'rerere.enabled=false', 'merge', '--ff', '--no-edit', '--no-autostash', tip);
+    return { conflict: false };
+  } catch (error) {
+    const merging = await git(cwd, 'rev-parse', '--verify', '-q', 'MERGE_HEAD').then(() => true, probeError => {
+      if (probeError.code === 1) return false;
+      throw probeError;
+    });
+    if (!merging) throw error;
+    const unmerged = await git(cwd, 'ls-files', '-u').finally(() => git(cwd, 'merge', '--abort'));
+    if (!unmerged) throw error;
+    return { conflict: true };
+  }
+}
+
+export async function worktreePaths(repo) {
+  const output = await git(repo, 'worktree', 'list', '--porcelain', '-z');
+  return output.split('\0').filter(field => field.startsWith('worktree ')).map(field => field.slice(9));
+}
+
 export async function repository(folder) {
   if (!path.isAbsolute(folder) || folder.startsWith('\\\\')) throw Error('ระบุพาธเต็มของ Git repo บนเครื่อง');
   const cwd = await realpath(folder);

@@ -41,7 +41,7 @@ function projectStage(job, key) {
   const notPlanned = key === 'checks' && job.runChecks === false ? 'skipped' : 'pending';
   const status = stage?.status ?? (legacy && !liveStage(legacy.status) ? legacy.status : notPlanned);
   return {
-    key, status, action: stage?.action ?? null,
+    key, status, action: stage?.action ?? null, note: stage?.note ?? legacy?.note ?? null,
     provider: providerId(stage ? stage.provider : status !== 'pending' ? legacy?.provider : null),
     branch: stage?.branch ?? null,
     round: stage?.round ?? (stage ? null : legacy?.round ?? null),

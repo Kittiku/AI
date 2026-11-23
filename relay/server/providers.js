@@ -56,10 +56,20 @@ const makeObject = fields => ({ type: 'object', properties: fields, required: Ob
 const string = { type: 'string' };
 const paths = { type: 'array', items: string };
 // Subtasks: the lead of a role splits its work into ordered pieces; each piece gets a goal, files and its own acceptance.
-const subtask = makeObject({ title: string, goal: string, files: paths, acceptance: string });
-export const planSchema = makeObject({ backend: string, frontend: string, contract: string, acceptance: string, backendFiles: paths, frontendFiles: paths,
-  complexity: { type: 'string', enum: ['simple', 'medium', 'hard'] },
-  backendTasks: { type: 'array', items: subtask }, frontendTasks: { type: 'array', items: subtask } });
+const makeSubtask = requireDependencies => {
+  const schema = makeObject({ title: string, goal: string, files: paths, acceptance: string });
+  schema.properties.dependsOn = { type: 'array', items: { type: 'integer', minimum: 1 } };
+  if (requireDependencies) schema.required.push('dependsOn');
+  return schema;
+};
+const makePlanSchema = requireDependencies => {
+  const subtasks = { type: 'array', items: makeSubtask(requireDependencies) };
+  return makeObject({ backend: string, frontend: string, contract: string, acceptance: string, backendFiles: paths, frontendFiles: paths,
+    complexity: { type: 'string', enum: ['simple', 'medium', 'hard'] }, backendTasks: subtasks, frontendTasks: subtasks });
+};
+export const planSchema = makePlanSchema(false);
+// Codex's strict output schema needs every property in required. Use [] for an independent subtask.
+const codexPlanSchema = makePlanSchema(true);
 // The lead's check of one subtask before the next one starts.
 export const subtaskCheckSchema = makeObject({ verdict: { type: 'string', enum: ['pass', 'fix'] }, summary: string, problems: { type: 'array', items: string } });
 export const editSchema = makeObject({
@@ -76,9 +86,10 @@ export const reviewSchema = makeObject({
 export function validate(result, schema) {
   if (schema.type === 'string') return typeof result === 'string' && (!schema.enum || schema.enum.includes(result));
   if (schema.type === 'array') return Array.isArray(result) && result.every(item => validate(item, schema.items));
+  if (schema.type === 'integer') return Number.isInteger(result) && (schema.minimum === undefined || result >= schema.minimum);
   return Boolean(result && typeof result === 'object' && !Array.isArray(result) &&
-    Object.keys(result).length === schema.required.length &&
-    schema.required.every(key => validate(result[key], schema.properties[key])));
+    schema.required.every(key => Object.hasOwn(result, key)) &&
+    Object.entries(result).every(([key, value]) => Object.hasOwn(schema.properties, key) && validate(value, schema.properties[key])));
 }
 
 function codexRpc(cwd, signal) {
@@ -593,7 +604,7 @@ export async function generate(provider, cwd, prompt, schema, jobSignal, onUsage
     return result;
   }
   if (provider === 'codex') {
-    output = await codexTurn(cwd, withContext(prompt, context), schema, signal, write);
+    output = await codexTurn(cwd, withContext(prompt, context), schema === planSchema ? codexPlanSchema : schema, signal, write);
   } else {
     const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(geminiApiModel)}:generateContent`, {
       method: 'POST', signal,
