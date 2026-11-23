@@ -1081,6 +1081,14 @@ function JobActions({ job, updated, removed, setError }) {
       {merged.before !== null ? <><small>ถ้าต้องการย้อน ใช้คำสั่งนี้ จะได้ commit ใหม่ที่ยกเลิกการเปลี่ยนแปลง ประวัติเดิมไม่หาย</small>
         <div className="action-row"><CopyButton text={undoCommand}>คัดลอกคำสั่งย้อน</CopyButton></div></> : null}
     </div> : null}
+    {merged && job.selfUpdate ? <div className={'self-update' + (job.selfUpdate.built === false || job.selfUpdate.restart || job.selfUpdate.dependencies ? ' warn' : '')}>
+      <strong>อัปเดต Relay</strong>
+      <ul>
+        {job.selfUpdate.ui ? <li>{job.selfUpdate.built ? <>build หน้าเว็บใหม่แล้ว <button className="link small" onClick={() => location.reload()}>รีเฟรชหน้านี้</button> เพื่อใช้เวอร์ชันใหม่</> : <>build หน้าเว็บไม่สำเร็จ รัน <code>npm.cmd run build</code> ในโฟลเดอร์ relay เอง</>}</li> : null}
+        {job.selfUpdate.restart ? <li>งานนี้แก้โค้ด server หรือ MCP ต้องรีสตาร์ท Relay (ปิดแล้วเปิด start-relay.bat ใหม่) ตอนที่ไม่มีงานค้าง</li> : null}
+        {job.selfUpdate.dependencies ? <li>งานนี้แก้ package.json ต้องรัน <code>npm.cmd install</code> ในโฟลเดอร์ relay ก่อน</li> : null}
+      </ul>
+    </div> : null}
     {merged && job.status === 'needs_review' ? <div className="fix-panel attention">
       <p className="fix-lead"><Wrench size={15} aria-hidden="true" /> merge แล้วแต่ยังมีปัญหาค้าง ส่งต่อให้ Claude Code แก้บน {merged.into} ได้</p>
       <div className="action-row"><CopyButton text={handoffPrompt(job)}>คัดลอก prompt ให้ Claude Code</CopyButton></div>

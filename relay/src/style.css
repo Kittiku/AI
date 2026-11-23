@@ -367,6 +367,11 @@ details.fact summary::marker { color: var(--muted); }
 .merged-box { padding: 10px 12px; background: #f4fbf7; border: 1px solid var(--ok-line); border-radius: 11px; margin: 8px 0; }
 .merged-box p { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; color: var(--ok) !important; font-size: 13px; }
 .merged-box small { color: var(--ink-2); font-size: 12.5px; }
+.self-update { padding: 10px 12px; border: 1px solid #cdd9f3; background: #f5f8fe; border-radius: 11px; margin: 8px 0; }
+.self-update.warn { border-color: var(--warn-line); background: #fffaf0; }
+.self-update strong { font-size: 13px; }
+.self-update ul { margin: 4px 0 0; padding-left: 18px; }
+.self-update li { font-size: 13px; color: var(--ink-2); line-height: 1.5; }
 
 .approval-panel { padding: 18px 20px; margin-bottom: 16px; border-color: var(--warn-line); background: linear-gradient(#fffaf0, #fffdf8); scroll-margin-top: 80px; }
 .approval-panel:focus { outline: 2px solid #f59e0b; outline-offset: 2px; }

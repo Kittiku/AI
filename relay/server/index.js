@@ -1376,6 +1376,7 @@ app.post('/api/jobs/:id/merge', async (req, res) => {
   const commit = await git(job.repo, 'rev-parse', 'HEAD');
   job.merged = { at: Date.now(), into: check.target, commit, tip, fastForward: check.fastForward, before: check.alreadyMerged ? null : headBefore };
   addEvent(job, 'Merge', (check.alreadyMerged ? 'branch นี้อยู่ใน ' : 'merge เข้า ') + check.target + ' แล้ว (' + commit.slice(0, 7) + (check.fastForward ? ', fast-forward' : '') + ')');
+  job.selfUpdate = await rebuildSelf(job, check.alreadyMerged ? job.base : headBefore, commit);
   if (req.body?.cleanup) {
     await cleanup(job, false);
     await git(job.repo, 'branch', '-d', job.branch).then(() => { job.branchKept = false; }).catch(() => {});
@@ -1384,6 +1385,29 @@ app.post('/api/jobs/:id/merge', async (req, res) => {
   save();
   res.json(publicJob(job));
 });
+// A job that changed Relay itself: after its merge, rebuild the web page Relay serves (dist) when the UI changed,
+// and say when the server or MCP code changed, since those need a restart.
+async function rebuildSelf(job, from, to) {
+  const relative = path.relative(path.resolve(job.repo), path.resolve(root));
+  if (relative.startsWith('..') || path.isAbsolute(relative)) return null;
+  const prefix = relative ? relative.split(path.sep).join('/') + '/' : '';
+  const changed = (await changedFileNames(job.repo, from, to) ?? []).filter(name => name.startsWith(prefix)).map(name => name.slice(prefix.length));
+  const ui = changed.some(name => /^(src\/|public\/|index\.html$|vite\.config\.)/.test(name));
+  const restart = changed.some(name => /^(server\/|mcp\/)/.test(name));
+  const dependencies = changed.includes('package.json') || changed.includes('package-lock.json');
+  if (!ui && !restart && !dependencies) return null;
+  const result = { at: Date.now(), ui, restart, dependencies, built: null, error: '' };
+  if (ui) {
+    addEvent(job, 'อัปเดต Relay', 'งานนี้แก้หน้าเว็บของ Relay กำลัง build หน้าเว็บใหม่');
+    const build = await npm(root, ['run', 'build'], AbortSignal.timeout(180_000)).catch(error => ({ code: -1, output: error.message }));
+    result.built = build.code === 0;
+    if (!result.built) result.error = String(build.output || '').slice(-1500);
+    addEvent(job, 'อัปเดต Relay', result.built ? 'build หน้าเว็บใหม่แล้ว รีเฟรชหน้าเพื่อใช้เวอร์ชันใหม่' : 'build หน้าเว็บไม่สำเร็จ: ' + result.error.slice(-400));
+  }
+  if (restart) addEvent(job, 'อัปเดต Relay', 'งานนี้แก้โค้ด server หรือ MCP ของ Relay ต้องรีสตาร์ท Relay ถึงจะมีผล');
+  if (dependencies) addEvent(job, 'อัปเดต Relay', 'งานนี้แก้ package.json ต้องรัน npm install ใน ' + root + ' ก่อน build หรือรีสตาร์ท');
+  return result;
+}
 const busy = job => ['queued', 'running', 'stopping', 'waiting_approval'].includes(job.status);
 async function cleanup(job, deleteBranch) {
   // Remove every folder for this job (including role worktrees left by a failed removal), then let git forget them.
