@@ -34,6 +34,71 @@ npm.cmd start
 
 ถ้าเลือกให้ทดสอบ แอปจะรันสคริปต์ `test` และ `build` ที่มีใน `package.json` ที่ root หากมี dependencies แอปใช้ `npm ci --ignore-scripts` เพื่อเตรียมจาก lockfile สคริปต์ของ repo รันบนเครื่อง จึงควรใช้ตัวเลือกนี้กับ repo ที่ไว้ใจ
 
-เวอร์ชันนี้รองรับการเพิ่มและแก้ไฟล์ข้อความจาก snapshot ขนาดจำกัด งานที่ต้องลบไฟล์ สร้างไฟล์ไบนารี หรือใช้ context ทั้ง repo ขนาดใหญ่อาจต้องแก้ต่อจาก branch ผลลัพธ์ คิวและประวัติเก็บใน `.relay/state.json` และ worktree ผลลัพธ์อยู่ใต้ `.relay/worktrees` การปิดเซิร์ฟเวอร์ระหว่างรันจะเก็บ commit ที่ทำเสร็จแล้วและแสดงงานเป็นถูกขัดจังหวะเมื่อเปิดใหม่
+เวอร์ชันนี้รองรับการเพิ่มและแก้ไฟล์ข้อความ งานที่ต้องลบไฟล์หรือสร้างไฟล์ไบนารีอาจต้องแก้ต่อจาก branch ผลลัพธ์ worktree ผลลัพธ์อยู่ใต้ `.relay/worktrees`
+
+## ข้อมูลของแอป
+
+คิวงาน ประวัติ โปรเจกต์ การตั้งค่า และการเรียก AI แต่ละครั้งเก็บใน SQLite ที่ `.relay/relay.db` เมื่อเปิดเวอร์ชันนี้ครั้งแรก แอปย้ายข้อมูลจาก `.relay/state.json` เข้า SQLite ให้เอง แล้วเก็บไฟล์เดิมไว้เป็น `state.json.migrated`
+
+ถ้าแอปปิดระหว่างที่งานกำลังรัน เมื่อเปิดใหม่งานจะกลับเข้าคิวและทำต่อจากขั้นที่ค้าง แผนและขั้นที่เสร็จแล้วไม่ถูกทำซ้ำ ถ้าแอปปิดระหว่างงานเดิมเกิน 3 ครั้ง งานจะหยุดเป็นถูกขัดจังหวะ
+
+แท็บ **การใช้ AI** ในหน้างานแสดงการเรียก AI ทุกครั้ง ทั้งเวลา token และค่าใช้จ่าย ค่าใช้จ่ายของ Claude Code ที่ใช้บัญชี claude.ai เป็นมูลค่าเทียบราคา API ไม่ใช่เงินที่จ่ายจริง Codex และ Gemini CLI ยังไม่รายงาน token
+
+## Task Card
+
+Task Card คือ JSON ที่บอก Relay ว่าต้องทำอะไร ใช้ส่งงานจาก Chat เข้า Relay ได้ทั้งผ่าน MCP (ด้านล่าง) และวางเองในหน้า **สร้างงาน → วาง Task Card** ดู schema เต็มได้ที่ `GET /api/cards/schema`
+
+```json
+{
+  "version": 1,
+  "title": "เพิ่มปุ่มสลับธีม",
+  "project": "Acceptance Report",
+  "type": "feature",
+  "goal": "ผู้ใช้สลับธีมสว่าง/มืดได้ และค่าที่เลือกคงอยู่หลังรีเฟรช",
+  "context": "สิ่งที่ตกลงกันใน Chat",
+  "scope": { "include": ["webapp/static/**"], "exclude": ["shared/report_core.py"] },
+  "constraints": ["ห้ามเปลี่ยน API เดิม"],
+  "acceptance": [
+    { "text": "โค้ด Python คอมไพล์ผ่าน", "check": "command", "command": "py -3 -m py_compile webapp/web_app.py" },
+    { "text": "ปุ่มอยู่มุมขวาบน", "check": "manual" }
+  ],
+  "routing": { "prefer": { "frontend": "claudecode" }, "budget_usd": 2 }
+}
+```
+
+- `project` ใช้ชื่อโปรเจกต์ที่บันทึกไว้ในหน้า **โปรเจกต์** หรือพาธเต็มของ repo
+- `acceptance` แบบ `command` Relay รันเป็นคำสั่งทดสอบ (รวมกับคำสั่งทดสอบของโปรเจกต์) และให้ AI แก้จนผ่าน แบบ `review` ให้ AI รีวิวตรวจ แบบ `manual` แสดงในหน้างานให้คุณตรวจเองหลังส่งมอบ
+- `scope` และ `constraints` ส่งให้ AI เป็นข้อกำหนด แต่ Relay ยังไม่บังคับไฟล์ที่แก้ได้ และ `budget_usd` ยังเป็นแค่การบันทึก ไม่ได้หยุดงานเมื่อเกินงบ
+
+## เชื่อม Chat ผ่าน MCP
+
+`mcp/server.js` เป็น MCP server แบบ stdio ที่คุยกับ Relay บนเครื่อง Relay ต้องเปิดอยู่ก่อน เครื่องมือที่มี:
+
+| เครื่องมือ | ทำอะไร |
+| --- | --- |
+| `relay_list_projects` | รายชื่อโปรเจกต์และคำสั่งทดสอบ |
+| `relay_create_task` | ส่ง Task Card เข้าคิว Claude ถูกสั่งให้เรียกหลังคุณยืนยันการ์ดแล้วเท่านั้น |
+| `relay_job_status` | สถานะงานเดียว หรือ 10 งานล่าสุด |
+| `relay_job_result` | ผลรีวิว ผลทดสอบ token branch คำสั่ง merge และ diff |
+| `relay_cancel_job` | หยุดงาน |
+| `relay_quota` | โควตาของ AI แต่ละตัว |
+
+เพิ่มให้ Claude Code (ใช้ได้ทุกโฟลเดอร์):
+
+```powershell
+claude mcp add --scope user relay -- node D:\AI\relay\mcp\server.js
+```
+
+เพิ่มให้ Claude Desktop: เปิด **Settings → Developer → Edit Config** แล้วเพิ่มใน `claude_desktop_config.json` จากนั้นปิดและเปิด Claude Desktop ใหม่
+
+```json
+{
+  "mcpServers": {
+    "relay": { "command": "node", "args": ["D:\\AI\\relay\\mcp\\server.js"] }
+  }
+}
+```
+
+ถ้า Relay ไม่ได้ใช้พอร์ต 4782 ให้ตั้ง `RELAY_PORT` หรือ `RELAY_URL` ใน `env` ของ MCP server ใช้ได้กับ Claude Desktop และ Claude Code บนเครื่องนี้เท่านั้น claude.ai บนเว็บเรียก MCP server บนเครื่องไม่ได้
 
 Claude Code ทำงานแบบอ่านอย่างเดียวใน worktree ของงาน (ใช้ได้แค่เครื่องมือ Read, Glob และ Grep) แล้วส่งผลกลับเป็น JSON ให้ Relay เขียนไฟล์และ commit เอง โหมดนี้ใช้บัญชี claude.ai ของคุณ จึงเหมาะกับการใช้งานส่วนตัวบนเครื่องของคุณ Relay ไม่เรียก Claude API โดยตรงและไม่ส่ง `ANTHROPIC_API_KEY` ให้ Claude Code จึงไม่มีค่าใช้จ่ายตาม API เพิ่ม

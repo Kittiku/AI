@@ -46,6 +46,10 @@ const agyCliEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) 
   !/^(?:GEMINI_API_KEY|GOOGLE_API_KEY|OPENAI_API_KEY|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|CODEX_THREAD_ID|CLAUDECODE|CLAUDE_CODE_ENTRYPOINT)$/i.test(key)));
 const claudeCodeTools = 'Read,Glob,Grep';
 
+// Token and cost details ride on each result under a symbol, so schema validation (Object.keys) ignores them.
+export const USAGE = Symbol('usage');
+let claudeCodeBilling = 'subscription';
+
 const makeObject = fields => ({ type: 'object', properties: fields, required: Object.keys(fields), additionalProperties: false });
 const string = { type: 'string' };
 const paths = { type: 'array', items: string };
@@ -199,7 +203,16 @@ async function claudeCodeTurn(cwd, prompt, schema, signal) {
   try { data = JSON.parse(stdout.trim().split('\n').at(-1)); } catch {
     throw Error(`Claude Code ไม่ได้ส่งผล JSON (exit ${code}) ${(stderr || stdout).trim().slice(0, 600)}`);
   }
-  if (data.structured_output && !data.is_error) return data.structured_output;
+  if (data.structured_output && !data.is_error) {
+    const tokens = data.usage || {};
+    data.structured_output[USAGE] = {
+      inputTokens: (tokens.input_tokens || 0) + (tokens.cache_read_input_tokens || 0) + (tokens.cache_creation_input_tokens || 0),
+      outputTokens: tokens.output_tokens || 0,
+      costUsd: Number.isFinite(data.total_cost_usd) ? data.total_cost_usd : null,
+      billing: claudeCodeBilling
+    };
+    return data.structured_output;
+  }
   const message = String(data.result || data.subtype || stderr || 'ไม่มีผลลัพธ์ตาม schema').trim();
   const error = Error('Claude Code: ' + message.slice(0, 700));
   if (/usage limit|rate limit|limit reached|overloaded|429/i.test(message)) error.cooldown = 15 * 60_000;
@@ -401,6 +414,7 @@ export function refreshClaudeCode(cwd) {
     try { status = JSON.parse(stdout); } catch {}
     const method = status.authMethod;
     if (code !== 0 || method === 'none') throw Error('ต้องลงชื่อเข้าใช้ Claude Code ด้วย claude auth login');
+    claudeCodeBilling = method === 'claude.ai' ? 'subscription' : 'api';
     if (method && method !== 'claude.ai') {
       claudeCode = { ready: true, windows: [], updatedAt: Date.now(), note: 'ลงชื่อเข้าใช้แบบ ' + method + ' (อาจคิดค่าบริการตาม API)' };
       return;
@@ -489,6 +503,7 @@ export async function generate(provider, cwd, prompt, schema, jobSignal, onUsage
   const timeoutMs = (provider === 'claudecode' || provider === 'codex' || useCli) ? 900_000 : 240_000;
   const signal = AbortSignal.any([jobSignal, AbortSignal.timeout(timeoutMs)]);
   let output;
+  let usage = null;
   if (provider === 'claudecode') {
     const result = await claudeCodeTurn(cwd, prompt, schema, signal);
     if (!validate(result, schema)) throw Error(names[provider] + ' ส่งข้อมูลไม่ตรงกับรูปแบบที่กำหนด');
@@ -518,9 +533,12 @@ export async function generate(provider, cwd, prompt, schema, jobSignal, onUsage
       throw error;
     }
     output = data.candidates?.[0]?.content?.parts?.filter(x => !x.thought).map(x => x.text || '').join('');
+    usage = { inputTokens: data.usageMetadata?.promptTokenCount || 0,
+      outputTokens: (data.usageMetadata?.candidatesTokenCount || 0) + (data.usageMetadata?.thoughtsTokenCount || 0), costUsd: null, billing: 'api' };
   }
   let result;
   try { result = JSON.parse(output); } catch { throw Error(names[provider] + ' ส่ง JSON ไม่สมบูรณ์'); }
   if (!validate(result, schema)) throw Error(names[provider] + ' ส่งข้อมูลไม่ตรงกับรูปแบบที่กำหนด');
+  result[USAGE] = usage || { inputTokens: 0, outputTokens: 0, costUsd: null, billing: provider === 'codex' || useCli ? 'subscription' : 'api' };
   return result;
 }

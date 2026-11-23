@@ -7,11 +7,12 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, s
 import { realpath } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { applyEdits, applyFiles, checkpoint, git, repository, snapshot } from './git.js';
-import { editSchema, generate, names, pacificDay, planSchema, quota, refreshClaudeCode, refreshCodex, reviewSchema } from './providers.js';
+import { editSchema, generate, names, pacificDay, planSchema, quota, refreshClaudeCode, refreshCodex, reviewSchema, USAGE } from './providers.js';
+import { openStore } from './store.js';
+import { cardToJob, taskCardSchema, validateCard } from './cards.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const dataDir = path.resolve(process.env.RELAY_DATA_DIR || path.join(root, '.relay'));
-const file = path.join(dataDir, 'state.json');
 const roles = { plan: 'วางแผน', backend: 'Backend', frontend: 'UX/UI', review: 'รีวิว' };
 const defaults = {
   routes: { plan: ['claudecode', 'gemini'], backend: ['claudecode', 'codex'], frontend: ['gemini', 'claudecode'], review: ['codex', 'gemini'] },
@@ -20,8 +21,8 @@ const defaults = {
   auto: { allProviders: true, waitMinutes: 60, retries: 2, maxJobMinutes: 180 }
 };
 mkdirSync(dataDir, { recursive: true });
-let state = { settings: defaults, jobs: [], usage: {} };
-try { state = JSON.parse(readFileSync(file, 'utf8')); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+const store = openStore(dataDir);
+const state = store.load({ settings: structuredClone(defaults), jobs: [], usage: {}, projects: [] });
 // Claude API was removed; saved routes that named it move to Claude Code.
 function migrateSettings(settings) {
   for (const [role, route] of Object.entries(settings.routes)) {
@@ -37,18 +38,26 @@ migrateSettings(state.settings);
 state.projects ??= [];
 for (const job of state.jobs) if (job.status === 'queued') migrateSettings(job.settings);
 for (const project of state.projects) project.checks ??= [];
+// A job that was running when the app closed goes back to the queue and continues from its last finished step.
+// After three restarts in a row it stops, so a job that crashes the app cannot loop forever.
+store.closeOpenSteps();
 for (const job of state.jobs) {
-  if (['running', 'stopping'].includes(job.status)) {
+  if (job.status === 'stopping') job.status = 'cancelled';
+  if (job.status !== 'running') continue;
+  job.restarts = (job.restarts || 0) + 1;
+  if (job.restarts > 3) {
     job.status = 'interrupted';
-    job.error = 'แอปปิดก่อนงานเสร็จ สร้างงานใหม่เพื่อเริ่มอีกครั้ง';
+    job.error = 'แอปปิดระหว่างงานนี้เกิน 3 ครั้ง จึงหยุดไว้ กด "ทำต่อจากจุดที่ค้าง" เพื่อเริ่มอีกครั้ง';
+    continue;
   }
+  job.status = 'queued';
+  job.resuming = true;
+  for (const stage of Object.values(job.stages || {})) if (['running', 'waiting', 'retrying'].includes(stage.status)) stage.status = 'pending';
+  job.events.push({ title: 'ทำต่อ', detail: 'แอปปิดระหว่างทำงาน เมื่อเปิดใหม่จะทำต่อจากขั้นที่ค้าง', at: Date.now() });
 }
 const cooldowns = {};
 let active;
-function save() {
-  writeFileSync(file + '.tmp', JSON.stringify(state), { mode: 0o600 });
-  renameSync(file + '.tmp', file);
-}
+function save() { store.persist(state); }
 save();
 
 function publicQuotas() {
@@ -145,6 +154,7 @@ async function call(job, role, cwd, task, context, schema, signal, accept) {
   async function attempt(provider, extra) {
     addEvent(job, roles[role], (extra ? 'ตัวที่กำหนดไว้ใช้ไม่ได้ ลองใช้ ' : 'มอบหมายให้ ') + names[provider], provider);
     setStage(job, role, { status: 'running', provider, startedAt: Date.now(), endedAt: null, round: job.round || 0 });
+    const step = store.startStep({ jobId: job.id, role, provider, round: job.round || 0 });
     let day;
     try {
       if (provider === 'gemini') {
@@ -154,13 +164,16 @@ async function call(job, role, cwd, task, context, schema, signal, accept) {
       }
       const response = await generate(provider, cwd, toolInstructions + '\n' + task +
         '\nUSER TASK\n' + job.prompt + '\nCONTEXT\n' + context, schema, signal, () => { day = null; });
+      addUsage(job, response[USAGE]);
       const problem = accept ? await accept(response) : '';
-      if (problem) throw Error(problem);
+      if (problem) { store.finishStep(step, { status: 'rejected', usage: response[USAGE], error: problem }); throw Object.assign(Error(problem), { recorded: true }); }
+      store.finishStep(step, { status: 'done', usage: response[USAGE] });
       addEvent(job, roles[role], response.summary || 'สร้างแผนและ API contract แล้ว', provider);
       setStage(job, role, { status: 'done', endedAt: Date.now(), waitUntil: null, note: response.status === 'no_work' ? 'ไม่มีงานส่วนนี้' : '' });
       return response;
     } catch (error) {
       if (day) { state.usage[day]--; save(); }
+      if (!error.recorded) store.finishStep(step, { status: signal.aborted ? 'cancelled' : 'failed', error: error.message });
       signal.throwIfAborted();
       lastError = error;
       if (error.cooldown) cooldowns[provider] = Date.now() + error.cooldown;
@@ -168,6 +181,15 @@ async function call(job, role, cwd, task, context, schema, signal, accept) {
       return null;
     }
   }
+}
+// Running totals per job. Subscription runs report a notional cost, so it is kept apart from real API spend.
+function addUsage(job, usage) {
+  if (!usage) return;
+  const total = job.usage ??= { calls: 0, inputTokens: 0, outputTokens: 0, apiCostUsd: 0, subscriptionCostUsd: 0 };
+  total.calls++;
+  total.inputTokens += usage.inputTokens || 0;
+  total.outputTokens += usage.outputTokens || 0;
+  if (usage.costUsd) total[usage.billing === 'api' ? 'apiCostUsd' : 'subscriptionCostUsd'] += usage.costUsd;
 }
 const retryDelay = Number(process.env.RELAY_RETRY_DELAY_MS) || 30_000;
 const clockText = time => new Intl.DateTimeFormat('th-TH', { timeZone: 'Asia/Bangkok', hour: '2-digit', minute: '2-digit' }).format(time);
@@ -273,23 +295,47 @@ async function work(job, signal) {
   const integrated = path.join(workRoot, 'combined');
   // Resuming starts from the earlier job's branch so finished Backend and UX/UI work is kept.
   const resumeTip = job.resumeBranch ? await git(job.repo, 'rev-parse', '--verify', job.resumeBranch).catch(() => null) : null;
-  await git(job.repo, 'worktree', 'add', '-b', job.branch, integrated, resumeTip || job.base);
+  const startPoint = resumeTip || job.base;
+  // `resuming`: the app restarted while this job ran. Reuse its worktree and skip steps that already finished.
+  const resuming = Boolean(job.resuming);
+  if (resuming && existsSync(integrated)) {
+    await git(integrated, 'reset', '--hard').catch(() => {});
+  } else {
+    await git(job.repo, 'worktree', 'prune').catch(() => {});
+    const branchExists = await git(job.repo, 'rev-parse', '--verify', 'refs/heads/' + job.branch).then(() => true, () => false);
+    await git(job.repo, 'worktree', 'add', ...(branchExists ? [integrated, job.branch] : ['-b', job.branch, integrated, startPoint]));
+  }
   job.worktree = integrated;
   addEvent(job, 'Git worktree', integrated);
   const original = await snapshot(integrated);
   if (job.plan) {
-    addEvent(job, roles.plan, 'ใช้แผนจากงานเดิม ไม่เรียก AI ซ้ำ');
-    setStage(job, 'plan', { status: 'done', provider: 'reused', startedAt: Date.now(), endedAt: Date.now() });
+    addEvent(job, roles.plan, resuming ? 'ใช้แผนที่ทำไว้แล้ว' : 'ใช้แผนจากงานเดิม ไม่เรียก AI ซ้ำ');
+    if (job.stages?.plan?.status !== 'done') setStage(job, 'plan', { status: 'done', provider: 'reused', startedAt: Date.now(), endedAt: Date.now() });
   } else job.plan = await call(job, 'plan', integrated, planPrompt, original, planSchema, signal);
   save();
   const tracked = JSON.parse(original).trackedPaths;
 
-  if (resumeTip) {
+  const built = job.stages?.backend?.status === 'done' && job.stages?.frontend?.status === 'done';
+  if (resumeTip && !resuming) {
     addEvent(job, 'ทำต่อ', 'ใช้ผล Backend และ UX/UI จาก branch ' + job.resumeBranch + ' แล้วไปขั้นทดสอบและรีวิวต่อ');
     for (const role of ['backend', 'frontend']) setStage(job, role, { status: 'done', provider: 'reused', startedAt: Date.now(), endedAt: Date.now() });
-  } else await build(job, signal, workRoot, integrated, tracked);
+  } else if (resuming && built) {
+    addEvent(job, 'ทำต่อ', 'Backend และ UX/UI เสร็จไว้แล้ว ไปขั้นทดสอบและรีวิวต่อ');
+  } else {
+    if (resuming) {
+      // A half-finished build is redone from the start: drop leftover role worktrees, branches and commits.
+      for (const role of ['backend', 'frontend']) {
+        await git(job.repo, 'worktree', 'remove', '--force', path.join(workRoot, role)).catch(() => {});
+        await git(job.repo, 'worktree', 'prune').catch(() => {});
+        await git(job.repo, 'branch', '-D', job.branch + '-' + role).catch(() => {});
+      }
+      await git(integrated, 'reset', '--hard', startPoint);
+    }
+    await build(job, signal, workRoot, integrated, tracked);
+  }
+  job.resuming = false;
 
-  for (let round = 0; round <= job.settings.maxRounds; round++) {
+  for (let round = resuming ? job.round || 0 : 0; round <= job.settings.maxRounds; round++) {
     signal.throwIfAborted();
     checkDeadline(job);
     job.round = round;
@@ -424,14 +470,54 @@ app.use((req, res, next) => {
     req.get('origin') !== 'http://' + req.get('host')))) return res.sendStatus(403);
   next();
 });
-app.use(express.json({ limit: '30kb' }));
+app.use(express.json({ limit: '200kb' }));
 app.get('/api/state', (_req, res) => res.json({ ...state, usage: undefined, quotas: publicQuotas() }));
 app.post('/api/quota/refresh', async (_req, res) => { await Promise.all([refreshCodex(root), refreshClaudeCode(root)]); res.json(publicQuotas()); });
 app.put('/api/settings', (req, res) => { state.settings = readSettings(req.body); save(); res.json(state.settings); });
 app.post('/api/jobs', async (req, res) => {
-  const { title, prompt, repo, runChecks, routes, fromJob } = req.body || {};
+  const job = await createJob(req.body || {});
+  res.status(201).json(job);
+});
+
+// Task Card intake: validate, resolve the project by saved name or path, then queue a job.
+app.post('/api/cards', async (req, res) => {
+  const card = req.body?.card ?? req.body;
+  const problem = validateCard(card);
+  if (problem) return res.status(400).json({ error: 'Task Card ไม่ถูกต้อง: ' + problem });
+  const project = state.projects.find(item => item.name.toLowerCase() === card.project.trim().toLowerCase() || sameFolder(item.path, card.project.trim()));
+  if (!project && !path.isAbsolute(card.project.trim())) {
+    return res.status(400).json({ error: 'ไม่พบโปรเจกต์ "' + card.project + '" ใน Relay ใช้ชื่อโปรเจกต์ที่บันทึกไว้หรือพาธเต็มของ repo', projects: state.projects.map(item => item.name) });
+  }
+  const spec = cardToJob(card, state.settings);
+  const job = await createJob({ title: spec.title, prompt: spec.prompt, repo: project?.path || card.project.trim(), routes: spec.routes,
+    runChecks: Boolean(spec.commands.length || project?.checks?.length), extraChecks: spec.commands, maxPrompt: 20_000,
+    card: { ...card, receivedAt: Date.now() }, budgetUsd: spec.budgetUsd });
+  res.status(201).json(job);
+});
+
+// A compact result for clients like the MCP server: status, stages, review, checks, usage and the diff.
+app.get('/api/jobs/:id/summary', async (req, res) => {
+  const job = state.jobs.find(item => item.id === req.params.id);
+  if (!job) return res.status(404).json({ error: 'ไม่พบงานนี้' });
+  const hasResult = Boolean(job.worktree || job.branchKept);
+  const [stat, diff] = hasResult ? await Promise.all([
+    git(job.repo, 'diff', '--stat', job.base, job.branch, '--').catch(() => ''),
+    git(job.repo, 'diff', '--no-ext-diff', job.base, job.branch, '--').catch(() => '')
+  ]) : ['', ''];
+  const limit = Math.min(Number(req.query.diffChars) || 20_000, 200_000);
+  res.json({ id: job.id, title: job.title, status: job.status, error: job.error || null, repo: job.repo, branch: hasResult ? job.branch : null,
+    mergeCommand: hasResult ? `git -C "${job.repo}" merge ${job.branch}` : null,
+    stages: job.stages || {}, review: job.review || null,
+    checks: (job.checks || []).map(item => ({ label: item.label, code: item.code, output: item.output.slice(-1500) })),
+    usage: job.usage || null, startedAt: job.startedAt || null, finishedAt: job.finishedAt || null,
+    events: job.events.slice(-15), diffStat: stat, diff: diff.slice(0, limit), diffTruncated: diff.length > limit });
+});
+app.get('/api/jobs/:id/steps', (req, res) => res.json(store.steps(req.params.id)));
+app.get('/api/cards/schema', (_req, res) => res.json(taskCardSchema));
+
+async function createJob({ title, prompt, repo, runChecks, routes, fromJob, extraChecks = [], maxPrompt = 8000, card, budgetUsd }) {
   if (![title, prompt, repo].every(value => typeof value === 'string' && value.trim()) ||
-    title.length > 100 || prompt.length > 8000 || repo.length > 500) throw Error('กรอกชื่องาน โจทย์ และพาธ Git repo ให้ครบ');
+    title.length > 100 || prompt.length > maxPrompt || repo.length > 500) throw Error('กรอกชื่องาน โจทย์ และพาธ Git repo ให้ครบ');
   const { root: repoRoot, base } = await repository(repo.trim());
   if (unsafeRoot(repoRoot)) throw Error('Git repo นี้อยู่ที่ ' + repoRoot + ' ซึ่งเป็นโฟลเดอร์ผู้ใช้หรือ root ของไดรฟ์ เพิ่มโฟลเดอร์งานในหน้าโปรเจกต์เพื่อสร้าง repo แยก');
   const id = randomUUID();
@@ -450,12 +536,15 @@ app.post('/api/jobs', async (req, res) => {
     }
   }
   const project = state.projects.find(item => sameFolder(item.path, repoRoot));
-  if (project?.checks?.length) job.checkCommands = [...project.checks];
+  const commands = [...new Set([...(project?.checks || []), ...extraChecks])];
+  if (commands.length) job.checkCommands = commands;
+  if (card) { job.card = card; job.source = card.source?.kind || 'card'; }
+  if (budgetUsd !== null && budgetUsd !== undefined) job.budgetUsd = budgetUsd;
   state.jobs.push(job);
   save();
-  res.status(201).json(job);
   setImmediate(drain);
-});
+  return job;
+}
 app.get('/api/jobs/:id/diff', async (req, res) => {
   const job = state.jobs.find(item => item.id === req.params.id);
   if (!job?.worktree && !job?.branchKept) return res.status(404).json({ error: 'ยังไม่มีผลลัพธ์ของงานนี้' });

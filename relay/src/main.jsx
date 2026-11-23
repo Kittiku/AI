@@ -234,6 +234,8 @@ function NewJob({ close, created, previous, jobs, projects, settings, quotas }) 
   const [repoInfo, setRepoInfo] = useState(null);
   const [error, setError] = useState('');
   const [pending, setPending] = useState(false);
+  const [mode, setMode] = useState('form');
+  const [cardText, setCardText] = useState('');
   const recentRepos = [...new Set([...jobs].reverse().map(job => job.repo))]
     .filter(repo => !projects.some(project => samePath(project.path, repo))).slice(0, 8);
   const chosenProject = projects.find(project => samePath(project.path, form.repo.trim()));
@@ -257,12 +259,17 @@ function NewJob({ close, created, previous, jobs, projects, settings, quotas }) 
 
   async function submit(event) {
     event.preventDefault();
-    if (override && hasDuplicate(routes)) { setError('ตัวหลักและตัวสำรองต้องไม่ซ้ำกัน'); return; }
+    if (mode === 'form' && override && hasDuplicate(routes)) { setError('ตัวหลักและตัวสำรองต้องไม่ซ้ำกัน'); return; }
+    let card;
+    if (mode === 'card') {
+      try { card = JSON.parse(cardText); } catch (error) { setError('JSON ไม่ถูกต้อง: ' + error.message); return; }
+    }
     setPending(true);
     setError('');
     try {
       if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission().catch(() => {});
-      const job = await api('/jobs', 'POST', { ...form, routes: override ? routes : undefined, fromJob: previous?.id });
+      const job = mode === 'card' ? await api('/cards', 'POST', { card: { ...card, source: card.source || { kind: 'paste' } } }) :
+        await api('/jobs', 'POST', { ...form, routes: override ? routes : undefined, fromJob: previous?.id });
       if (!previous?.title) writeStorage(draftKey, null);
       created(job);
     } catch (error) { setError(error.message); setPending(false); }
@@ -274,6 +281,16 @@ function NewJob({ close, created, previous, jobs, projects, settings, quotas }) 
       <header><h2 id="create-title">{previous?.title ? 'สร้างงานจากโจทย์เดิม' : 'สร้างงาน'}</h2>
         <button title="ปิด" aria-label="ปิด" className="icon-button" type="button" onClick={close} disabled={pending}><X size={22} /></button>
       </header>
+      {previous?.title ? null : <div className="filters" aria-label="วิธีสร้างงาน">
+        <button type="button" aria-pressed={mode === 'form'} onClick={() => { setMode('form'); setError(''); }}>กรอกเอง</button>
+        <button type="button" aria-pressed={mode === 'card'} onClick={() => { setMode('card'); setError(''); }}>วาง Task Card</button>
+      </div>}
+      {mode === 'card' ? <>
+        <label>Task Card (JSON)<textarea className="card-json" required rows={14} value={cardText} spellCheck={false}
+          placeholder={'{\n  "title": "…",\n  "project": "ชื่อโปรเจกต์ใน Relay",\n  "goal": "…",\n  "acceptance": [{ "text": "…", "check": "command", "command": "…" }]\n}'}
+          onChange={event => setCardText(event.target.value)} /></label>
+        <small>วาง Task Card ที่ได้จาก Chat ฟิลด์ที่จำเป็นคือ title, project และ goal ส่วน acceptance แบบ command Relay จะรันเป็นคำสั่งทดสอบให้</small>
+      </> : <>
       <label>ชื่องาน<input autoFocus required name="title" maxLength={100} placeholder="เพิ่มระบบจองคิว" value={form.title} onChange={event => set('title', event.target.value)} /></label>
       {projects.length ? <label>โปรเจกต์<select value={chosenProject?.id || ''} onChange={event => {
         const project = projects.find(item => item.id === event.target.value);
@@ -301,6 +318,7 @@ function NewJob({ close, created, previous, jobs, projects, settings, quotas }) 
         <summary>เลือก AI เฉพาะงานนี้</summary>
         <RouteTable routes={routes} quotas={quotas} label="AI สำหรับงานนี้" onChange={(role, index, value) => setRoutes(current => updateRoutes(current, role, index, value))} />
       </details>
+      </>}
       {error ? <p role="alert" className="error">{error}</p> : null}
       <footer><Button disabled={pending} onClick={close}>ยกเลิก</Button><button type="submit" className="button primary" disabled={pending}>{pending ? 'กำลังเพิ่มงาน…' : 'เพิ่มเข้าคิว'}</button></footer>
     </form>
@@ -447,6 +465,46 @@ function JobActions({ job, updated, removed, setError }) {
   </div>;
 }
 
+const sourceNames = { chat: 'Chat (MCP)', paste: 'วางเอง', card: 'Task Card' };
+const stepStatus = { done: 'สำเร็จ', failed: 'ล้มเหลว', rejected: 'ใช้ผลไม่ได้', running: 'กำลังทำ', cancelled: 'หยุด', interrupted: 'ถูกขัดจังหวะ' };
+const tokens = value => value == null ? '–' : value >= 10_000 ? Math.round(value / 1000).toLocaleString() + 'k' : value.toLocaleString();
+const usd = value => value == null ? '–' : '$' + value.toFixed(value < 0.1 ? 4 : 2);
+
+// One row per AI call: who did what, how long it took, tokens and cost.
+// Cost on a subscription login is what the same tokens would cost on the API, not money spent.
+function UsageView({ job }) {
+  const [steps, setSteps] = useState(null);
+  const [error, setError] = useState('');
+  const running = busyStatuses.has(job.status);
+  const stepCount = job.usage?.calls;
+  useEffect(() => {
+    api('/jobs/' + job.id + '/steps').then(setSteps, error => setError(error.message));
+  }, [job.id, running, stepCount]);
+  const total = job.usage;
+  if (error) return <p className="error">{error}</p>;
+  if (!steps) return <p>กำลังโหลด…</p>;
+  return <div className="usage">
+    <div className="usage-totals">
+      <div><small>เรียก AI</small><strong>{steps.length} ครั้ง</strong></div>
+      <div><small>Token เข้า / ออก</small><strong>{tokens(total?.inputTokens ?? 0)} / {tokens(total?.outputTokens ?? 0)}</strong></div>
+      <div><small>จ่ายจริงผ่าน API</small><strong>{usd(total?.apiCostUsd ?? 0)}</strong></div>
+      <div><small>มูลค่าเทียบ API (ใช้ subscription)</small><strong>{usd(total?.subscriptionCostUsd ?? 0)}</strong></div>
+    </div>
+    {steps.length ? <div className="table-scroll"><table className="steps">
+      <thead><tr><th>ขั้น</th><th>AI</th><th>ผล</th><th>เวลา</th><th>Token เข้า/ออก</th><th>ค่าใช้จ่าย</th></tr></thead>
+      <tbody>{steps.map(step => <tr key={step.id} className={step.status}>
+        <td>{stageNames[step.role] || step.role}{step.round ? ' · รอบ ' + step.round : ''}</td>
+        <td>{providerName(step.provider)}</td>
+        <td title={step.error || ''}>{stepStatus[step.status] || step.status}</td>
+        <td>{step.ended_at ? duration(step.ended_at - step.started_at) : '…'}</td>
+        <td>{tokens(step.input_tokens)} / {tokens(step.output_tokens)}</td>
+        <td>{usd(step.cost_usd)}{step.billing === 'subscription' && step.cost_usd != null ? ' *' : ''}</td>
+      </tr>)}</tbody>
+    </table></div> : <p className="muted">ยังไม่มีการเรียก AI ในงานนี้</p>}
+    <p className="muted">* ใช้บัญชี subscription ตัวเลขคือมูลค่าเทียบราคา API ไม่ใช่เงินที่จ่ายจริง · Codex และ Gemini CLI ยังไม่รายงาน token</p>
+  </div>;
+}
+
 function JobDetail({ job, back, retry, updated, removed }) {
   const [tab, setTab] = useState('events');
   const [diff, setDiff] = useState(null);
@@ -477,14 +535,20 @@ function JobDetail({ job, back, retry, updated, removed }) {
     <div className="detail-grid">
       <section className="card detail">
         <div className="filters"><button aria-pressed={tab === 'events'} onClick={() => { setTab('events'); setError(''); }}>ประวัติการทำงาน</button>
-          <button aria-pressed={tab === 'diff'} onClick={() => showDiff()} disabled={!hasResult}>Git diff</button></div>
+          <button aria-pressed={tab === 'diff'} onClick={() => showDiff()} disabled={!hasResult}>Git diff</button>
+          <button aria-pressed={tab === 'usage'} onClick={() => { setTab('usage'); setError(''); }}>การใช้ AI</button></div>
         {error ? <p role="alert" className="error">{error}</p> : null}
-        {tab === 'diff' ? loading ? <p>กำลังโหลด diff…</p> : diff ? <DiffView diff={diff} focus={focus} /> : null :
+        {tab === 'usage' ? <UsageView job={job} /> :
+          tab === 'diff' ? loading ? <p>กำลังโหลด diff…</p> : diff ? <DiffView diff={diff} focus={focus} /> : null :
           <ol className="events">{job.events.length ? [...job.events].reverse().map((event, i) => <li key={job.events.length - i}><span>{time(event.at)}</span><div><strong>{event.title}{event.provider ? ' · ' + providerName(event.provider) : ''}</strong><p>{event.detail}</p></div></li>) : <li><p>รอเริ่มงาน</p></li>}</ol>}
       </section>
       <aside className="card detail facts">
         {!busy ? <JobActions job={job} updated={updated} removed={removed} setError={setError} /> : null}
-        <h2>รายละเอียดงาน</h2><p className="preline">{job.prompt}</p>
+        <h2>รายละเอียดงาน</h2>
+        {job.card ? <p className="source-badge">มาจาก Task Card · {sourceNames[job.source] || job.source}{job.budgetUsd != null ? ' · งบ $' + job.budgetUsd : ''}</p> : null}
+        {job.card?.acceptance?.some(item => item.check === 'manual') ? <><h3>ต้องตรวจเองหลังส่งมอบ</h3>
+          <ul>{job.card.acceptance.filter(item => item.check === 'manual').map(item => <li key={item.text}>{item.text}</li>)}</ul></> : null}
+        <p className="preline">{job.prompt}</p>
         {job.error ? <p className="error">{job.error}</p> : null}
         {assigned.length ? <><h3>AI ที่รับงาน</h3><ul className="assigned">{assigned.map(([key, stage]) => <li key={key}>{stageNames[key]} · {providerName(stage.provider)}</li>)}</ul></> : null}
         {job.branch && hasResult ? <><h3>Branch ผลลัพธ์</h3><code>{job.branch}</code>{job.worktree ? <small>{job.worktree}</small> : null}</> : null}
