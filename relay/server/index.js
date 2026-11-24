@@ -837,71 +837,101 @@ async function work(job, signal) {
   }
   job.resuming = false;
 
-  // The user asked for one more fix round on a finished job: fix the open findings (and their note), then review once.
-  if (job.fixRequest && built) {
-    const { note, findings: open } = job.fixRequest;
-    job.round = (job.round || 0) + 1;
-    job.roundLimit = job.round;
-    const findings = open.length ? open : [{ owner: 'backend', detail: note }];
-    const prompt = ' Address only the assigned review findings.' + (note ? ' The user reviewed the result and added: ' + note : '');
-    for (const role of job.single ? ['backend'] : ['backend', 'frontend']) {
-      const mine = findings.filter(item => job.single || item.owner === role || (!open.length && role === 'backend'));
-      if (!mine.length) continue;
-      addEvent(job, 'แก้ต่อ', 'รอบ ' + job.round + ' · ' + roles[role] + ' · ' + mine.length + ' ข้อ');
-      await editOn(job, role, integrated, tracked, signal, {
-        branch: job.branch, action: 'fix_review', prompt,
-        context: { findings: mine, ...(note ? { userNote: note } : {}) },
-        findingsText: mine.map(item => item.detail).join('\n') + '\n' + note,
-        message: 'Relay: extra review fixes for ' + role
-      });
-    }
-    job.fixRequest = null;
-    save();
-  }
-  const lastRound = Math.max(job.settings.maxRounds, job.roundLimit || 0);
+  const fixRequest = job.fixRequest;
+  const firstRound = fixRequest
+    ? (fixRequest.round ??= (job.round || 0) + 1)
+    : (resuming ? job.round || 0 : 0);
+  // A manual request gets one review, including when the worker restarts before delivery.
+  if (fixRequest) job.roundLimit = firstRound;
+  const lastRound = Math.max(firstRound, job.roundLimit ?? job.settings.maxRounds);
 
-  for (let round = resuming ? job.round || 0 : 0; round <= lastRound; round++) {
+  for (let round = firstRound; round <= lastRound; round++) {
     signal.throwIfAborted();
     checkDeadline(job);
     job.round = round;
-    job.checks = await verify(job, integrated, signal);
-    const diff = await git(integrated, 'diff', '--no-ext-diff', job.base, 'HEAD', '--');
-    job.review = await call(job, 'review', integrated,
-      'Review the integrated diff against acceptance and test output. Report only actionable defects with file references. An empty findings array means no defects observed. Do not report missing tests unless this blocks acceptance. If any check failed, report at least one finding that explains the failure and assign it to the role most likely responsible.',
-      JSON.stringify({ plan: job.plan, diff: diff.slice(0, 105_000), truncated: diff.length > 105_000, checks: job.checks }), reviewSchema, signal);
-    signal.throwIfAborted();
-    const broken = failedChecks(job.checks);
-    if (!job.review.findings.length && broken.length) {
-      // Failing tests are a defect even when the reviewer did not call them out.
-      job.review.findings = broken.map(result => ({ owner: guessOwner(job, result.output),
-        detail: 'คำสั่ง ' + result.label + ' ไม่ผ่าน (exit ' + result.code + '):\n' + result.output.slice(-2500) }));
-      addEvent(job, 'ทดสอบ', 'ทดสอบไม่ผ่าน ' + broken.length + ' คำสั่ง ส่ง error ให้ AI แก้');
+    if (job.lastReviewedRound !== round) {
+      if (fixRequest || job.lastReviewedRound === round - 1) {
+        await fixReviewFindings(job, integrated, tracked, signal, fixRequest);
+      }
+      await reviewIntegrated(job, integrated, signal, fixRequest);
     }
-    finishRole(job, 'review');
     if (!job.review.findings.length) break;
-    if (round >= lastRound) break;
-    job.round = round + 1;
-    for (const role of job.single ? ['backend'] : ['backend', 'frontend']) {
-      // One implementer owns every finding in single-implementer job types.
-      const findings = job.review.findings.filter(item => job.single || item.owner === role);
-      if (!findings.length) continue;
-      addEvent(job, 'แก้ตามรีวิว', 'รอบ ' + (round + 1) + ' · ' + roles[role]);
-      await editOn(job, role, integrated, tracked, signal, {
-        branch: job.branch, action: 'fix_review', prompt: ' Address only the assigned review findings.',
-        context: { findings }, findingsText: findings.map(item => item.detail).join('\n'),
-        message: 'Relay: review fixes for ' + role
-      });
-    }
   }
   beginStage(job, 'delivery', 'finish', job.branch, job.round || 0);
-  const changed = await changedFileNames(integrated, job.base, 'HEAD');
+  const [changed, diffStat] = await Promise.all([
+    changedFileNames(integrated, job.base, 'HEAD'),
+    readDiffStat(integrated, job.base, 'HEAD')
+  ]);
   signal.throwIfAborted();
+  job.diffStat = diffStat;
   const needsReview = Boolean(job.review.findings.length || failedChecks(job.checks).length);
   job.changedFiles = (changed ?? []).slice(0, 50);
   finishStage(job, 'delivery', needsReview ? 'warning' : 'done', { changedFiles: monitorFiles(changed) });
   job.status = needsReview ? 'needs_review' : 'complete';
   rememberJob(job);
   job.events.push({ title: 'ส่งมอบ', detail: 'ผลลัพธ์อยู่บน branch ' + job.branch, at: Date.now() });
+}
+
+async function fixReviewFindings(job, cwd, tracked, signal, request) {
+  const open = request ? request.findings : job.review.findings;
+  const note = request?.note || '';
+  const findings = open.length ? open.map(item => typeof item === 'string'
+    ? { owner: guessOwner(job, item), detail: item } : item) : [{ owner: 'backend', detail: note }];
+  const prompt = ' Address only the assigned review findings.' + (note ? ' The user reviewed the result and added: ' + note : '');
+  const result = request ?? job.reviewHistory.at(-1);
+
+  for (const role of job.single ? ['backend'] : ['backend', 'frontend']) {
+    const mine = findings.filter(item => job.single || item.owner === role);
+    if (!mine.length) continue;
+    const stage = job.stages?.[role];
+    // Stage completion and fixer attribution are saved together by editOn.
+    if (stage?.status === 'done' && stage.round === job.round) continue;
+    addEvent(job, request ? 'แก้ต่อ' : 'แก้ตามรีวิว', 'รอบ ' + job.round + ' · ' + roles[role] +
+      (request ? ' · ' + mine.length + ' ข้อ' : ''));
+    await editOn(job, role, cwd, tracked, signal, {
+      branch: job.branch, action: 'fix_review', prompt,
+      context: { findings: mine, ...(note ? { userNote: note } : {}) },
+      findingsText: mine.map(item => item.detail).join('\n') + '\n' + note,
+      message: 'Relay: ' + (request ? 'extra ' : '') + 'review fixes for ' + role,
+      onApplied(provider) {
+        (result.fixedBy ??= []).push({ role: job.single ? 'single' : role, provider });
+      }
+    });
+  }
+}
+
+async function reviewIntegrated(job, cwd, signal, request) {
+  job.checks = await verify(job, cwd, signal);
+  const diff = await git(cwd, 'diff', '--no-ext-diff', job.base, 'HEAD', '--');
+  const review = await call(job, 'review', cwd,
+    'Review the integrated diff against acceptance and test output. Report only actionable defects with file references. An empty findings array means no defects observed. Do not report missing tests unless this blocks acceptance. If any check failed, report at least one finding that explains the failure and assign it to the role most likely responsible.',
+    JSON.stringify({ plan: job.plan, diff: diff.slice(0, 105_000), truncated: diff.length > 105_000, checks: job.checks }), reviewSchema, signal);
+  signal.throwIfAborted();
+  const broken = failedChecks(job.checks);
+  const omittedFailures = !review.findings.length && broken.length;
+  if (omittedFailures) {
+    // Failing tests are a defect even when the reviewer did not call them out.
+    review.findings = broken.map(result => ({ owner: guessOwner(job, result.output),
+      detail: 'คำสั่ง ' + result.label + ' ไม่ผ่าน (exit ' + result.code + '):\n' + result.output.slice(-2500) }));
+  }
+  review.ok = !review.findings.length && !broken.length;
+  const history = job.reviewHistory ??= [];
+  history.push({
+    round: history.length + 1,
+    at: Date.now(),
+    trigger: request ? 'manual_fix' : job.round > 0 ? 'auto_fix' : 'initial',
+    userNote: request?.note || null,
+    provider: review[PROVIDER] ?? null,
+    ok: review.ok,
+    summary: review.summary,
+    findings: structuredClone(review.findings),
+    fixedBy: request?.fixedBy ?? []
+  });
+  job.review = review;
+  job.lastReviewedRound = job.round;
+  if (request) job.fixRequest = null;
+  finishRole(job, 'review');
+  if (omittedFailures) addEvent(job, 'ทดสอบ', 'ทดสอบไม่ผ่าน ' + broken.length + ' คำสั่ง ส่ง error ให้ AI แก้');
 }
 
 // How the planner should split work into a team. With team mode off it still answers the schema, with empty task lists.
@@ -938,8 +968,26 @@ async function changedFileNames(cwd, from, to, { includeRenameSources = false } 
   return output === null ? null : output.split('\0').filter(Boolean);
 }
 
+async function readDiffStat(cwd, from, to) {
+  const output = await git(cwd, 'diff', '--no-ext-diff', '--numstat', '-z', from, to, '--').catch(() => null);
+  if (output === null) return null;
+  const stat = { files: 0, additions: 0, deletions: 0 };
+  const entries = output.split('\0');
+  for (let index = 0; index < entries.length - 1; index++) {
+    const record = /^(\d+|-)\t(\d+|-)\t(.*)$/s.exec(entries[index]);
+    if (!record) return null;
+    const [, additions, deletions, name] = record;
+    stat.files++;
+    stat.additions += additions === '-' ? 0 : Number(additions);
+    stat.deletions += deletions === '-' ? 0 : Number(deletions);
+    // Renames and copies have an empty path followed by two NUL-delimited paths.
+    if (!name) index += 2;
+  }
+  return stat;
+}
+
 async function editOn(job, role, cwd, tracked, signal, {
-  branch, message, action = 'implement', prompt = '', context = {}, findingsText = '', onOutput, onProvider, routeKey
+  branch, message, action = 'implement', prompt = '', context = {}, findingsText = '', onOutput, onProvider, onApplied, routeKey
 }) {
   const quiet = Boolean(routeKey);
   if (!quiet) {
@@ -969,6 +1017,7 @@ async function editOn(job, role, cwd, tracked, signal, {
   if (!quiet) {
     const changedFiles = monitorFiles(tip ? await changedFileNames(cwd, tip + '^', tip) : []);
     signal.throwIfAborted();
+    if (tip) onApplied?.(output[PROVIDER] ?? null);
     finishRole(job, role, { note: output.status === 'no_work' ? 'ไม่มีงานส่วนนี้' : '' }, { changedFiles });
   }
   return tip;
@@ -1311,6 +1360,7 @@ async function drain() {
   save();
   try { await work(job, active.controller.signal); }
   catch (error) {
+    if (job.worktree) job.diffStat = await readDiffStat(job.worktree, job.base, 'HEAD');
     job.status = active.controller.signal.aborted || error.userRejected ? 'cancelled' : 'failed';
     job.error = error.message.slice(0, 1800);
     closeJobStages(job, job.status);
@@ -1461,19 +1511,20 @@ app.post('/api/cards', async (req, res) => {
 app.get('/api/jobs/:id/summary', async (req, res) => {
   const job = state.jobs.find(item => item.id === req.params.id);
   if (!job) return res.status(404).json({ error: 'ไม่พบงานนี้' });
-  const hasResult = Boolean(resultRef(job));
-  const [stat, diff] = hasResult ? await Promise.all([
-    git(job.repo, 'diff', '--stat', job.base, resultRef(job), '--').catch(() => ''),
-    git(job.repo, 'diff', '--no-ext-diff', job.base, resultRef(job), '--').catch(() => '')
+  const ref = resultRef(job);
+  const [diffStatText, diff] = ref ? await Promise.all([
+    git(job.repo, 'diff', '--stat', job.base, ref, '--').catch(() => ''),
+    git(job.repo, 'diff', '--no-ext-diff', job.base, ref, '--').catch(() => '')
   ]) : ['', ''];
   const limit = Math.min(Number(req.query.diffChars) || 20_000, 200_000);
   res.json({ id: job.id, title: job.title, status: job.status, error: job.error || null, repo: job.repo, branch: job.worktree || job.branchKept ? job.branch : null, merged: job.merged || null,
     mergeCommand: (job.worktree || job.branchKept) && !job.merged ? `git -C "${job.repo}" merge ${job.branch}` : null,
     type: job.type || 'feature', approval: job.approval || null, plan: job.plan || null, scope: job.scope || null, budgetUsd: job.budgetUsd ?? null,
-    stages: job.stages || {}, review: job.review || null,
-    checks: (job.checks || []).map(item => ({ label: item.label, code: item.code, output: item.output.slice(-1500) })),
+    stages: job.stages || {}, card: job.card ?? null, review: job.review || null,
+    ...reviewDetails(job),
+    checks: (job.checks || []).map(item => ({ label: item.label, code: item.code, output: String(item.output ?? '').slice(-1500) })),
     usage: job.usage || null, startedAt: job.startedAt || null, finishedAt: job.finishedAt || null,
-    events: job.events.slice(-15), diffStat: stat, diff: diff.slice(0, limit), diffTruncated: diff.length > limit });
+    events: job.events.slice(-15), diffStatText, diff: diff.slice(0, limit), diffTruncated: diff.length > limit });
 });
 app.post('/api/jobs/:id/approve', (req, res) => {
   const job = state.jobs.find(item => item.id === req.params.id);
@@ -1510,7 +1561,11 @@ app.post('/api/jobs/:id/fix', async (req, res) => {
   const findings = (job.review?.findings || []).slice(0, 30);
   if (!findings.length && !text) throw Error('งานนี้ไม่มีปัญหาค้าง บอกด้วยว่าต้องการให้แก้อะไร');
   requireJobIntake();
-  job.fixRequest = { note: text, provider: provider || null, findings, at: Date.now() };
+  if (findJob(job.id) !== job || !['complete', 'needs_review'].includes(job.status) || job.merged) {
+    return res.status(409).json({ error: 'สถานะงานเปลี่ยนไป กรุณาตรวจงานล่าสุดก่อนสั่งแก้ต่อ' });
+  }
+  job.fixRequest = { note: text, provider: provider || null, findings, at: Date.now(), round: (job.round || 0) + 1 };
+  job.diffStat = null;
   job.status = 'queued';
   job.resuming = true;
   job.error = null;
@@ -1562,7 +1617,7 @@ async function createJob({ title, prompt, repo, runChecks, routes, fromJob, extr
     settings.routing = { ...settings.routing, profile };
   }
   const job = { id, repo: repoRoot, base, baseBranch: startBranch === 'HEAD' ? null : startBranch, branch: 'relay/' + id.slice(0, 12), title: title.trim(),
-    prompt: prompt.trim(), runChecks: runChecks === true, settings, status: 'queued', events: [], createdAt: Date.now(),
+    prompt: prompt.trim(), runChecks: runChecks === true, settings, status: 'queued', events: [], reviewHistory: [], createdAt: Date.now(),
     type: type || 'feature', single: jobTypes[type || 'feature'].single, scope: scope || null,
     approvalGates: [...new Set([...(approvals || []), ...(settings.approvals?.afterPlan ? ['after_plan'] : [])])] };
   // Resuming reuses the earlier plan when the task, repo and HEAD are unchanged, so the plan step costs no quota.
@@ -1724,7 +1779,13 @@ app.delete('/api/projects/:id', (req, res) => {
   res.json({ ok: true });
 });
 
-function publicJob({ monitor: _monitor, ...job }) { return job; }
+function reviewDetails(job) {
+  return { reviewHistory: job.reviewHistory ?? [], diffStat: job.diffStat ?? null };
+}
+
+function publicJob({ monitor: _monitor, lastReviewedRound: _lastReviewedRound, ...job }) {
+  return { ...job, ...reviewDetails(job) };
+}
 
 const findJob = id => state.jobs.find(item => item.id === id);
 // The result lives on the job branch; after a merge deleted it, the recorded tip commit still shows the diff.
