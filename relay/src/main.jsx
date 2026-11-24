@@ -421,7 +421,7 @@ function MonitorActivityList({ job, expanded }) {
   </details>;
 }
 
-function LiveMonitor({ monitor, job, fallbackJob, saved, onDetails, onApproval, children }) {
+function LiveMonitor({ monitor, job, fallbackJob, saved, onDetails, onApproval, showTeam, children }) {
   const { snapshot, receivedAt, connection } = monitor;
   const [now, setNow] = useState(Date.now);
   const latest = snapshot?.lastFinishedJob;
@@ -482,6 +482,7 @@ function LiveMonitor({ monitor, job, fallbackJob, saved, onDetails, onApproval, 
       {roles.length ? <div className={'monitor-roles' + (roles.length === 1 ? ' single' : '')} key={job.id}>
         {roles.map(stage => <MonitorRole key={stage.key} stage={stage} single={job.single} activities={job.activities} />)}
       </div> : null}
+      {showTeam && job.team ? <TeamTree key={'team:' + job.id} job={job} team={job.team} compact /> : null}
       {job.activities.length ? <MonitorActivityList key={job.id} job={job} expanded={Boolean(fallbackJob) && !saved} /> : null}
     </> : children}
   </section>;
@@ -1005,7 +1006,7 @@ const subtaskStatus = {
 };
 const subtaskFinished = new Set(['passed', 'skipped', 'done']);
 const subtaskActive = new Set(['running', 'checking', 'fixing', 'merging', 'rerun']);
-const subtaskNumber = (item, index) => Number.isInteger(item.id) ? item.id : Number.isInteger(Number(item.id)) && String(item.id).trim() ? Number(item.id) : index + 1;
+const subtaskNumber = (item, index) => Number.isInteger(item.index) ? item.index : Number.isInteger(item.id) ? item.id : Number.isInteger(Number(item.id)) && String(item.id).trim() ? Number(item.id) : index + 1;
 
 // Use the server's waitingOn list, including an empty list. Infer dependencies only for older records.
 function waitingFor(item, items) {
@@ -1018,11 +1019,17 @@ function waitingFor(item, items) {
 }
 
 // Team view: each role's lead, its subtasks in order, who did each one and what the lead's check said.
-function TeamTree({ job }) {
-  const groups = Object.entries(job.team || {}).filter(([, items]) => items?.length);
+// Takes the full job.team from /api/state, or the monitor's { fromCard, backend, frontend } via `team`.
+// `compact` is the short form shown inside the live monitor on the home page.
+function TeamTree({ job = {}, team = job.team, compact = false }) {
+  const groups = ['backend', 'frontend'].map(role => [role, team?.[role]]).filter(([, items]) => Array.isArray(items) && items.length);
   if (!groups.length) return null;
-  return <section className="card team" aria-label="ทีมงาน">
-    <div className="card-head"><h2>ทีมงาน</h2>{job.plan?.complexity ? <span className="chip">{complexityNames[job.plan.complexity]}</span> : null}</div>
+  const fromCard = team?.fromCard === true || job.plan?.subtasksFromCard === true;
+  const Wrapper = compact ? 'div' : 'section';
+  const Title = compact ? 'h3' : 'h2';
+  return <Wrapper className={compact ? 'team compact' : 'card team'} aria-label="ทีมงาน">
+    <div className="card-head"><Title>ทีมงาน{fromCard ? <> <span className="plan-source-badge">งานย่อยจากการ์ด</span></> : null}</Title>
+      {!compact && job.plan?.complexity ? <span className="chip">{complexityNames[job.plan.complexity]}</span> : null}</div>
     <div className={'team-groups' + (groups.length === 1 ? ' single' : '')}>
       {groups.map(([role, items]) => {
         const passed = items.filter(item => subtaskFinished.has(item.status)).length;
@@ -1030,7 +1037,7 @@ function TeamTree({ job }) {
         const waiting = items.filter(item => waitingFor(item, items).length).length;
         return <div key={role} className="team-group">
           <header><strong>{job.single ? 'ผู้ลงมือ' : role === 'frontend' ? 'UX/UI' : 'Backend'}</strong>
-            <small>หัวหน้าแบ่ง {items.length} งานย่อย · ผ่านแล้ว {passed}</small>
+            <small>{compact ? '' : fromCard ? 'จากการ์ด ' : 'หัวหน้าแบ่ง '}{items.length} งานย่อย · ผ่านแล้ว {passed}</small>
             {active > 1 || waiting ? <span className="team-badges">
               {active > 1 ? <span className="team-badge parallel">ทำพร้อมกัน {active} ชิ้น</span> : null}
               {waiting ? <span className="team-badge waiting">รอชิ้นอื่น {waiting}</span> : null}
@@ -1042,7 +1049,9 @@ function TeamTree({ job }) {
               const [text, tone] = waits.length ? ['รอ #' + waits.join(', #'), 'waiting'] : subtaskStatus[item.status] || [item.status, ''];
               const parallel = active > 1 && subtaskActive.has(item.status);
               const deps = Array.isArray(item.dependsOn) ? item.dependsOn : [];
-              return <li key={item.id ?? index} className={'subtask ' + (tone || 'idle') + (parallel ? ' parallel' : '')}>
+              const worker = item.provider && item.provider !== 'reused' ? item.provider : null;
+              const prefer = providers[item.prefer] && item.prefer !== worker ? item.prefer : null;
+              return <li key={item.id ?? item.index ?? index} className={'subtask ' + (tone || 'idle') + (parallel ? ' parallel' : '')}>
                 <span className="subtask-no">{subtaskNumber(item, index)}</span>
                 <div className="subtask-body">
                   <div className="subtask-line"><strong>{item.title}</strong><em className={'subtask-status ' + tone}
@@ -1051,12 +1060,13 @@ function TeamTree({ job }) {
                     {parallel ? <span className="subtask-flag parallel">ทำพร้อมกัน</span> : null}
                     {deps.length && !waits.length && !subtaskFinished.has(item.status) ? <span className="subtask-flag">ต่อจาก #{deps.join(', #')}</span> : null}
                   </div> : null}
-                  <div className="subtask-who">
-                    {item.provider && item.provider !== 'reused' ? <span><ProviderIcon id={item.provider} size={12} /> ทำโดย {providerName(item.provider)}</span> : null}
+                  {worker || prefer || item.checker || item.fixes ? <div className="subtask-who">
+                    {worker ? <span><ProviderIcon id={worker} size={12} /> ทำโดย {providerName(worker)}</span> : null}
+                    {prefer ? <span className="subtask-prefer">AI ที่ต้องการ · {providerName(prefer)}</span> : null}
                     {item.checker ? <span><ProviderIcon id={item.checker} size={12} /> ตรวจโดย {providerName(item.checker)}</span> : null}
                     {item.fixes ? <span>แก้ {item.fixes} รอบ</span> : null}
-                  </div>
-                  {item.check ? <p className="subtask-check">{item.check}</p> : item.summary ? <p className="subtask-check">{item.summary}</p> : null}
+                  </div> : null}
+                  {compact ? null : item.check ? <p className="subtask-check">{item.check}</p> : item.summary ? <p className="subtask-check">{item.summary}</p> : null}
                 </div>
               </li>;
             })}
@@ -1064,7 +1074,7 @@ function TeamTree({ job }) {
         </div>;
       })}
     </div>
-  </section>;
+  </Wrapper>;
 }
 
 // A ready-to-paste brief for a Claude Code session: where the work is, what is still wrong, and what done means.
@@ -1232,6 +1242,27 @@ function UsageView({ job }) {
   </div>;
 }
 
+function PlanTaskGroups({ plan, single, Heading = 'h3' }) {
+  const minTasks = plan.subtasksFromCard === true ? 1 : 2;
+  return ['backend', 'frontend'].map(role => {
+    const tasks = plan[role + 'Tasks'];
+    if (!tasks || tasks.length < minTasks) return null;
+    return <div key={role} className="plan-tasks">
+      <Heading>งานย่อย {single ? '' : roleNames[role]} ({tasks.length})</Heading>
+      <ol>{tasks.map((task, index) => <li key={index}>
+        <strong>{task.title}</strong>
+        {task.prefer ? <> <span className="plan-task-prefer">AI ที่ต้องการ · {providerName(task.prefer)}</span></> : null}
+        <p>{task.goal}</p>
+        {task.files?.length ? <small>ไฟล์: {task.files.join(', ')}</small> : null}
+      </li>)}</ol>
+    </div>;
+  });
+}
+
+function CardSubtaskBadge({ plan }) {
+  return plan?.subtasksFromCard === true ? <> <span className="plan-source-badge">งานย่อยจากการ์ด</span></> : null;
+}
+
 // Shown while a job waits: the plan to approve, revise or reject, or a budget question.
 function ApprovalPanel({ job, panelRef }) {
   const [note, setNote] = useState('');
@@ -1264,17 +1295,14 @@ function ApprovalPanel({ job, panelRef }) {
     }
   }
   return <section ref={panelRef} tabIndex={-1} className="card approval-panel" aria-label="รออนุมัติ">
-    <h2>{plan ? 'ตรวจแผนก่อนลงมือ' : 'ถึงงบที่ตั้งไว้'}</h2>
+    <h2>{plan ? 'ตรวจแผนก่อนลงมือ' : 'ถึงงบที่ตั้งไว้'}<CardSubtaskBadge plan={plan} /></h2>
     <p>{job.approval.message}</p>
     {plan ? <div className="plan-view">
       <div><h3>{job.single ? 'สิ่งที่จะทำ' : 'Backend'}</h3><p className="preline">{plan.backend}</p>{plan.backendFiles?.length ? <small>ไฟล์: {plan.backendFiles.join(', ')}</small> : null}</div>
       {job.single ? null : <div><h3>UX/UI</h3><p className="preline">{plan.frontend}</p>{plan.frontendFiles?.length ? <small>ไฟล์: {plan.frontendFiles.join(', ')}</small> : null}</div>}
       <div><h3>ข้อตกลงระหว่างส่วน</h3><p className="preline">{plan.contract}</p></div>
       <div><h3>เกณฑ์รับงาน</h3><p className="preline">{plan.acceptance}</p></div>
-      {['backend', 'frontend'].map(role => plan[role + 'Tasks']?.length >= 2 ? <div key={role} className="plan-tasks">
-        <h3>งานย่อย {job.single ? '' : role === 'backend' ? 'Backend' : 'UX/UI'} ({plan[role + 'Tasks'].length})</h3>
-        <ol>{plan[role + 'Tasks'].map((task, index) => <li key={index}><strong>{task.title}</strong><p>{task.goal}</p>{task.files?.length ? <small>ไฟล์: {task.files.join(', ')}</small> : null}</li>)}</ol>
-      </div> : null)}
+      <PlanTaskGroups plan={plan} single={job.single} />
     </div> : null}
     {plan?.complexity ? <p className="muted">ความยากที่ประเมิน: {complexityNames[plan.complexity] || plan.complexity}</p> : null}
     {plan ? <label>หมายเหตุ (ต้องใส่ถ้าขอแก้แผน)<textarea rows={3} value={note} onChange={event => setNote(event.target.value)} placeholder="เช่น อย่าแตะไฟล์ CSS ของหน้า Records" /></label> : null}
@@ -1423,8 +1451,10 @@ function JobDetail({ job, projectName, monitor, approvalRequested, onApproval, o
           {skippedRoles.length ? <div className="fact"><h3>ส่วนที่ข้าม</h3><ul className="skipped-roles">{skippedRoles.map(([key, stage]) =>
             <li key={key}><span className="skipped-chip">{stageName(job, key)}</span> {stage.note}</li>)}</ul></div> : null}
           <details className="fact" open={job.prompt.length < 500}><summary><h3>โจทย์</h3></summary><p className="preline">{job.prompt}</p></details>
-          {job.plan ? <details className="fact"><summary><h3>แผนงาน</h3></summary>
-            <h4>ข้อตกลงระหว่างส่วน</h4><p className="preline">{job.plan.contract}</p><h4>เกณฑ์รับงาน</h4><p className="preline">{job.plan.acceptance}</p></details> : null}
+          {job.plan ? <details className="fact"><summary><h3>แผนงาน</h3><CardSubtaskBadge plan={job.plan} /></summary>
+            <h4>ข้อตกลงระหว่างส่วน</h4><p className="preline">{job.plan.contract}</p><h4>เกณฑ์รับงาน</h4><p className="preline">{job.plan.acceptance}</p>
+            {job.plan.subtasksFromCard === true ? <PlanTaskGroups plan={job.plan} single={job.single} Heading="h4" /> : null}
+          </details> : null}
           {job.scope ? <div className="fact"><h3>Scope</h3><p>{job.scope.include?.length ? 'แก้ได้เฉพาะ ' + job.scope.include.join(', ') : ''}{job.scope.exclude?.length ? ' · ห้ามแก้ ' + job.scope.exclude.join(', ') : ''}</p></div> : null}
           {job.branch && hasResult ? <div className="fact"><h3>Branch ผลลัพธ์</h3><code>{job.branch}</code>{job.worktree ? <small>{job.worktree}</small> : null}</div> : null}
           {job.budgetUsd != null ? <div className="fact"><h3>งบ</h3><p>{'$' + job.budgetUsd}</p></div> : null}
@@ -1887,7 +1917,7 @@ function App() {
             <Kpis jobs={jobs} onFilter={setFilter} onApproval={openApproval} />
             <div className="home-grid">
               <div className="home-main">
-                <LiveMonitor monitor={monitor} job={snapshot?.activeJob} onDetails={select} onApproval={openApproval} />
+                <LiveMonitor monitor={monitor} job={snapshot?.activeJob} onDetails={select} onApproval={openApproval} showTeam />
                 <Queue jobs={jobs} projects={projects} filter={filter} setFilter={setFilter} select={select} create={() => setDialog({})} hasProjects={projects.length > 0} addProject={() => open('projects')} />
               </div>
               <AiStatus quotas={data?.quotas} reserve={reserve} onMore={() => open('quota')} />
