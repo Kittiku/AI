@@ -2,6 +2,7 @@
 // The same JSON Schema is served to MCP clients, so Claude sees exactly what Relay accepts.
 const providerIds = ['claudecode', 'codex', 'gemini'];
 const roleIds = ['plan', 'backend', 'frontend', 'review'];
+const subtaskRoles = ['backend', 'frontend'];
 
 export const taskCardSchema = {
   type: 'object',
@@ -32,6 +33,25 @@ export const taskCardSchema = {
         }
       }
     },
+    subtasks: {
+      type: 'array', maxItems: 20,
+      description: 'Optional user-defined work breakdown. The configured task limit applies separately to each role.',
+      items: {
+        type: 'object', additionalProperties: false, required: ['role', 'title', 'goal', 'files', 'acceptance'],
+        properties: {
+          role: { type: 'string', enum: subtaskRoles },
+          title: { type: 'string', maxLength: 120, pattern: '\\S' },
+          goal: { type: 'string', maxLength: 2000, pattern: '\\S' },
+          files: { type: 'array', maxItems: 50, items: { type: 'string', maxLength: 300 } },
+          acceptance: { type: 'string', maxLength: 1000, pattern: '\\S' },
+          dependsOn: {
+            type: 'array', maxItems: 20, items: { type: 'integer', minimum: 1 },
+            description: '1-based subtask numbers in the same role, in card order. No self-dependencies or cycles.'
+          },
+          prefer: { type: 'string', enum: providerIds, description: 'Preferred AI for this subtask.' }
+        }
+      }
+    },
     constraints: { type: 'array', maxItems: 30, items: { type: 'string', maxLength: 500 } },
     routing: {
       type: 'object', additionalProperties: false,
@@ -58,6 +78,7 @@ function check(value, schema, where) {
   if (schema.type === 'string') {
     if (typeof value !== 'string') return `${where} ต้องเป็นข้อความ`;
     if (schema.maxLength && value.length > schema.maxLength) return `${where} ยาวเกิน ${schema.maxLength} ตัวอักษร`;
+    if (schema.pattern && !new RegExp(schema.pattern).test(value)) return `${where} ต้องเป็นข้อความที่ไม่ว่าง`;
     return '';
   }
   if (schema.type === 'integer' || schema.type === 'number') {
@@ -74,19 +95,65 @@ function check(value, schema, where) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return `${where} ต้องเป็น object`;
   for (const key of schema.required || []) if (value[key] === undefined || value[key] === '') return `${where}.${key} จำเป็นต้องมี`;
   for (const [key, item] of Object.entries(value)) {
-    if (!schema.properties[key]) { if (schema.additionalProperties === false) return `${where}.${key} ไม่รู้จักฟิลด์นี้`; continue; }
+    if (!Object.hasOwn(schema.properties, key)) { if (schema.additionalProperties === false) return `${where}.${key} ไม่รู้จักฟิลด์นี้`; continue; }
     const problem = check(item, schema.properties[key], `${where}.${key}`);
     if (problem) return problem;
   }
   return '';
 }
 
-export function validateCard(card) {
+function checkSubtaskDependencies(tasks, role) {
+  for (const [index, task] of tasks.entries()) {
+    const number = index + 1;
+    for (const dependency of task.dependsOn || []) {
+      const field = `งานย่อยฝั่ง ${role} #${number} (dependsOn)`;
+      if (dependency > tasks.length) return `${field} อ้างถึง #${dependency} นอกช่วงของฝั่งเดียวกัน (1–${tasks.length})`;
+      if (dependency === number) return `${field} ห้ามอ้างถึงตัวเอง (#${number})`;
+    }
+  }
+
+  const chain = [];
+  const checked = new Set();
+  function visit(number) {
+    if (checked.has(number)) return '';
+    const start = chain.indexOf(number);
+    if (start !== -1) {
+      const cycle = [...chain.slice(start), number].map(item => `#${item}`).join(' → ');
+      return `งานย่อยฝั่ง ${role} มี dependsOn วนกลับเป็นวงจร (${cycle})`;
+    }
+    chain.push(number);
+    for (const dependency of tasks[number - 1].dependsOn || []) {
+      const problem = visit(dependency);
+      if (problem) return problem;
+    }
+    chain.pop();
+    checked.add(number);
+    return '';
+  }
+
+  for (let number = 1; number <= tasks.length; number++) {
+    const problem = visit(number);
+    if (problem) return problem;
+  }
+  return '';
+}
+
+export function validateCard(card, { maxSubtasks } = {}) {
   const problem = check(card, taskCardSchema, 'card');
   if (problem) return problem;
   if (!card.title.trim() || !card.goal.trim() || !card.project.trim()) return 'card ต้องมี title, project และ goal ที่ไม่ว่าง';
   const commandless = (card.acceptance || []).find(item => item.check === 'command' && !item.command?.trim());
   if (commandless) return 'เกณฑ์ "' + commandless.text + '" เป็นแบบ command แต่ไม่มีคำสั่ง';
+  if (card.subtasks?.length) {
+    for (const role of subtaskRoles) {
+      const tasks = card.subtasks.filter(task => task.role === role);
+      if (Number.isInteger(maxSubtasks) && tasks.length > maxSubtasks) {
+        return `งานย่อยฝั่ง ${role} มี ${tasks.length} รายการ เกินเพดาน maxSubtasks ที่กำหนดไว้ ${maxSubtasks} รายการต่อฝั่ง`;
+      }
+      const problem = checkSubtaskDependencies(tasks, role);
+      if (problem) return problem;
+    }
+  }
   return '';
 }
 
@@ -111,6 +178,26 @@ export function cardToJob(card, settings) {
       lines.push('- [' + kind + '] ' + item.text + (kind === 'command' ? ' (Relay runs: `' + item.command + '`)' : kind === 'manual' ? ' (the user checks this after delivery)' : ''));
     }
   }
+  let cardSubtasks;
+  if (card.subtasks?.length) {
+    cardSubtasks = { backend: [], frontend: [] };
+    for (const { role, title, goal, files, acceptance, dependsOn = [], prefer } of card.subtasks) {
+      cardSubtasks[role].push({ title: title.trim(), goal: goal.trim(), files: [...files], acceptance: acceptance.trim(),
+        dependsOn: [...dependsOn], ...(prefer ? { prefer } : {}) });
+    }
+    lines.push('', '## Subtasks', 'User-defined subtasks. Dependency numbers refer to subtasks in the same role.');
+    for (const role of subtaskRoles) {
+      const tasks = cardSubtasks[role];
+      if (!tasks.length) continue;
+      lines.push('', '### ' + role);
+      for (const [index, task] of tasks.entries()) {
+        lines.push(`${index + 1}. ${task.title}`, '   Goal: ' + task.goal, '   Acceptance: ' + task.acceptance);
+        if (task.files.length) lines.push('   Files: ' + task.files.join(', '));
+        if (task.dependsOn.length) lines.push('   Depends on: ' + task.dependsOn.join(', '));
+        if (task.prefer) lines.push('   Preferred AI: ' + task.prefer);
+      }
+    }
+  }
   const prompt = lines.join('\n');
   const commands = acceptance.filter(item => item.check === 'command').map(item => item.command.trim());
 
@@ -125,7 +212,8 @@ export function cardToJob(card, settings) {
   }
   const scope = include.length || exclude.length ? { include, exclude } : null;
   return { title: card.title.trim(), prompt, commands, routes, budgetUsd: card.routing?.budget_usd ?? null,
-    type: card.type || 'feature', scope, approvals: card.approvals || [], pinned: prefer, profile: card.routing?.profile || null };
+    type: card.type || 'feature', scope, approvals: card.approvals || [], pinned: prefer, profile: card.routing?.profile || null,
+    ...(cardSubtasks ? { cardSubtasks } : {}) };
 }
 
 // Scope check for changed paths. A pattern without wildcards matches that file or everything under that folder;
