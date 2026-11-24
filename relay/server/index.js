@@ -11,7 +11,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { applyEdits, applyFiles, attemptChanges, attemptState, checkpoint, editContexts, git, isSafePath, mergeWorktree, removeWorktreeFolder, repository, restoreAttempt, snapshot, worktreePaths } from './git.js';
 import { editSchema, generate, names, pacificDay, planSchema, quota, refreshClaudeCode, refreshCodex, reviewSchema, subtaskCheckSchema, USAGE } from './providers.js';
 import { openStore } from './store.js';
-import { createRestartController, defaultSelfUpdateSettings, normalizeSelfUpdateSettings, shouldAutoRestart } from './restart.js';
+import { createRestartController, defaultSelfUpdateSettings, normalizeSelfUpdateSettings, restartMessages, shouldAutoRestart } from './restart.js';
 import { PROFILES, rank } from './router.js';
 import { closeMonitorStages, createMonitor, liveStage, monitorFiles, recordMonitor } from './monitor.js';
 import { cardToJob, outOfScope, taskCardSchema, validateCard } from './cards.js';
@@ -23,6 +23,8 @@ import {
 const root = fileURLToPath(new URL('..', import.meta.url));
 const dataDir = path.resolve(process.env.RELAY_DATA_DIR || path.join(root, '.relay'));
 const serverBoot = { bootId: randomUUID(), startedAt: Date.now(), supervised: process.env.RELAY_SUPERVISED === '1' };
+const restartHandoff = process.env.RELAY_RESTART_HANDOFF === '1' && typeof process.send === 'function';
+if (restartHandoff) delete process.env.RELAY_RESTART_HANDOFF;
 const roles = { plan: 'วางแผน', backend: 'Backend', frontend: 'Frontend', review: 'รีวิว' };
 const defaults = {
   routes: { plan: ['claudecode', 'gemini'], backend: ['claudecode', 'codex'], frontend: ['gemini', 'claudecode'], review: ['codex', 'gemini'] },
@@ -109,7 +111,7 @@ const cooldowns = {};
 let active;
 let monitor;
 let httpServer;
-const pendingWrites = new Set();
+let acceptingRequests = false;
 const restartController = createRestartController({
   getJobs: () => state.jobs,
   closeServer,
@@ -1369,6 +1371,7 @@ const restartPath = '/api/system/restart';
 const restartActions = new Set([restartPath, restartPath + '/cancel']);
 app.use((req, res, next) => {
   if (![host + ':' + port, 'localhost:' + port].includes(req.get('host'))) return res.sendStatus(403);
+  if (!acceptingRequests) return res.status(503).json({ error: 'Relay กำลังเริ่มทำงาน' });
   if (req.method !== 'GET') {
     const restartAction = req.method === 'POST' && restartActions.has(req.path);
     const origin = req.get('origin');
@@ -1870,18 +1873,11 @@ app.post('/api/jobs/:id/cancel', (req, res) => {
 app.use(express.static(path.join(root, 'dist')));
 app.use((error, _req, res, _next) => res.status(error.status === 503 ? 503 : 400).json({ error: error.message.slice(0, 1800) }));
 
-// Let admitted writes finish even when their client disconnects before receiving the response.
 function finishBeforeRestart(handler) {
-  return async (req, res) => {
-    const write = handler(req, res);
-    pendingWrites.add(write);
-    try { await write; }
-    finally { pendingWrites.delete(write); }
-  };
+  return (req, res) => restartController.runWrite(() => handler(req, res));
 }
 
 async function closeServer() {
-  await Promise.allSettled(pendingWrites);
   monitor.close();
   if (httpServer?.listening) {
     await new Promise((resolve, reject) => {
@@ -1913,6 +1909,7 @@ async function reopenServer() {
   if (!store) {
     store = openStore(dataDir);
     store.load(state); // Restore the store's cache of persisted rows for subsequent updates and deletions.
+    store.persist(state); // Undo boot bookkeeping a replacement may have saved before failing to start.
   }
   if (!httpServer?.listening) await listen();
 }
@@ -1921,6 +1918,15 @@ async function startServer() {
   await listen();
   // A process waiting for the port must leave the live server's database alone.
   initializeState();
+  if (restartHandoff) {
+    if (!process.connected) throw Error('ขาดการเชื่อมต่อกับ Relay ตัวเดิมก่อนส่งสัญญาณพร้อม');
+    // Stay closed to requests until the parent accepts readiness and releases the IPC channel.
+    await new Promise((resolve, reject) => {
+      process.once('disconnect', resolve);
+      process.send({ type: restartMessages.ready }, error => { if (error) reject(error); });
+    });
+  }
+  acceptingRequests = true;
   console.log('Relay · http://' + host + ':' + port);
   const refreshProviders = () => { void refreshCodex(root); void refreshClaudeCode(root); };
   refreshProviders();
@@ -1931,5 +1937,9 @@ async function startServer() {
 const serverReady = startServer();
 void serverReady.catch(error => {
   console.error('เปิด Relay ไม่สำเร็จ · ' + error.message);
+  if (restartHandoff && process.connected) {
+    process.send({ type: restartMessages.failed, error: error.message }, () => process.exit(1));
+    return;
+  }
   process.exit(1);
 });

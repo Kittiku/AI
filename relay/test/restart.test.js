@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import {
   buildRestartSpawnSpec, busyJobs, createRestartController, defaultSelfUpdateSettings,
-  normalizeSelfUpdateSettings, shouldAutoRestart
+  normalizeSelfUpdateSettings, restartMessages, shouldAutoRestart
 } from '../server/restart.js';
 
 const envFlag = '--env-file-if-exists=.env';
@@ -54,13 +54,23 @@ function setup(options = {}) {
   const finished = Promise.withResolvers();
   const failed = Promise.withResolvers();
   const child = new EventEmitter();
+  child.pid = 123;
+  child.connected = true;
+  child.ready = () => child.emit('message', { type: restartMessages.ready });
+  child.disconnect = () => { child.connected = false; };
+  child.stop = (code, signal) => {
+    child.exitCode = code;
+    child.signalCode = signal;
+    child.emit('exit', code, signal);
+  };
+  child.kill = signal => { calls.push(['kill', signal]); child.stop(null, signal); };
   child.unref = () => calls.push('unref');
   const controller = createRestartController({
     getJobs: () => jobs,
     checkSyntax: () => { calls.push('check'); },
     closeServer: () => { calls.push('close'); },
     reopenServer: () => { calls.push('reopen'); },
-    spawnProcess: () => { calls.push('spawn'); return child; },
+    spawnProcess: () => { calls.push('spawn'); queueMicrotask(child.ready); return child; },
     writeMarker: marker => { calls.push(['marker', marker]); },
     exit: code => { calls.push(['exit', code]); finished.resolve(); },
     onStateChange: state => {
@@ -69,7 +79,7 @@ function setup(options = {}) {
     },
     supervised: false,
     flushMs: 0,
-    verifyChildMs: 5,
+    readyTimeoutMs: 500,
     ...options
   });
   return { controller, jobs, calls, changes, child, finished: finished.promise, failed: failed.promise };
@@ -154,6 +164,26 @@ test('a job added during preflight keeps Relay waiting', { timeout: 3000 }, asyn
   await finished;
 });
 
+test('a write completed during preflight invalidates that syntax check', { timeout: 3000 }, async () => {
+  const firstCheck = Promise.withResolvers();
+  let checks = 0;
+  const { controller, calls, changes } = setup({
+    checkSyntax() {
+      if (++checks === 1) return firstCheck.promise;
+      throw Error('invalid syntax after merge');
+    }
+  });
+  const restarting = controller.requestRestart();
+  await Promise.resolve();
+  assert.equal(checks, 1);
+  await controller.runWrite(() => assert.equal(controller.getState().status, 'waiting'));
+  firstCheck.resolve();
+  assert.match((await restarting).error, /invalid syntax after merge/);
+  assert.equal(checks, 2);
+  assert.deepEqual(changes.map(state => state.status), ['waiting', 'failed']);
+  assert.deepEqual(calls, []);
+});
+
 test('a job added while flushing the response defers server closure', { timeout: 3000 }, async () => {
   const waiting = Promise.withResolvers();
   const { controller, jobs, calls } = setup({
@@ -185,9 +215,11 @@ for (const supervised of [false, true]) {
         assert.deepEqual(args, buildRestartSpawnSpec().args);
         assert.equal(options.cwd, process.cwd());
         assert.equal(options.env.RELAY_NO_BROWSER, '1');
+        assert.equal(options.env.RELAY_RESTART_HANDOFF, '1');
         assert.equal(options.detached, true);
         assert.equal(options.windowsHide, false);
-        assert.equal(options.stdio, 'inherit');
+        assert.deepEqual(options.stdio, ['inherit', 'inherit', 'inherit', 'ipc']);
+        queueMicrotask(child.ready);
         return child;
       }
     });
@@ -239,7 +271,13 @@ for (const [name, event, args, error] of [
     const { controller, failed, calls, child } = setup({
       spawnProcess() {
         calls.push('spawn');
-        queueMicrotask(() => child.emit(event, ...args));
+        queueMicrotask(() => {
+          if (event === 'exit') child.stop(...args);
+          else {
+            child.pid = undefined;
+            child.emit(event, ...args);
+          }
+        });
         return child;
       },
       async reopenServer() {
@@ -257,6 +295,44 @@ for (const [name, event, args, error] of [
     assert.deepEqual(calls, ['check', 'close', 'spawn', 'reopen']);
     assert.equal(child.listenerCount('exit'), 0);
     assert.equal(child.listenerCount('error'), 0);
+  });
+}
+
+test('a live replacement must signal readiness before the original process exits', { timeout: 3000 }, async () => {
+  const spawned = Promise.withResolvers();
+  const { controller, calls, child, finished } = setup({
+    spawnProcess() { spawned.resolve(); return child; }
+  });
+  await controller.requestRestart();
+  await spawned.promise;
+  child.emit('message', { type: 'unrelated' });
+  await delay(20);
+  assert.deepEqual(calls, ['check', 'close']);
+  assert.equal(child.connected, true);
+  child.ready();
+  await finished;
+  assert.equal(child.connected, false);
+  assert.deepEqual(calls, ['check', 'close', 'unref', ['exit', 0]]);
+});
+
+for (const startupError of [null, 'SQLite could not open']) {
+  test(`a replacement that ${startupError ? 'reports a startup error' : 'times out'} must exit before recovery`, { timeout: 3000 }, async () => {
+    const spawned = Promise.withResolvers();
+    const killed = Promise.withResolvers();
+    const { controller, calls, child, failed } = setup({
+      readyTimeoutMs: startupError ? 500 : 20,
+      spawnProcess() { spawned.resolve(); return child; }
+    });
+    child.kill = signal => killed.resolve(signal);
+    await controller.requestRestart();
+    await spawned.promise;
+    if (startupError) child.emit('message', { type: restartMessages.failed, error: startupError });
+    assert.equal(await killed.promise, 'SIGKILL');
+    assert.equal(controller.getState().status, 'restarting');
+    assert.deepEqual(calls, ['check', 'close']);
+    child.stop(null, 'SIGKILL');
+    assert.match((await failed).error, startupError ? /SQLite could not open/ : /หมดเวลา/);
+    assert.deepEqual(calls, ['check', 'close', 'reopen']);
   });
 }
 
@@ -314,9 +390,13 @@ test('the restart API reports boot and queue state and restores HTTP, SSE and SQ
   `);
   const gitUrl = inlineModule(`
     export * from ${JSON.stringify(new URL('git.js', serverDir).href)};
+    export const gitFixture = {};
     export async function git(_cwd, command, ...args) {
       switch (command) {
-        case 'rev-parse': return args.includes('--abbrev-ref') ? 'main' : 'commit';
+        case 'rev-parse':
+          if (!args.includes('--abbrev-ref')) return 'commit';
+          await gitFixture.beforeMergeCheck?.();
+          return 'main';
         case 'status': case 'merge-base': return '';
         case 'diff': return args.includes('--name-only') ? 'relay/server/index.js\\0' : '';
         default: throw Error('Unexpected git command: ' + command);
@@ -326,10 +406,10 @@ test('the restart API reports boot and queue state and restores HTTP, SSE and SQ
   const controllerUrl = inlineModule(`
     export * from ${JSON.stringify(new URL('restart.js', serverDir).href)};
     import { createRestartController as create } from ${JSON.stringify(new URL('restart.js', serverDir).href)};
-    export const fake = { ready: false };
+    export const fake = { ready: false, checks: 0 };
     export function createRestartController(options) {
       return create({ ...options, flushMs: 800,
-        checkSyntax: () => { if (!fake.ready) throw Error('test preflight failure'); },
+        checkSyntax: () => { fake.checks++; if (!fake.ready) throw Error('test preflight failure'); },
         writeMarker: (...args) => fake.writeMarker(...args),
         exit: () => { throw Error('Unexpected exit'); }
       });
@@ -473,6 +553,37 @@ test('the restart API reports boot and queue state and restores HTTP, SSE and SQ
   assert.equal(manualFailure.body.error, manualFailure.body.restart.error);
   assert.equal(manualFailure.body.restart.source, 'manual');
   assert.equal((await request(restartPath + '/cancel', 'POST')).body.restart.status, 'idle');
+
+  const { gitFixture } = await import(gitUrl);
+  const mergeEntered = Promise.withResolvers();
+  const finishMerge = Promise.withResolvers();
+  gitFixture.beforeMergeCheck = () => {
+    mergeEntered.resolve();
+    return finishMerge.promise;
+  };
+  fake.ready = true;
+  const mergeInFlight = request('/api/jobs/merged/merge', 'POST', { target: 'main' });
+  await mergeEntered.promise;
+  const priorChecks = fake.checks;
+  try {
+    const waitingForMerge = await request(restartPath, 'POST');
+    assert.equal(waitingForMerge.status, 202);
+    assert.equal(waitingForMerge.body.restart.status, 'waiting');
+    assert.equal(waitingForMerge.body.restart.busyCount, 0);
+    assert.equal((await request('/api/health')).body.restart.status, 'waiting');
+    assert.equal(fake.checks, priorChecks);
+    await nextSnapshot(value => value.status === 'waiting' && value.busyCount === 0);
+  } finally {
+    fake.ready = false;
+    finishMerge.resolve();
+  }
+  assert.equal((await mergeInFlight).status, 200);
+  const postMergeFailure = await nextSnapshot(value => value.status !== 'waiting');
+  assert.equal(postMergeFailure.status, 'failed');
+  assert.match(postMergeFailure.error, /test preflight failure/);
+  assert.equal(fake.checks, priorChecks + 1);
+  assert.equal((await request('/api/health')).body.bootId, server.bootId);
+  assert.equal(opened.length, 1);
 
   fake.ready = true;
   fake.writeMarker = marker => {
