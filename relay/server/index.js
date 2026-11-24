@@ -931,8 +931,9 @@ function planContext(job, original) {
   return JSON.stringify({ project: projectMemory(job), repo: JSON.parse(original) });
 }
 
-async function changedFileNames(cwd, from, to) {
-  const output = await git(cwd, 'diff', '--no-ext-diff', '--name-only', '-z', from, to, '--').catch(() => null);
+async function changedFileNames(cwd, from, to, { includeRenameSources = false } = {}) {
+  const renameOptions = includeRenameSources ? ['--no-renames'] : [];
+  const output = await git(cwd, 'diff', '--no-ext-diff', '--name-only', ...renameOptions, '-z', from, to, '--').catch(() => null);
   return output === null ? null : output.split('\0').filter(Boolean);
 }
 
@@ -1807,7 +1808,9 @@ async function rebuildSelf(job, from, to) {
   const relative = path.relative(path.resolve(job.repo), path.resolve(root));
   if (relative.startsWith('..') || path.isAbsolute(relative)) return null;
   const prefix = relative ? relative.split(path.sep).join('/') + '/' : '';
-  const changed = (await changedFileNames(job.repo, from, to) ?? []).filter(name => name.startsWith(prefix)).map(name => name.slice(prefix.length));
+  // List moves as a deletion and an addition so moving a file out of Relay still counts.
+  const changed = (await changedFileNames(job.repo, from, to, { includeRenameSources: true }) ?? [])
+    .filter(name => name.startsWith(prefix)).map(name => name.slice(prefix.length));
   const ui = changed.some(name => /^(src\/|public\/|index\.html$|vite\.config\.)/.test(name));
   const restart = changed.some(name => /^(server\/|mcp\/)/.test(name));
   const dependencies = changed.includes('package.json') || changed.includes('package-lock.json');

@@ -395,7 +395,11 @@ test('the restart API reports boot and queue state and restores HTTP, SSE and SQ
   `);
   const gitUrl = inlineModule(`
     export * from ${JSON.stringify(new URL('git.js', serverDir).href)};
-    export const gitFixture = {};
+    export const gitFixture = { renameSource: 'relay/server/index.js' };
+    export async function worktreePaths() {
+      await gitFixture.beforeCleanup?.();
+      return [];
+    }
     export async function git(_cwd, command, ...args) {
       switch (command) {
         case 'rev-parse':
@@ -408,8 +412,9 @@ test('the restart API reports boot and queue state and restores HTTP, SSE and SQ
         case 'diff':
           if (!args.includes('--name-only')) return '';
           if (args.includes('docs-tip') || args.includes('HEAD...relay/docs')) return 'relay/README.md\\0';
-          return 'relay/server/index.js\\0';
-        case 'worktree': return (await gitFixture.beforeCleanup?.()) ?? '';
+          // With rename detection, --name-only reports only the destination.
+          const destination = 'archive/old-relay.js\\0';
+          return args.includes('--no-renames') ? gitFixture.renameSource + '\\0' + destination : destination;
         default: throw Error('Unexpected git command: ' + command);
       }
     }
@@ -555,6 +560,7 @@ test('the restart API reports boot and queue state and restores HTTP, SSE and SQ
   assert.equal(cancelled.body.restart.status, 'idle');
   const merged = await request('/api/jobs/merged/merge', 'POST', { target: 'main' });
   assert.equal(merged.status, 200);
+  assert.equal(merged.body.selfUpdate?.restart, true);
   assert.ok(merged.body.selfUpdate.at >= server.startedAt);
   assert.equal(merged.body.selfUpdate.restarted, undefined);
   const automatic = await nextSnapshot(value => value.source === 'auto');
@@ -575,6 +581,7 @@ test('the restart API reports boot and queue state and restores HTTP, SSE and SQ
   assert.equal((await request(restartPath + '/cancel', 'POST')).body.restart.status, 'idle');
 
   const { gitFixture } = await import(gitUrl);
+  gitFixture.renameSource = 'relay/mcp/server.js';
   const cleanupEntered = Promise.withResolvers();
   const finishCleanup = Promise.withResolvers();
   gitFixture.beforeCleanup = () => {
