@@ -13,7 +13,10 @@ import { openStore } from './store.js';
 import { PROFILES, rank } from './router.js';
 import { closeMonitorStages, createMonitor, liveStage, monitorFiles, recordMonitor } from './monitor.js';
 import { cardToJob, outOfScope, taskCardSchema, validateCard } from './cards.js';
-import { NO_WORK_NOTE, isNoWorkRole, normalizeSubtasks, normalizeTeamSettings, runSubtaskScheduler, shouldCheckSubtask } from './team.js';
+import {
+  NO_WORK_NOTE, isNoWorkRole, mergeCardSubtasks, normalizeSubtasks, normalizeTeamSettings,
+  preferredSubtaskProvider, runSubtaskScheduler, shouldCheckSubtask, shouldRunSubtasks
+} from './team.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const dataDir = path.resolve(process.env.RELAY_DATA_DIR || path.join(root, '.relay'));
@@ -188,7 +191,7 @@ function autoCandidates(role, settings, job, values, now, options = {}, stats = 
   }
   const implementers = new Set(job ? ['backend', 'frontend'].map(key => job.stages?.[key]?.provider).filter(provider => Object.hasOwn(names, provider)) : []);
   if (options.implementer) implementers.add(options.implementer);
-  const wanted = wantedProvider(job, role);
+  const wanted = wantedProvider(job, role, options.subtask);
   const pinned = wanted && ready.includes(wanted) ? wanted : null;
   const ranking = rank({ role, candidates: ready, quotas: values, settings, stats,
     context: { implementers, siblings, pinned }, now });
@@ -200,18 +203,18 @@ function autoCandidates(role, settings, job, values, now, options = {}, stats = 
   return list;
 }
 
-// The AI the user picked for an extra fix round wins for the implementer roles; otherwise the Task Card's pin.
-function wantedProvider(job, role) {
+// An extra fix round has its own provider choice. Subtask edits can override their role's Task Card pin.
+function wantedProvider(job, role, subtask) {
   const fix = job?.fixRequest?.provider;
   if (fix && ['backend', 'frontend'].includes(role)) return fix;
-  return job?.pinned?.[role] || null;
+  return preferredSubtaskProvider(subtask, job?.pinned?.[role]);
 }
 
-function routeCandidates(role, settings, job, options) {
+function routeCandidates(role, settings, job, options = {}) {
   const now = Date.now();
   const values = publicQuotas();
   if (settings.routing?.mode === 'auto') return autoCandidates(role, settings, job, values, now, options);
-  const preferred = wantedProvider(job, role);
+  const preferred = wantedProvider(job, role, options.subtask);
   const configured = [...new Set([...(preferred ? [preferred] : []), ...settings.routes[role]])].filter(provider => Object.hasOwn(names, provider));
   const order = [...new Set([...configured, ...(settings.auto?.allProviders ? Object.keys(names) : [])])];
   return order.map(provider => ({ provider, extra: !configured.includes(provider), ...providerStatus(provider, role, settings, values, now) }));
@@ -261,7 +264,9 @@ async function callCore(job, role, cwd, task, context, schema, signal, accept, o
   const stageFail = () => { if (!quiet) failStage(job, role); };
   if (!options.edit && !quiet) beginStage(job, role, action, job.branch, round);
   if (role === 'review' || !publicQuotas().codex.ready) await refreshCodex(root);
-  if ((job.settings.routing?.mode === 'auto' || job.settings.auto?.allProviders || job.settings.routes[role].includes('claudecode')) && !publicQuotas().claudecode.ready) await refreshClaudeCode(root);
+  const wanted = wantedProvider(job, role, options.subtask);
+  if ((wanted === 'claudecode' || job.settings.routing?.mode === 'auto' || job.settings.auto?.allProviders ||
+    job.settings.routes[role].includes('claudecode')) && !publicQuotas().claudecode.ready) await refreshClaudeCode(root);
   let lastError;
   let contextError;
   const contextSkips = new Map();
@@ -331,6 +336,7 @@ async function callCore(job, role, cwd, task, context, schema, signal, accept, o
     signal.throwIfAborted();
     entry.attempts.push(provider);
     entry.chosen = provider;
+    options.onProvider?.(provider);
     if (candidate.row) {
       if (contextSkips.size) inflight.get(job.id)?.set(routeKey, provider);
       const fallback = 'ลองใช้ ' + names[provider] + ' ต่อ (อันดับ ' + candidate.row.rank + ')';
@@ -341,7 +347,7 @@ async function callCore(job, role, cwd, task, context, schema, signal, accept, o
     const startedAt = Date.now();
     stageSet({ status: 'running', provider, startedAt, endedAt: null, waitUntil: null, round });
     stageTrack({ status: 'running', action, provider, startedAt, endedAt: null, waitUntil: null, changedFiles: null },
-      (candidate.row ? candidate.row.rank === 1 : provider === job.settings.routes[role][0]) ? 'started' : 'provider_fallback');
+      (candidate.row ? candidate.row.rank === 1 : provider === (options.subtask?.prefer ?? job.settings.routes[role][0])) ? 'started' : 'provider_fallback');
     const step = store.startStep({ jobId: job.id, role, provider, round });
     let day;
     try {
@@ -737,6 +743,9 @@ async function work(job, signal) {
   signal.throwIfAborted();
   finishStage(job, 'prepare', 'done');
   if (job.plan) {
+    if (job.cardSubtasks && !job.plan.subtasksFromCard) {
+      job.plan = mergeCardSubtasks(job.plan, job.cardSubtasks, job.settings.team?.maxSubtasks);
+    }
     addEvent(job, roles.plan, resuming ? 'ใช้แผนที่ทำไว้แล้ว' : 'ใช้แผนจากงานเดิม ไม่เรียก AI ซ้ำ');
     if (job.stages?.plan?.status !== 'done') setStage(job, 'plan', { status: 'done', provider: 'reused', startedAt: Date.now(), endedAt: Date.now() });
     if (job.monitor?.stages.plan?.status !== 'done') {
@@ -864,6 +873,10 @@ async function work(job, signal) {
 function teamPlanText(job) {
   const team = job.settings.team || defaults.team;
   const noWork = '\nFor any role with no work, use "none" as its description and empty lists for its files and subtasks.';
+  if (job.cardSubtasks?.backend?.length || job.cardSubtasks?.frontend?.length) {
+    return noWork + '\nThe Task Card supplies the implementation subtasks in its Subtasks section. Its role assignments take precedence when writing the role descriptions and file lists.' +
+      ' Define the shared contract and acceptance criteria and rate complexity as usual. Leave backendTasks and frontendTasks empty because Relay fills them from the card, including after revisions.';
+  }
   if (team.mode === 'off') return noWork + ' Set complexity honestly and leave backendTasks and frontendTasks empty.';
   return noWork + '\nRate complexity: "simple" (a small change one implementer finishes in one pass), "medium" or "hard" (several distinct pieces of work).' +
     ' For simple tasks leave backendTasks and frontendTasks empty.' +
@@ -874,8 +887,9 @@ function teamPlanText(job) {
 }
 
 async function makePlan(job, cwd, original, signal, prompt) {
-  job.plan = await call(job, 'plan', cwd, prompt + teamPlanText(job), planContext(job, original), planSchema, signal);
+  const plan = await call(job, 'plan', cwd, prompt + teamPlanText(job), planContext(job, original), planSchema, signal);
   signal.throwIfAborted();
+  job.plan = mergeCardSubtasks(plan, job.cardSubtasks, job.settings.team?.maxSubtasks);
   finishRole(job, 'plan');
 }
 
@@ -889,7 +903,7 @@ async function changedFileNames(cwd, from, to) {
 }
 
 async function editOn(job, role, cwd, tracked, signal, {
-  branch, message, action = 'implement', prompt = '', context = {}, findingsText = '', onOutput, routeKey
+  branch, message, action = 'implement', prompt = '', context = {}, findingsText = '', onOutput, onProvider, routeKey
 }) {
   const quiet = Boolean(routeKey);
   if (!quiet) {
@@ -905,7 +919,8 @@ async function editOn(job, role, cwd, tracked, signal, {
     { plan: job.plan, project: projectMemory(job), ...context }, requiredFiles, priorChanges ?? []);
   const output = await call(job, role, cwd, ({ write }) => (write ? agentEditPrompt(job, role) : editPrompt(role) + scopeText(job)) + prompt,
     normalContext, editSchema, signal,
-    (response, attempt) => checkEdits(job, cwd, response, attempt), { edit: true, action, geminiCliContext, quiet, routeKey });
+    (response, attempt) => checkEdits(job, cwd, response, attempt),
+    { edit: true, action, geminiCliContext, quiet, routeKey, subtask: context.subtask, onProvider });
   signal.throwIfAborted();
   onOutput?.(output);
   await applyOutput(cwd, output);
@@ -923,12 +938,11 @@ async function editOn(job, role, cwd, tracked, signal, {
   return tip;
 }
 
-// The subtasks a role's lead planned, when team mode applies to this job; null means one implementer does the whole role.
+// Return the role's runnable subtasks, or null for a whole-role edit.
 function subtasksFor(job, role) {
   const settings = job.settings.team || defaults.team;
-  if (settings.mode === 'off' || job.plan?.complexity === 'simple') return null;
   const planned = job.plan?.[role + 'Tasks'];
-  if (!Array.isArray(planned)) return null;
+  if (!Array.isArray(planned) || !shouldRunSubtasks(job.plan, settings, planned.length)) return null;
   const selected = planned.map((task, index) => ({ task, number: index + 1 }))
     .filter(({ task }) => task?.title && task?.goal).slice(0, settings.maxSubtasks);
   const numbers = new Map(selected.map(({ number }, index) => [number, index + 1]));
@@ -945,7 +959,7 @@ function subtasksFor(job, role) {
     }
     return { ...task, dependsOn: dependencies.map(dependency => numbers.get(dependency)) };
   });
-  return tasks.length < 2 ? null : normalizeSubtasks(tasks);
+  return shouldRunSubtasks(job.plan, settings, tasks.length) ? normalizeSubtasks(tasks) : null;
 }
 
 const subtaskCheckPrompt = parallel => 'You are the lead of this role. Check one finished subtask' + (parallel ? '' : ' before the next one starts') +
@@ -957,16 +971,19 @@ async function runTeam(job, role, cwd, branch, tracked, signal, tasks) {
   const parallel = settings.parallel > 1;
   const checking = shouldCheckSubtask(settings.check, job.plan?.complexity);
   const prerequisites = new Set(tasks.flatMap(task => task.dependsOn));
+  const preferences = [...new Set(tasks.map(task => task.prefer))];
   const done = [];
   let lastProvider = null;
   const temporary = new Map();
   job.team ??= {};
   const items = job.team[role] = tasks.map((task, index) => ({
     id: index + 1, title: String(task.title).slice(0, 160), goal: String(task.goal).slice(0, 2000),
-    files: (task.files || []).slice(0, 30), acceptance: String(task.acceptance).slice(0, 1000),
-    dependsOn: task.dependsOn, waitingOn: [], status: 'pending', provider: null, checker: null, summary: '', check: '', fixes: 0
+    files: (task.files || []).slice(0, job.plan.subtasksFromCard ? 50 : 30), acceptance: String(task.acceptance).slice(0, 1000),
+    dependsOn: task.dependsOn, prefer: task.prefer ?? null, waitingOn: [], status: 'pending',
+    provider: null, checker: null, summary: '', check: '', fixes: 0
   }));
-  addEvent(job, roles[role], 'หัวหน้าแบ่งงานเป็น ' + items.length + ' งานย่อย: ' + items.map(item => item.id + '. ' + item.title).join(' · '));
+  const source = job.plan.subtasksFromCard ? 'ใช้รายการจาก Task Card จำนวน ' : 'หัวหน้าแบ่งงานเป็น ';
+  addEvent(job, roles[role], source + items.length + ' งานย่อย: ' + items.map(item => item.id + '. ' + item.title).join(' · '));
 
   try {
     if (parallel) {
@@ -975,7 +992,18 @@ async function runTeam(job, role, cwd, branch, tracked, signal, tasks) {
     }
     await runSubtaskScheduler({
       tasks, teamParallel: settings.parallel,
-      availableProviders: () => routeCandidates(role, job.settings, job).filter(item => !item.blocked).length,
+      availableProviders: () => {
+        if (job.settings.routing?.mode === 'auto') {
+          return routeCandidates(role, job.settings, job).filter(item => !item.blocked).length;
+        }
+        const available = new Set();
+        for (const prefer of preferences) {
+          for (const candidate of routeCandidates(role, job.settings, job, { subtask: { prefer } })) {
+            if (!candidate.blocked) available.add(candidate.provider);
+          }
+        }
+        return available.size;
+      },
       signal,
       onWaiting(_task, waitingOn, number) {
         Object.assign(items[number - 1], { status: waitingOn.length ? 'waiting' : 'pending', waitingOn });
@@ -983,14 +1011,21 @@ async function runTeam(job, role, cwd, branch, tracked, signal, tasks) {
       },
       async runSubtask(_task, number) {
         if (!parallel) return executeOnRoleBranch(number);
+        const item = items[number - 1];
         const subtaskCwd = path.join(path.dirname(cwd), role + '-subtask-' + number);
-        temporary.set(number, subtaskCwd);
-        const start = await git(cwd, 'rev-parse', 'HEAD');
-        signal.throwIfAborted();
-        // A detached HEAD holds the subtask's commits until merge and leaves no temporary branch ref.
-        await git(job.repo, 'worktree', 'add', '--detach', subtaskCwd, start);
-        await linkDependencies(job, subtaskCwd);
-        return execute(items[number - 1], subtaskCwd);
+        try {
+          const start = await git(cwd, 'rev-parse', 'HEAD');
+          signal.throwIfAborted();
+          // A detached HEAD holds the subtask's commits until merge and leaves no temporary branch ref.
+          await git(job.repo, 'worktree', 'add', '--detach', subtaskCwd, start);
+          temporary.set(number, subtaskCwd);
+          await linkDependencies(job, subtaskCwd);
+        } catch (error) {
+          item.status = signal.aborted ? 'cancelled' : 'failed';
+          save();
+          throw error;
+        }
+        return execute(item, subtaskCwd);
       },
       async mergeSubtask(_task, tip, number) {
         const outcome = tip ? await mergeWorktree(cwd, tip) : { conflict: false };
@@ -1016,7 +1051,9 @@ async function runTeam(job, role, cwd, branch, tracked, signal, tasks) {
     return head === job.base ? null : head;
   } catch (error) {
     for (const item of items) {
-      if (item.status === 'waiting') item.status = signal.aborted ? 'cancelled' : 'pending';
+      if (item.status === 'waiting' || (signal.aborted && item.status === 'pending')) {
+        item.status = signal.aborted ? 'cancelled' : 'pending';
+      }
       item.waitingOn = [];
     }
     save();
@@ -1041,30 +1078,36 @@ async function runTeam(job, role, cwd, branch, tracked, signal, tasks) {
   }
 
   async function execute(item, worktree) {
-    signal.throwIfAborted();
-    checkDeadline(job);
     const label = item.id + '/' + items.length;
     const brief = {
       subtask: { number: item.id, of: items.length, title: item.title, goal: item.goal, files: item.files, acceptance: item.acceptance,
-        ...(parallel || item.dependsOn.length ? { dependsOn: item.dependsOn } : {}) },
+        ...(parallel || item.dependsOn.length ? { dependsOn: item.dependsOn } : {}), ...(item.prefer ? { prefer: item.prefer } : {}) },
       finishedSubtasks: done.slice()
     };
     const instructions = worktree !== cwd
       ? ' Do only this subtask. The current code includes the subtasks it depends on. Other independent subtasks may run concurrently.'
       : ' Do only this subtask. The current code includes the finished subtasks listed in the context.';
-    const subtaskPrompt = '\nThis is subtask ' + label + ' of your role: ' + item.title + '.' + instructions + ' Goal: ' + item.goal + '\nAcceptance: ' + item.acceptance;
-    const startCommit = await git(worktree, 'rev-parse', 'HEAD');
+    const integratedNote = branch === job.branch ? ' Apply your changes on top of the other role’s work already in this branch.' : '';
+    const subtaskPrompt = '\nThis is subtask ' + label + ' of your role: ' + item.title + '.' + instructions + integratedNote +
+      ' Goal: ' + item.goal + '\nAcceptance: ' + item.acceptance;
     const routeKey = parallel ? Symbol('subtask ' + role + ' ' + item.id) : undefined;
-    Object.assign(item, { status: 'running', waitingOn: [], provider: null, checker: null, summary: '', check: '', fixes: 0 });
-    save();
+    const onProvider = provider => {
+      if (item.provider === provider) return;
+      item.provider = provider;
+      save();
+    };
     try {
+      signal.throwIfAborted();
+      checkDeadline(job);
+      const startCommit = await git(worktree, 'rev-parse', 'HEAD');
+      Object.assign(item, { status: 'running', waitingOn: [], provider: null, checker: null, summary: '', check: '', fixes: 0 });
+      save();
       let output;
       let tip = await editOn(job, role, worktree, tracked, signal, {
         branch, action: 'subtask', prompt: subtaskPrompt, context: brief, findingsText: [item.goal, ...item.files].join('\n'),
         message: ('Relay: ' + role + ' ' + label + ' ' + item.title).slice(0, 200),
-        onOutput: value => { output = value; }, routeKey
+        onOutput: value => { output = value; }, onProvider, routeKey
       });
-      item.provider = output[PROVIDER];
       item.summary = String(output.summary || '').slice(0, 600);
       let diff = await git(worktree, 'diff', '--no-ext-diff', startCommit, 'HEAD', '--');
       if (!diff.trim()) {
@@ -1074,14 +1117,13 @@ async function runTeam(job, role, cwd, branch, tracked, signal, tasks) {
         item.status = 'passed';
       } else {
         const checkLabel = 'ตรวจงานย่อย ' + roles[role] + ' ' + label;
-        let implementer = item.provider;
         for (;;) {
           item.status = 'checking';
           save();
           const verdict = await call(job, 'review', worktree, subtaskCheckPrompt(parallel),
             JSON.stringify({ ...brief, contract: job.plan?.contract, diff: diff.slice(0, 60_000) }),
             subtaskCheckSchema, signal, null,
-            { quiet: true, label: checkLabel, action: 'check_subtask', routeKey, implementer: parallel ? implementer : null });
+            { quiet: true, label: checkLabel, action: 'check_subtask', routeKey, implementer: parallel ? item.provider : null });
           signal.throwIfAborted();
           item.checker = verdict[PROVIDER];
           item.check = String(verdict.summary || '').slice(0, 600);
@@ -1102,7 +1144,7 @@ async function runTeam(job, role, cwd, branch, tracked, signal, tasks) {
           const fixTip = await editOn(job, role, worktree, tracked, signal, {
             branch, action: 'fix_subtask', prompt: subtaskPrompt + '\nThe lead checked this subtask and found these problems. Fix only them:\n- ' + verdict.problems.join('\n- '),
             context: { ...brief, problems: verdict.problems }, findingsText: verdict.problems.join('\n'), routeKey,
-            message: ('Relay: ' + role + ' ' + label + ' fixes').slice(0, 200), onOutput: value => { implementer = value[PROVIDER]; }
+            message: ('Relay: ' + role + ' ' + label + ' fixes').slice(0, 200), onProvider
           });
           tip = fixTip || tip;
           diff = await git(worktree, 'diff', '--no-ext-diff', startCommit, 'HEAD', '--');
@@ -1140,7 +1182,9 @@ async function build(job, signal, workRoot, integrated, tracked) {
   const order = job.single ? ['backend'] : ['backend', 'frontend'];
   // Validate both role plans before either role starts implementation.
   const roleTasks = order.map(role => subtasksFor(job, role));
+  const hadSubtasks = job.team?.backend?.length || job.team?.frontend?.length;
   job.team = {};
+  if (hadSubtasks) save();
   if (job.single) skipRole(job, 'frontend', isNoWorkRole(job.plan, 'frontend') ? NO_WORK_NOTE : 'งานประเภทนี้ใช้ AI ลงมือทำตัวเดียว');
   const results = await Promise.allSettled(order.map(async (role, index) => {
     signal.throwIfAborted();
@@ -1197,10 +1241,14 @@ async function build(job, signal, workRoot, integrated, tracked) {
     }
     if (conflict) {
       addEvent(job, 'รวมงาน', roles[role] + ' แก้ไฟล์ชนกับอีกส่วน ให้ AI ทำส่วนนี้ใหม่บนโค้ดที่รวมแล้ว');
-      await editOn(job, role, integrated, tracked, signal, {
-        branch: job.branch, prompt: ' The other role has already changed some of the same files. Apply your part on top of the current file contents.',
-        message: 'Relay: ' + role + ' (re-applied after conflict)'
-      });
+      if (job.plan?.subtasksFromCard && roleTasks[index]) {
+        await runTeam(job, role, integrated, job.branch, tracked, signal, roleTasks[index]);
+      } else {
+        await editOn(job, role, integrated, tracked, signal, {
+          branch: job.branch, prompt: ' The other role has already changed some of the same files. Apply your part on top of the current file contents.',
+          message: 'Relay: ' + role + ' (re-applied after conflict)'
+        });
+      }
     }
   }
   const failure = results.find(result => result.status === 'rejected');
@@ -1294,6 +1342,7 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: '200kb' }));
 app.get('/api/monitor', monitor.json);
 app.get('/api/monitor/events', monitor.events);
+app.get('/api/monitor/jobs/:id', monitor.jobJson);
 app.get('/api/jobs/:id/monitor', monitor.jobJson);
 app.get('/api/state', (_req, res) => res.json({
   ...state, jobs: state.jobs.map(publicJob), usage: undefined, quotas: publicQuotas()
@@ -1309,7 +1358,7 @@ app.post('/api/jobs', async (req, res) => {
 // Task Card intake: validate, resolve the project by saved name or path, then queue a job.
 app.post('/api/cards', async (req, res) => {
   const card = req.body?.card ?? req.body;
-  const problem = validateCard(card);
+  const problem = validateCard(card, { maxSubtasks: state.settings.team?.maxSubtasks });
   if (problem) return res.status(400).json({ error: 'Task Card ไม่ถูกต้อง: ' + problem });
   const project = state.projects.find(item => item.name.toLowerCase() === card.project.trim().toLowerCase() || sameFolder(item.path, card.project.trim()));
   if (!project && !path.isAbsolute(card.project.trim())) {
@@ -1317,8 +1366,9 @@ app.post('/api/cards', async (req, res) => {
   }
   const spec = cardToJob(card, state.settings);
   const job = await createJob({ title: spec.title, prompt: spec.prompt, repo: project?.path || card.project.trim(), routes: state.settings.routing?.mode === 'fixed' ? spec.routes : undefined,
-    runChecks: Boolean(spec.commands.length || project?.checks?.length), extraChecks: spec.commands, maxPrompt: 20_000,
-    pinned: spec.pinned, profile: spec.profile,
+    runChecks: Boolean(spec.commands.length || project?.checks?.length), extraChecks: spec.commands,
+    maxPrompt: spec.cardSubtasks ? spec.prompt.length : 20_000,
+    pinned: spec.pinned, profile: spec.profile, cardSubtasks: spec.cardSubtasks,
     card: { ...card, receivedAt: Date.now() }, budgetUsd: spec.budgetUsd, type: spec.type, scope: spec.scope, approvals: spec.approvals });
   res.status(201).json(publicJob(job));
 });
@@ -1401,16 +1451,16 @@ app.get('/api/routing/preview', (_req, res) => {
 });
 app.get('/api/cards/schema', (_req, res) => res.json(taskCardSchema));
 
-async function createJob({ title, prompt, repo, runChecks, routes, fromJob, extraChecks = [], maxPrompt = 8000, card, budgetUsd, type, scope, approvals, pinned, profile }) {
+async function createJob({ title, prompt, repo, runChecks, routes, fromJob, extraChecks = [], maxPrompt = 8000, card, cardSubtasks, budgetUsd, type, scope, approvals, pinned, profile }) {
   if (type !== undefined && !Object.hasOwn(jobTypes, type)) throw Error('ประเภทงานไม่ถูกต้อง');
   if (approvals !== undefined && (!Array.isArray(approvals) || approvals.some(item => item !== 'after_plan'))) throw Error('จุดอนุมัติไม่ถูกต้อง');
   if (![title, prompt, repo].every(value => typeof value === 'string' && value.trim()) ||
     title.length > 100 || prompt.length > maxPrompt || repo.length > 500) throw Error('กรอกชื่องาน โจทย์ และพาธ Git repo ให้ครบ');
+  const settings = structuredClone(state.settings);
   const { root: repoRoot, base } = await repository(repo.trim());
   const startBranch = await git(repoRoot, 'rev-parse', '--abbrev-ref', 'HEAD').catch(() => 'HEAD');
   if (unsafeRoot(repoRoot)) throw Error('Git repo นี้อยู่ที่ ' + repoRoot + ' ซึ่งเป็นโฟลเดอร์ผู้ใช้หรือ root ของไดรฟ์ เพิ่มโฟลเดอร์งานในหน้าโปรเจกต์เพื่อสร้าง repo แยก');
   const id = randomUUID();
-  const settings = structuredClone(state.settings);
   // An explicit AI table for one job (from the new-job dialog) turns automatic routing off for that job.
   if (routes) { settings.routes = readRoutes(routes); settings.routing = { ...settings.routing, mode: 'fixed' }; }
   if (profile !== undefined && profile !== null) {
@@ -1425,6 +1475,7 @@ async function createJob({ title, prompt, repo, runChecks, routes, fromJob, extr
   const source = typeof fromJob === 'string' && state.jobs.find(item => item.id === fromJob);
   if (source?.plan && source.repo === repoRoot && source.base === base && source.prompt === job.prompt) {
     job.plan = structuredClone(source.plan);
+    cardSubtasks ??= source.cardSubtasks && structuredClone(source.cardSubtasks);
     job.resumedFrom = source.id;
     // Backend and UX/UI already finished on the old branch: continue from there instead of redoing them.
     if (hasIntegratedBuild(source) && (source.worktree || source.branchKept)) {
@@ -1438,6 +1489,10 @@ async function createJob({ title, prompt, repo, runChecks, routes, fromJob, extr
   const commands = [...new Set([...(project?.checks || []), ...extraChecks])];
   if (commands.length) job.checkCommands = commands;
   if (card) { job.card = card; job.source = card.source?.kind || 'card'; }
+  if (cardSubtasks) {
+    job.cardSubtasks = cardSubtasks;
+    if (cardSubtasks.frontend?.length) job.single = false;
+  }
   if (pinned && Object.keys(pinned).length) job.pinned = Object.fromEntries(Object.entries(pinned).filter(([role, provider]) => Object.hasOwn(roles, role) && Object.hasOwn(names, provider)));
   if (budgetUsd !== null && budgetUsd !== undefined) job.budgetUsd = budgetUsd;
   else if (settings.budget?.perJobUsd > 0) job.budgetUsd = settings.budget.perJobUsd;
