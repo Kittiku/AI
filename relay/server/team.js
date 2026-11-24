@@ -15,13 +15,49 @@ export function normalizeTeamSettings(team) {
 }
 
 const emptyList = value => value == null || (Array.isArray(value) && value.length === 0);
+const noWorkDescription = description => typeof description === 'string' &&
+  ['', 'none', 'ไม่มี', 'ไม่มีงาน', 'ไม่มีงานส่วนนี้'].includes(description.trim().toLowerCase());
 
 export function isNoWorkRole(plan, role) {
   if (!plan || typeof plan !== 'object' || Array.isArray(plan) || !['backend', 'frontend'].includes(role)) return false;
-  const description = plan[role] ?? '';
-  return typeof description === 'string' &&
-    ['', 'none', 'ไม่มี', 'ไม่มีงาน', 'ไม่มีงานส่วนนี้'].includes(description.trim().toLowerCase()) &&
+  return noWorkDescription(plan[role] ?? '') &&
     emptyList(plan[role + 'Files']) && emptyList(plan[role + 'Tasks']);
+}
+
+export function mergeCardSubtasks(plan, cardSubtasks, maxSubtasks = 4) {
+  if (!cardSubtasks?.backend?.length && !cardSubtasks?.frontend?.length) return plan;
+
+  const merged = { ...plan, subtasksFromCard: true };
+  for (const role of ['backend', 'frontend']) {
+    const requested = cardSubtasks[role] ?? [];
+    const tasks = requested.slice(0, maxSubtasks);
+    // Preserve dependencies if the cap changes after intake by rejecting a cut prerequisite.
+    for (const [index, task] of tasks.entries()) {
+      const removed = task.dependsOn?.find(number => number > tasks.length && number <= requested.length);
+      if (removed !== undefined) {
+        const label = role === 'backend' ? 'Backend' : 'UX/UI';
+        throw Error(`${label} งานย่อย #${index + 1} ต้องรอ #${removed} แต่ชิ้นที่รอเกินเพดานงานย่อย ${maxSubtasks} ชิ้น`);
+      }
+    }
+    const filesKey = role + 'Files';
+    const plannedFiles = Array.isArray(plan[filesKey]) ? plan[filesKey] : [];
+    merged[role + 'Tasks'] = tasks;
+    merged[filesKey] = [...new Set([...plannedFiles, ...tasks.flatMap(task => task.files ?? [])])];
+    if (tasks.length && noWorkDescription(plan[role] ?? '')) {
+      merged[role] = tasks.map(task => task.goal).join('\n');
+    }
+  }
+  return merged;
+}
+
+export function shouldRunSubtasks(plan, team, taskCount) {
+  if (plan?.subtasksFromCard === true) return taskCount > 0;
+  return team?.mode !== 'off' && plan?.complexity !== 'simple' && taskCount >= 2;
+}
+
+// Use this preference as rank's pin or ahead of the configured manual route.
+export function preferredSubtaskProvider(task, rolePreference = null) {
+  return task?.prefer ?? rolePreference;
 }
 
 export function shouldCheckSubtask(checkMode, complexity) {
