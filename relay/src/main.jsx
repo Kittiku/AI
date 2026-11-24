@@ -753,10 +753,14 @@ function RoutingPreview({ refreshKey }) {
   </div>;
 }
 
-function withTeamDefaults(settings) {
+function withSettingsDefaults(settings) {
   const team = settings.team;
   return {
     ...settings,
+    selfUpdate: {
+      ...settings.selfUpdate,
+      autoRestart: settings.selfUpdate?.autoRestart === true
+    },
     team: {
       ...team,
       mode: team?.mode ?? 'auto',
@@ -768,7 +772,7 @@ function withTeamDefaults(settings) {
 }
 
 function SettingsForm({ initial: storedSettings, changed, quotas, onDirty }) {
-  const initial = withTeamDefaults(storedSettings);
+  const initial = withSettingsDefaults(storedSettings);
   const [draft, setDraft] = useState(initial);
   const [notice, setNotice] = useState(null);
   const [saving, setSaving] = useState(false);
@@ -786,7 +790,7 @@ function SettingsForm({ initial: storedSettings, changed, quotas, onDirty }) {
     try {
       const saved = await api('/settings', 'PUT', draft);
       changed(saved);
-      setDraft(withTeamDefaults(saved));
+      setDraft(withSettingsDefaults(saved));
       setNotice({ text: 'บันทึกการตั้งค่าแล้ว' });
     } catch (error) { setNotice({ text: error.message, error: true }); }
     finally { setSaving(false); }
@@ -795,7 +799,8 @@ function SettingsForm({ initial: storedSettings, changed, quotas, onDirty }) {
   const setRouting = (key, value) => setDraft(current => ({ ...current, routing: { ...routing, [key]: value } }));
   const table = <RouteTable routes={draft.routes} quotas={quotas} label="การมอบหมายงาน" onChange={(role, index, value) => setDraft(current => ({ ...current, routes: updateRoutes(current.routes, role, index, value) }))} />;
   const sections = [['routing', 'การจ่ายงาน', 'Relay เลือก AI ให้แต่ละขั้นอย่างไร'], ['quota', 'โควตาและรอบแก้', 'กันโควตาไว้ใช้รีวิว และจำนวนรอบแก้'],
-    ['edit', 'การแก้โค้ดและอนุมัติ', 'ให้ AI แก้ไฟล์เอง และจุดหยุดรออนุมัติ'], ['budget', 'งบ', 'หยุดรออนุมัติเมื่อถึงงบ'], ['auto', 'ทำงานต่อเนื่อง', 'ลองซ้ำ รอโควตา และเวลาสูงสุด']];
+    ['edit', 'การแก้โค้ดและอนุมัติ', 'ให้ AI แก้ไฟล์เอง และจุดหยุดรออนุมัติ'], ['budget', 'งบ', 'หยุดรออนุมัติเมื่อถึงงบ'],
+    ['auto', 'ทำงานต่อเนื่อง', 'ลองซ้ำ รอโควตา และเวลาสูงสุด'], ['self-update', 'อัปเดต Relay', 'ตั้งค่าการรีสตาร์ทหลัง merge']];
   const show = key => section === key;
   return <form className="settings-layout" onSubmit={submit}>
     <nav className="card settings-nav" aria-label="หมวดการตั้งค่า">{sections.map(([key, label, hint]) =>
@@ -886,6 +891,18 @@ function SettingsForm({ initial: storedSettings, changed, quotas, onDirty }) {
       <label>ลองขั้นที่ล้มใหม่ (ครั้ง)<input type="number" required min="0" max="5" value={draft.auto.retries} onChange={event => setAuto('retries', Number(event.target.value))} /></label>
       <label>เวลาสูงสุดต่องาน (นาที)<input type="number" required min="10" max="1440" value={draft.auto.maxJobMinutes} onChange={event => setAuto('maxJobMinutes', Number(event.target.value))} /></label>
     </div>
+    </> : null}
+    {show('self-update') ? <>
+    <h2>อัปเดต Relay</h2>
+    <label className="checkbox">
+      <input type="checkbox" role="switch" className="settings-switch" checked={draft.selfUpdate.autoRestart}
+        aria-describedby="auto-restart-help" onChange={event => {
+          const autoRestart = event.target.checked;
+          setDraft(current => ({ ...current, selfUpdate: { ...current.selfUpdate, autoRestart } }));
+        }} />
+      รีสตาร์ท Relay อัตโนมัติหลัง merge งานที่แก้ server
+    </label>
+    <p id="auto-restart-help" className="muted">การตั้งค่านี้มีผลกับงานที่แก้ server หรือ MCP และ Relay จะรอให้งานค้างเสร็จทั้งหมดก่อนรีสตาร์ทเสมอ</p>
     </> : null}
     <div className={'form-actions save-bar' + (dirty ? ' dirty' : '')}>
       {notice ? <span role="status" className={notice.error ? 'error' : 'success'}>{notice.text}</span> :
@@ -1157,7 +1174,59 @@ function FixPanel({ job, updated }) {
   </div>;
 }
 
-function JobActions({ job, updated, removed, setError }) {
+function SelfUpdatePanel({ job, restart, onRestartChange }) {
+  const [pending, setPending] = useState(false);
+  const [requestError, setRequestError] = useState('');
+  const { ui, built, dependencies, restarted } = job.selfUpdate;
+  const needsRestart = job.selfUpdate.restart === true && !restarted;
+  const status = restart?.status;
+  const waiting = status === 'waiting';
+  const restarting = status === 'restarting';
+  const failed = status === 'failed';
+
+  async function changeRestart(cancel) {
+    setPending(true);
+    setRequestError('');
+    try {
+      const result = cancel ? await api('/system/restart/cancel', 'POST') :
+        await api('/system/restart', 'POST', { jobId: job.id });
+      onRestartChange(result);
+    } catch (error) {
+      if (error.data?.restart) onRestartChange(error.data);
+      if (!error.data?.restart?.error) setRequestError(error.message);
+    } finally {
+      setPending(false);
+    }
+  }
+
+  return <div className={'self-update' + (built === false || needsRestart || dependencies ? ' warn' : '')}>
+    <strong>อัปเดต Relay</strong>
+    {ui || dependencies ? <ul>
+      {ui ? <li>{built ? <>build หน้าเว็บใหม่แล้ว <button type="button" className="link small" onClick={() => location.reload()}>รีเฟรชหน้านี้</button> เพื่อใช้เวอร์ชันใหม่</> : <>build หน้าเว็บไม่สำเร็จ รัน <code>npm.cmd run build</code> ในโฟลเดอร์ relay เอง</>}</li> : null}
+      {dependencies ? <li>งานนี้แก้ package.json ต้องรัน <code>npm.cmd install</code> ในโฟลเดอร์ relay ก่อน</li> : null}
+    </ul> : null}
+    {restarted ? <p role="status" className="self-update-status success"><Check size={16} aria-hidden="true" />รีสตาร์ท Relay แล้ว</p> : null}
+    {needsRestart ? <>
+      {waiting ? <p role="status" className="self-update-status warn-text"><Clock size={16} aria-hidden="true" />รอให้งานค้างเสร็จก่อนรีสตาร์ท ({restart.busyCount} งาน)</p> : null}
+      {restarting ? <p role="status" className="self-update-status">กำลังรีสตาร์ท Relay…</p> : null}
+      {failed ? <div role="alert" className="error">
+        <TriangleExclamationPoint size={16} aria-hidden="true" />
+        <div>
+          <strong>รีสตาร์ท Relay ไม่สำเร็จ</strong>
+          {restart.error ? <p>{restart.error}</p> : null}
+          <p>ตรวจข้อความในหน้าต่าง <code>start-relay.bat</code> แล้วเปิด Relay เองหากจำเป็น</p>
+        </div>
+      </div> : null}
+      {requestError ? <p role="alert" className="error">{requestError}</p> : null}
+      {!restarting ? <div className="action-row">
+        {waiting ? <Button icon={X} disabled={pending} onClick={() => changeRestart(true)}>ยกเลิกการรอรีสตาร์ท</Button> :
+          <Button primary icon={RotateCcw} disabled={pending} onClick={() => changeRestart(false)}>รีสตาร์ท Relay ตอนนี้</Button>}
+      </div> : null}
+    </> : null}
+  </div>;
+}
+
+function JobActions({ job, restart, onRestartChange, updated, removed, setError }) {
   const [working, setWorking] = useState(false);
   const hasBranch = Boolean(job.worktree || job.branchKept);
   async function run(task) {
@@ -1175,14 +1244,7 @@ function JobActions({ job, updated, removed, setError }) {
       {merged.before !== null ? <><small>ถ้าต้องการย้อน ใช้คำสั่งนี้ จะได้ commit ใหม่ที่ยกเลิกการเปลี่ยนแปลง ประวัติเดิมไม่หาย</small>
         <div className="action-row"><CopyButton text={undoCommand}>คัดลอกคำสั่งย้อน</CopyButton></div></> : null}
     </div> : null}
-    {merged && job.selfUpdate ? <div className={'self-update' + (job.selfUpdate.built === false || job.selfUpdate.restart || job.selfUpdate.dependencies ? ' warn' : '')}>
-      <strong>อัปเดต Relay</strong>
-      <ul>
-        {job.selfUpdate.ui ? <li>{job.selfUpdate.built ? <>build หน้าเว็บใหม่แล้ว <button className="link small" onClick={() => location.reload()}>รีเฟรชหน้านี้</button> เพื่อใช้เวอร์ชันใหม่</> : <>build หน้าเว็บไม่สำเร็จ รัน <code>npm.cmd run build</code> ในโฟลเดอร์ relay เอง</>}</li> : null}
-        {job.selfUpdate.restart ? <li>งานนี้แก้โค้ด server หรือ MCP ต้องรีสตาร์ท Relay (ปิดแล้วเปิด start-relay.bat ใหม่) ตอนที่ไม่มีงานค้าง</li> : null}
-        {job.selfUpdate.dependencies ? <li>งานนี้แก้ package.json ต้องรัน <code>npm.cmd install</code> ในโฟลเดอร์ relay ก่อน</li> : null}
-      </ul>
-    </div> : null}
+    {merged && job.selfUpdate ? <SelfUpdatePanel job={job} restart={restart} onRestartChange={onRestartChange} /> : null}
     {merged && job.status === 'needs_review' ? <div className="fix-panel attention">
       <p className="fix-lead"><Wrench size={15} aria-hidden="true" /> merge แล้วแต่ยังมีปัญหาค้าง ส่งต่อให้ Claude Code แก้บน {merged.into} ได้</p>
       <div className="action-row"><CopyButton text={handoffPrompt(job)}>คัดลอก prompt ให้ Claude Code</CopyButton></div>
@@ -1360,7 +1422,7 @@ function EventItem({ event }) {
   </li>;
 }
 
-function JobDetail({ job, projectName, monitor, approvalRequested, onApproval, onApprovalFocused, back, retry, updated, removed }) {
+function JobDetail({ job, projectName, monitor, restart, onRestartChange, approvalRequested, onApproval, onApprovalFocused, back, retry, updated, removed }) {
   const [tab, setTab] = useState('events');
   const [diff, setDiff] = useState(null);
   const [focus, setFocus] = useState(null);
@@ -1443,7 +1505,8 @@ function JobDetail({ job, projectName, monitor, approvalRequested, onApproval, o
           <ol className="events timeline">{job.events.length ? [...job.events].reverse().map((event, i) => <EventItem key={job.events.length - i} event={event} />) : <li><p>รอเริ่มงาน</p></li>}</ol>}
       </section>
       <aside className="facts-column">
-        {!busy ? <section className="card detail"><JobActions job={job} updated={updated} removed={removed} setError={setError} /></section> : null}
+        {!busy ? <section className="card detail"><JobActions job={job} restart={restart} onRestartChange={onRestartChange}
+          updated={updated} removed={removed} setError={setError} /></section> : null}
         <section className="card detail facts">
           <h2>สรุปงาน</h2>
           {manualChecks.length ? <div className="callout warn"><strong>ต้องตรวจเองหลังส่งมอบ</strong>
@@ -1807,6 +1870,7 @@ function isEditableTarget(node) {
 
 function App() {
   const [data, setData] = useState(null);
+  const restartRevision = useRef(0);
   const monitor = useMonitor();
   const [networkError, setNetworkError] = useState('');
   const [page, setPage] = useState('queue');
@@ -1826,9 +1890,16 @@ function App() {
     const { signal } = controller;
     let timer;
     async function poll() {
+      const revision = restartRevision.current;
       try {
         const next = await readState(signal);
-        if (!signal.aborted) { setData(next); setNetworkError(''); }
+        if (!signal.aborted) {
+          // A state request already in flight may predate the restart action's response.
+          const restartChanged = revision !== restartRevision.current;
+          setData(previous => restartChanged && next.server?.bootId === previous?.server?.bootId
+            ? { ...next, restart: previous?.restart } : next);
+          setNetworkError('');
+        }
       } catch (error) { if (!signal.aborted) setNetworkError(error.message); }
       if (!signal.aborted) timer = window.setTimeout(poll, 2200);
     }
@@ -1866,6 +1937,11 @@ function App() {
   function removeJob(id) {
     setData(previous => ({ ...previous, jobs: previous.jobs.filter(item => item.id !== id) }));
     setSelection(null);
+  }
+  function updateRestart({ server, restart }) {
+    restartRevision.current++;
+    setData(previous => previous && (!previous.server || previous.server.bootId === server?.bootId)
+      ? { ...previous, server: server ?? previous.server, restart } : previous);
   }
   async function refresh() {
     setRefreshing(true);
@@ -1914,7 +1990,8 @@ function App() {
       </header>
       <main>
         {networkError ? <p className="error banner" role="alert">{networkError}</p> : null}
-        {job ? <JobDetail key={job.id} job={job} projectName={projectName} monitor={monitor} approvalRequested={approvalTarget === job.id}
+        {job ? <JobDetail key={job.id} job={job} projectName={projectName} monitor={monitor} restart={data.restart}
+          onRestartChange={updateRestart} approvalRequested={approvalTarget === job.id}
           onApproval={openApproval} onApprovalFocused={() => setApprovalTarget(null)} back={() => open('queue')}
           retry={setDialog} updated={updateJob} removed={removeJob} /> :
           page === 'settings' ? <>
