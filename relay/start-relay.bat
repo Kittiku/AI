@@ -1,5 +1,5 @@
 @echo off
-setlocal
+setlocal EnableExtensions DisableDelayedExpansion
 title Relay
 cd /d "%~dp0"
 
@@ -34,12 +34,38 @@ set "PORT=4782"
 if defined RELAY_PORT set "PORT=%RELAY_PORT%"
 if exist ".env" for /f "usebackq tokens=1,* delims==" %%A in (".env") do if /i "%%A"=="RELAY_PORT" set "PORT=%%B"
 
+set "RELAY_SUPERVISED=1"
+set "RELAY_RESTART_MARKER=%TEMP%\relay-restart-%RANDOM%-%RANDOM%.flag"
+if exist "%RELAY_RESTART_MARKER%\." goto :marker_failed
+if exist "%RELAY_RESTART_MARKER%" del /f /q "%RELAY_RESTART_MARKER%"
+if exist "%RELAY_RESTART_MARKER%" goto :marker_failed
+
 echo [Relay] Starting at http://127.0.0.1:%PORT%  (close this window or press Ctrl+C to stop)
-if not defined RELAY_NO_BROWSER start "" /b powershell -NoProfile -WindowStyle Hidden -Command "Start-Sleep -Seconds 2; Start-Process 'http://127.0.0.1:%PORT%'"
+if not "%RELAY_NO_BROWSER%"=="1" start "" /b powershell -NoProfile -WindowStyle Hidden -Command "Start-Sleep -Seconds 2; Start-Process 'http://127.0.0.1:%PORT%'"
+
+:run
 call npm.cmd start
-echo [Relay] Server stopped.
+set "RELAY_EXIT_CODE=%errorlevel%"
+if not exist "%RELAY_RESTART_MARKER%" goto :stopped
+if exist "%RELAY_RESTART_MARKER%\." goto :marker_failed
+del /f /q "%RELAY_RESTART_MARKER%"
+if exist "%RELAY_RESTART_MARKER%" goto :marker_failed
+echo [Relay] Restarting Relay...
+set "RELAY_NO_BROWSER=1"
+goto :run
+
+:marker_failed
+echo [Relay] Could not clear restart marker "%RELAY_RESTART_MARKER%".
+set "RELAY_EXIT_CODE=1"
+
+:stopped
+if "%RELAY_EXIT_CODE%"=="0" (
+  echo [Relay] Server stopped.
+) else (
+  echo [Relay] Server stopped ^(exit code %RELAY_EXIT_CODE%^).
+)
 pause
-exit /b 0
+exit /b %RELAY_EXIT_CODE%
 
 :failed
 echo [Relay] Setup failed. See the messages above.
