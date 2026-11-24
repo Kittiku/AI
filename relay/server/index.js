@@ -1786,16 +1786,18 @@ app.post('/api/jobs/:id/merge', finishBeforeRestart(async (req, res) => {
   const commit = await git(job.repo, 'rev-parse', 'HEAD');
   job.merged = { at: Date.now(), into: check.target, commit, tip, fastForward: check.fastForward, before: check.alreadyMerged ? null : headBefore };
   addEvent(job, 'Merge', (check.alreadyMerged ? 'branch นี้อยู่ใน ' : 'merge เข้า ') + check.target + ' แล้ว (' + commit.slice(0, 7) + (check.fastForward ? ', fast-forward' : '') + ')');
-  job.selfUpdate = await rebuildSelf(job, check.alreadyMerged ? job.base : headBefore, commit);
+  job.selfUpdate = check.alreadyMerged
+    ? await rebuildSelf(job, job.base, tip)
+    : await rebuildSelf(job, headBefore, commit);
   save();
+  // The tracked merge handler keeps restart waiting until cleanup settles, even if cleanup fails.
+  if (shouldAutoRestart(job.selfUpdate, state.settings)) {
+    void restartController.requestRestart({ source: 'auto', reason: job.title });
+  }
   if (req.body?.cleanup) {
     await cleanup(job, false);
     await git(job.repo, 'branch', '-d', job.branch).then(() => { job.branchKept = false; }).catch(() => {});
     addEvent(job, 'Merge', 'ล้าง worktree และลบ branch ' + job.branch + ' แล้ว');
-  }
-  save();
-  if (shouldAutoRestart(job.selfUpdate, state.settings)) {
-    void restartController.requestRestart({ source: 'auto', reason: job.title });
   }
   res.json(publicJob(job));
 }));

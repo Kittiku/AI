@@ -365,7 +365,11 @@ test('the restart API reports boot and queue state and restores HTTP, SSE and SQ
     export const pacificDay = () => 'test-day', quota = () => ({});
     export const generate = () => { throw Error('Unexpected AI call'); };
   `);
-  const fsUrl = inlineModule("export * from 'node:fs'; export const mkdirSync = () => {}; export const existsSync = () => false;");
+  const fsUrl = inlineModule(`
+    export * from 'node:fs';
+    export const mkdirSync = () => {}, existsSync = () => false;
+    export const rmSync = () => { throw Object.assign(Error('worktree is locked'), { code: 'EBUSY' }); };
+  `);
   const sqliteUrl = inlineModule(`
     import { DatabaseSync as SQLite } from 'node:sqlite';
     export class DatabaseSync extends SQLite { constructor() { super(':memory:'); } }
@@ -382,6 +386,7 @@ test('the restart API reports boot and queue state and restores HTTP, SSE and SQ
         const common = { repo: ${JSON.stringify(repo)}, status: 'complete', events: [], branchKept: true, base: 'base' };
         store.persist({ ...fallback, settings, jobs: [
           { ...common, id: 'merged', title: 'Relay server change', branch: 'relay/merged', selfUpdate: { at: 1, restart: true } },
+          { ...common, id: 'docs', title: 'Docs change', branch: 'relay/docs' },
           { ...common, id: 'ui', title: 'Relay UI change', selfUpdate: { at: 1, ui: true, restart: false } }
         ] });
         return store.load(fallback);
@@ -394,11 +399,17 @@ test('the restart API reports boot and queue state and restores HTTP, SSE and SQ
     export async function git(_cwd, command, ...args) {
       switch (command) {
         case 'rev-parse':
+          if (args[0] === 'relay/docs') return 'docs-tip';
+          if (args[0] === 'relay/merged') return 'server-tip';
           if (!args.includes('--abbrev-ref')) return 'commit';
           await gitFixture.beforeMergeCheck?.();
           return 'main';
         case 'status': case 'merge-base': return '';
-        case 'diff': return args.includes('--name-only') ? 'relay/server/index.js\\0' : '';
+        case 'diff':
+          if (!args.includes('--name-only')) return '';
+          if (args.includes('docs-tip') || args.includes('HEAD...relay/docs')) return 'relay/README.md\\0';
+          return 'relay/server/index.js\\0';
+        case 'worktree': return (await gitFixture.beforeCleanup?.()) ?? '';
         default: throw Error('Unexpected git command: ' + command);
       }
     }
@@ -492,6 +503,15 @@ test('the restart API reports boot and queue state and restores HTTP, SSE and SQ
   assert.deepEqual((await request('/api/settings', 'PUT', oldClientSettings)).body.selfUpdate, { autoRestart: true });
   assert.deepEqual(opened[0].load().settings.selfUpdate, { autoRestart: true });
 
+  // HEAD also contains another job's server change. Recording the docs merge should use the docs tip.
+  const docs = await request('/api/jobs/docs/merge', 'POST', { target: 'main' });
+  assert.equal(docs.status, 200);
+  assert.equal(docs.body.merged.commit, 'commit');
+  assert.equal(docs.body.merged.tip, 'docs-tip');
+  assert.equal(docs.body.selfUpdate, null);
+  assert.deepEqual((await request(restartPath)).body.restart, idle);
+  assert.equal(fake.checks, 0);
+
   const stream = await fetch(base + '/api/monitor/events', { signal: AbortSignal.timeout(9000) });
   assert.match(stream.headers.get('content-type'), /text\/event-stream/);
   const reader = stream.body.getReader();
@@ -555,6 +575,39 @@ test('the restart API reports boot and queue state and restores HTTP, SSE and SQ
   assert.equal((await request(restartPath + '/cancel', 'POST')).body.restart.status, 'idle');
 
   const { gitFixture } = await import(gitUrl);
+  const cleanupEntered = Promise.withResolvers();
+  const finishCleanup = Promise.withResolvers();
+  gitFixture.beforeCleanup = () => {
+    cleanupEntered.resolve();
+    return finishCleanup.promise;
+  };
+  const checksBeforeCleanup = fake.checks;
+  const mergeWithCleanup = request('/api/jobs/merged/merge', 'POST', { target: 'main', cleanup: true });
+  try {
+    await Promise.race([
+      cleanupEntered.promise,
+      mergeWithCleanup.then(() => assert.fail('merge returned before cleanup'))
+    ]);
+    const duringCleanup = (await request(restartPath)).body.restart;
+    assert.equal(duringCleanup.status, 'waiting');
+    assert.equal(duringCleanup.source, 'auto');
+    assert.equal(duringCleanup.busyCount, 0);
+    assert.equal(fake.checks, checksBeforeCleanup);
+    assert.equal(opened[0].load().jobs.find(item => item.id === 'merged').selfUpdate.restart, true);
+  } finally {
+    delete gitFixture.beforeCleanup;
+    finishCleanup.resolve();
+    // Let the request finish even if an assertion above failed.
+    await mergeWithCleanup;
+  }
+  const cleanupFailed = await mergeWithCleanup;
+  assert.equal(cleanupFailed.status, 400);
+  assert.match(cleanupFailed.body.error, /worktree is locked/);
+  const restartAfterCleanup = await nextSnapshot(value => value.status === 'failed' && value.source === 'auto');
+  assert.match(restartAfterCleanup.error, /test preflight failure/);
+  assert.equal(fake.checks, checksBeforeCleanup + 1);
+  assert.equal((await request(restartPath + '/cancel', 'POST')).body.restart.status, 'idle');
+
   const mergeEntered = Promise.withResolvers();
   const finishMerge = Promise.withResolvers();
   gitFixture.beforeMergeCheck = () => {
