@@ -36,7 +36,7 @@ if exist ".env" for /f "usebackq tokens=1,* delims==" %%A in (".env") do if /i "
 
 set "RELAY_SUPERVISED=1"
 set "RELAY_RESTART_MARKER=%TEMP%\relay-restart-%RANDOM%-%RANDOM%.flag"
-if exist "%RELAY_RESTART_MARKER%\." goto :marker_failed
+if exist "%RELAY_RESTART_MARKER%\*" goto :marker_failed
 if exist "%RELAY_RESTART_MARKER%" del /f /q "%RELAY_RESTART_MARKER%"
 if exist "%RELAY_RESTART_MARKER%" goto :marker_failed
 
@@ -47,7 +47,7 @@ if not "%RELAY_NO_BROWSER%"=="1" start "" /b powershell -NoProfile -WindowStyle 
 call npm.cmd start
 set "RELAY_EXIT_CODE=%errorlevel%"
 if not exist "%RELAY_RESTART_MARKER%" goto :stopped
-if exist "%RELAY_RESTART_MARKER%\." goto :marker_failed
+if exist "%RELAY_RESTART_MARKER%\*" goto :marker_failed
 del /f /q "%RELAY_RESTART_MARKER%"
 if exist "%RELAY_RESTART_MARKER%" goto :marker_failed
 echo [Relay] Restarting Relay...
