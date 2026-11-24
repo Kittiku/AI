@@ -4,10 +4,23 @@ import { chmod, lstat, mkdir, readFile, readlink, realpath, rm, rmdir, symlink, 
 import path from 'node:path';
 
 const execute = promisify(execFile);
-export const git = async (cwd, ...args) => (await execute('git', [
+const runGit = (cwd, args) => execute('git', [
   '-c', 'core.hooksPath=' + (process.platform === 'win32' ? 'NUL' : '/dev/null'),
   '-c', 'commit.gpgSign=false', ...args
-], { cwd, timeout: 45_000, maxBuffer: 8 * 1024 * 1024, windowsHide: true })).stdout.trimEnd();
+], { cwd, timeout: 45_000, maxBuffer: 8 * 1024 * 1024, windowsHide: true });
+
+// `git worktree` add/remove/prune/list all read and write the shared .git/worktrees folder. Two at once can make one
+// read the other's half-written entry ("failed to read .git/worktrees/<name>/commondir"), which parallel subtasks hit.
+// They are quick, so Relay runs them one at a time; a failure does not block the next one.
+let worktreeQueue = Promise.resolve();
+function oneWorktreeCommandAtATime(run) {
+  const result = worktreeQueue.then(run);
+  worktreeQueue = result.catch(() => {});
+  return result;
+}
+
+export const git = async (cwd, ...args) =>
+  (await (args[0] === 'worktree' ? oneWorktreeCommandAtATime(() => runGit(cwd, args)) : runGit(cwd, args))).stdout.trimEnd();
 
 // Merge in a Relay worktree. Only a content conflict is eligible for an AI rerun.
 export async function mergeWorktree(cwd, tip) {
