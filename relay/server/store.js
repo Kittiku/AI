@@ -126,5 +126,9 @@ export function openStore(dataDir) {
     return db.prepare('SELECT * FROM steps WHERE job_id = ? ORDER BY id').all(jobId);
   }
 
-  return { load, persist, startStep, finishStep, closeOpenSteps, steps, spendSince, providerStats };
+  function close() {
+    db.close();
+  }
+
+  return { load, persist, startStep, finishStep, closeOpenSteps, steps, spendSince, providerStats, close };
 }

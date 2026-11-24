@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict';
-import { EventEmitter } from 'node:events';
+import { EventEmitter, once } from 'node:events';
+import { createServer } from 'node:net';
+import { registerHooks } from 'node:module';
+import { setTimeout as delay } from 'node:timers/promises';
+import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import {
   buildRestartSpawnSpec, busyJobs, createRestartController, defaultSelfUpdateSettings,
@@ -270,3 +274,244 @@ for (const [name, hook, expected, supervised] of [
     assert.deepEqual(calls, expected);
   });
 }
+
+test('the restart API reports boot and queue state and restores HTTP, SSE and SQLite after a failed restart', { timeout: 10_000 }, async t => {
+  const serverDir = new URL('../server/', import.meta.url);
+  const indexUrl = new URL('index.js?restart-api', serverDir).href;
+  const storeUrl = new URL('store.js?restart-api', serverDir).href;
+  const inlineModule = source => 'data:text/javascript,' + encodeURIComponent(source);
+  const repo = fileURLToPath(new URL('../../', import.meta.url));
+  const providersUrl = inlineModule(`
+    export const names = { claudecode: 'Claude Code', gemini: 'Gemini', codex: 'Codex' };
+    export const USAGE = Symbol('usage');
+    export const editSchema = {}, planSchema = {}, reviewSchema = {}, subtaskCheckSchema = {};
+    export const refreshClaudeCode = async () => {}, refreshCodex = async () => {};
+    export const pacificDay = () => 'test-day', quota = () => ({});
+    export const generate = () => { throw Error('Unexpected AI call'); };
+  `);
+  const fsUrl = inlineModule("export * from 'node:fs'; export const mkdirSync = () => {}; export const existsSync = () => false;");
+  const sqliteUrl = inlineModule(`
+    import { DatabaseSync as SQLite } from 'node:sqlite';
+    export class DatabaseSync extends SQLite { constructor() { super(':memory:'); } }
+  `);
+  const storeFixtureUrl = inlineModule(`
+    import { openStore as open } from ${JSON.stringify(storeUrl)};
+    export const opened = [];
+    export function openStore(dataDir) {
+      const store = open(dataDir);
+      opened.push(store);
+      if (opened.length !== 1) return store;
+      return { ...store, load(fallback) {
+        const { selfUpdate, ...settings } = fallback.settings;
+        const common = { repo: ${JSON.stringify(repo)}, status: 'complete', events: [], branchKept: true, base: 'base' };
+        store.persist({ ...fallback, settings, jobs: [
+          { ...common, id: 'merged', title: 'Relay server change', branch: 'relay/merged', selfUpdate: { at: 1, restart: true } },
+          { ...common, id: 'ui', title: 'Relay UI change', selfUpdate: { at: 1, ui: true, restart: false } }
+        ] });
+        return store.load(fallback);
+      } };
+    }
+  `);
+  const gitUrl = inlineModule(`
+    export * from ${JSON.stringify(new URL('git.js', serverDir).href)};
+    export async function git(_cwd, command, ...args) {
+      switch (command) {
+        case 'rev-parse': return args.includes('--abbrev-ref') ? 'main' : 'commit';
+        case 'status': case 'merge-base': return '';
+        case 'diff': return args.includes('--name-only') ? 'relay/server/index.js\\0' : '';
+        default: throw Error('Unexpected git command: ' + command);
+      }
+    }
+  `);
+  const controllerUrl = inlineModule(`
+    export * from ${JSON.stringify(new URL('restart.js', serverDir).href)};
+    import { createRestartController as create } from ${JSON.stringify(new URL('restart.js', serverDir).href)};
+    export const fake = { ready: false };
+    export function createRestartController(options) {
+      return create({ ...options, flushMs: 800,
+        checkSyntax: () => { if (!fake.ready) throw Error('test preflight failure'); },
+        writeMarker: (...args) => fake.writeMarker(...args),
+        exit: () => { throw Error('Unexpected exit'); }
+      });
+    }
+  `);
+  const hooks = registerHooks({
+    resolve(specifier, context, nextResolve) {
+      const parent = context.parentURL;
+      if (specifier === './providers.js' && parent?.startsWith(serverDir.href)) return nextResolve(providersUrl, context);
+      if (parent === indexUrl) {
+        const mocks = { './store.js': storeFixtureUrl, './restart.js': controllerUrl, './git.js': gitUrl, 'node:fs': fsUrl };
+        if (Object.hasOwn(mocks, specifier)) return nextResolve(mocks[specifier], context);
+      }
+      if (parent === storeUrl && specifier === 'node:sqlite') return nextResolve(sqliteUrl, context);
+      if (parent === storeUrl && specifier === 'node:fs') return nextResolve(fsUrl, context);
+      return nextResolve(specifier, context);
+    },
+    load(url, context, nextLoad) {
+      const loaded = nextLoad(url, context);
+      if (url !== indexUrl) return loaded;
+      return { ...loaded, source: loaded.source.toString() + '\nexport { serverReady, state, save, httpServer, closeServer };' };
+    }
+  });
+  const portHolder = createServer().listen(0, '127.0.0.1');
+  await once(portHolder, 'listening');
+  t.after(() => { if (portHolder.listening) portHolder.close(); });
+  const env = { RELAY_PORT: String(portHolder.address().port), RELAY_SUPERVISED: '1', RELAY_RESTART_MARKER: 'test-marker' };
+  const previous = Object.fromEntries(Object.keys(env).map(key => [key, process.env[key]]));
+  Object.assign(process.env, env);
+  let api;
+  let fake;
+  let opened;
+  try {
+    api = await import(indexUrl);
+    ({ fake } = await import(controllerUrl));
+    ({ opened } = await import(storeFixtureUrl));
+    await delay(150);
+    assert.equal(opened.length, 0, 'a server waiting for the port must not open SQLite');
+    await new Promise(resolve => portHolder.close(resolve));
+    await api.serverReady;
+  } finally {
+    hooks.deregister();
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+  t.after(() => api.closeServer());
+  const base = 'http://127.0.0.1:' + api.httpServer.address().port;
+  async function request(route, method = 'GET', body) {
+    const response = await fetch(base + route, {
+      method, signal: AbortSignal.timeout(2000),
+      ...(body === undefined ? {} : { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+    });
+    return { status: response.status, cache: response.headers.get('cache-control'), body: await response.json() };
+  }
+  const restartPath = '/api/system/restart';
+  const idle = {
+    status: 'idle', source: null, reason: null, requestedAt: null, updatedAt: null,
+    busyCount: 0, busyJobs: [], error: null
+  };
+  const state = (await request('/api/state')).body;
+  const server = state.server;
+  assert.match(server.bootId, /^[\da-f-]{36}$/);
+  assert.ok(Number.isFinite(server.startedAt));
+  assert.equal(server.supervised, true);
+  assert.deepEqual(state.restart, idle);
+  assert.deepEqual(state.settings.selfUpdate, { autoRestart: false });
+  assert.deepEqual(state.jobs.find(item => item.id === 'merged').selfUpdate,
+    { at: 1, restart: true, restarted: true, restartedAt: server.startedAt });
+  assert.equal(state.jobs.find(item => item.id === 'ui').selfUpdate.restarted, undefined);
+  assert.deepEqual(await request('/api/health'), { status: 200, cache: 'no-store', body: { ok: true, ...server, restart: idle } });
+  assert.deepEqual(await request(restartPath), { status: 200, cache: 'no-store', body: { server, restart: idle } });
+  assert.deepEqual((await request('/api/monitor')).body.restart, idle);
+
+  const enabled = await request('/api/settings', 'PUT', { ...state.settings, selfUpdate: { autoRestart: true } });
+  assert.equal(enabled.status, 200);
+  assert.deepEqual(enabled.body.selfUpdate, { autoRestart: true });
+  const { selfUpdate: _omitted, ...oldClientSettings } = enabled.body;
+  assert.deepEqual((await request('/api/settings', 'PUT', oldClientSettings)).body.selfUpdate, { autoRestart: true });
+  assert.deepEqual(opened[0].load().settings.selfUpdate, { autoRestart: true });
+
+  const stream = await fetch(base + '/api/monitor/events', { signal: AbortSignal.timeout(9000) });
+  assert.match(stream.headers.get('content-type'), /text\/event-stream/);
+  const reader = stream.body.getReader();
+  const decoder = new TextDecoder();
+  let frames = '';
+  async function nextSnapshot(predicate) {
+    for (;;) {
+      const end = frames.indexOf('\n\n');
+      if (end !== -1) {
+        const frame = frames.slice(0, end);
+        frames = frames.slice(end + 2);
+        if (frame.startsWith('event: snapshot\n')) {
+          const snapshot = JSON.parse(frame.split('\n')[1].slice('data: '.length));
+          if (predicate(snapshot.restart)) return snapshot.restart;
+        }
+        continue;
+      }
+      const chunk = await reader.read();
+      assert.equal(chunk.done, false);
+      frames += decoder.decode(chunk.value, { stream: true });
+    }
+  }
+  assert.deepEqual(await nextSnapshot(() => true), idle);
+
+  const busy = { id: 'busy', title: 'Pending approval', status: 'waiting_approval' };
+  api.state.jobs.push({ ...busy, repo, events: [] });
+  api.save();
+  const waiting = await request(restartPath, 'POST', { jobId: busy.id });
+  assert.equal(waiting.status, 202);
+  assert.equal(waiting.body.ok, true);
+  assert.deepEqual(waiting.body.server, server);
+  assert.equal(waiting.body.restart.status, 'waiting');
+  assert.equal(waiting.body.restart.source, 'manual');
+  assert.equal(waiting.body.restart.reason, busy.title);
+  assert.equal(waiting.body.restart.busyCount, 1);
+  assert.deepEqual(waiting.body.restart.busyJobs, [busy]);
+  assert.deepEqual(await nextSnapshot(value => value.status === 'waiting'), waiting.body.restart);
+
+  const cancelled = await request(restartPath + '/cancel', 'POST');
+  assert.equal(cancelled.status, 200);
+  assert.equal(cancelled.body.restart.status, 'idle');
+  const merged = await request('/api/jobs/merged/merge', 'POST', { target: 'main' });
+  assert.equal(merged.status, 200);
+  assert.ok(merged.body.selfUpdate.at >= server.startedAt);
+  assert.equal(merged.body.selfUpdate.restarted, undefined);
+  const automatic = await nextSnapshot(value => value.source === 'auto');
+  assert.equal(automatic.status, 'waiting');
+  assert.equal(automatic.busyCount, 1);
+  assert.equal(opened.length, 1);
+
+  const stopped = await request('/api/jobs/busy/cancel', 'POST', {});
+  assert.equal(stopped.body.status, 'cancelled');
+  const failed = await nextSnapshot(value => value.status === 'failed');
+  assert.equal(failed.busyCount, 0);
+  assert.match(failed.error, /test preflight failure/);
+  const manualFailure = await request(restartPath, 'POST');
+  assert.equal(manualFailure.status, 500);
+  assert.equal(manualFailure.body.ok, false);
+  assert.equal(manualFailure.body.error, manualFailure.body.restart.error);
+  assert.equal(manualFailure.body.restart.source, 'manual');
+  assert.equal((await request(restartPath + '/cancel', 'POST')).body.restart.status, 'idle');
+
+  fake.ready = true;
+  fake.writeMarker = marker => {
+    assert.equal(marker, 'test-marker');
+    assert.equal(api.httpServer.listening, false);
+    assert.throws(() => opened[0].steps('busy'), /database is not open/i);
+    throw Error('test marker failure');
+  };
+  const restarting = await request(restartPath, 'POST');
+  assert.equal(restarting.status, 202);
+  assert.equal(restarting.body.restart.status, 'restarting');
+  const [duplicate, conflict, newJob, newCard, newFix] = await Promise.all([
+    request(restartPath, 'POST'), request(restartPath + '/cancel', 'POST'),
+    request('/api/jobs', 'POST', {}), request('/api/cards', 'POST', {}), request('/api/jobs/merged/fix', 'POST', {})
+  ]);
+  assert.deepEqual(duplicate.body, restarting.body);
+  assert.equal(conflict.status, 409);
+  assert.equal(conflict.body.error, 'Relay กำลังรีสตาร์ทอยู่ ไม่สามารถยกเลิกได้');
+  for (const response of [newJob, newCard, newFix]) assert.equal(response.status, 503);
+  assert.deepEqual(await nextSnapshot(value => value.status === 'restarting'), restarting.body.restart);
+
+  // Closing the old HTTP connections may end the stream normally or reset its socket.
+  while (!(await reader.read().catch(() => ({ done: true }))).done) {}
+  let recovered;
+  for (let attempt = 0; attempt < 30; attempt++) {
+    recovered = await request('/api/health').catch(() => null);
+    if (recovered?.body.restart.status === 'failed') break;
+    await delay(50);
+  }
+  assert.equal(recovered?.status, 200);
+  assert.equal(recovered.body.bootId, server.bootId);
+  assert.match(recovered.body.restart.error, /test marker failure/);
+  assert.equal(opened.length, 2);
+  assert.deepEqual((await request('/api/jobs/busy/steps')).body, []);
+  assert.deepEqual((await request('/api/monitor')).body.restart, recovered.body.restart);
+  const reconnected = await fetch(base + '/api/monitor/events', { signal: AbortSignal.timeout(2000) });
+  const reopenedStream = reconnected.body.getReader();
+  const firstFrame = new TextDecoder().decode((await reopenedStream.read()).value);
+  assert.match(firstFrame, /event: snapshot/);
+  assert.match(firstFrame, /test marker failure/);
+  await reopenedStream.cancel();
+});

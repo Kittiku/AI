@@ -34,7 +34,10 @@ const expressUrl = inlineModule(`
   export const routes = new Map();
   const register = method => (path, handler) => routes.set(method + ' ' + path, handler);
   export default Object.assign(() => ({
-    disable: noop, use: noop, get: register('GET'), post: register('POST'), put: register('PUT'), delete: noop, listen: noop
+    disable: noop, use: noop, get: register('GET'), post: register('POST'), put: register('PUT'), delete: noop, listen: (port, _host, callback) => {
+      queueMicrotask(callback);
+      return { address: () => ({ port }) };
+    }
   }), { json: noop, static: noop });
 `);
 const sqliteUrl = inlineModule(`
@@ -70,11 +73,12 @@ before(async () => {
     load(url, context, nextLoad) {
       const loaded = nextLoad(url, context);
       if (url !== indexUrl) return loaded;
-      return { ...loaded, source: loaded.source.toString() + '\nexport { createJob, drain, defaults, state, store, monitor };' };
+      return { ...loaded, source: loaded.source.toString() + '\nexport { createJob, drain, defaults, state, store, monitor, serverReady };' };
     }
   });
   try {
     server = await import(indexUrl);
+    await server.serverReady;
     ({ fake } = await import(providersUrl));
     ({ routes } = await import(expressUrl));
   } finally {

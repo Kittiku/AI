@@ -23,7 +23,10 @@ const providersUrl = moduleUrl(`
 const expressUrl = moduleUrl(`
   const noop = () => {};
   export default Object.assign(() => ({
-    disable: noop, use: noop, get: noop, post: noop, put: noop, delete: noop, listen: noop
+    disable: noop, use: noop, get: noop, post: noop, put: noop, delete: noop, listen: (port, _host, callback) => {
+      queueMicrotask(callback);
+      return { address: () => ({ port }) };
+    }
   }), { json: noop, static: noop });
 `);
 const fsUrl = moduleUrl("export * from 'node:fs'; export const mkdirSync = () => {}; export const existsSync = () => false;");
@@ -61,16 +64,17 @@ const hooks = registerHooks({
   load(url, context, nextLoad) {
     const loaded = nextLoad(url, context);
     if (url !== indexUrl) return loaded;
-    return { ...loaded, source: loaded.source.toString() + '\nexport { call, defaults, state, store, publicQuotas };' };
+    return { ...loaded, source: loaded.source.toString() + '\nexport { call, defaults, state, store, publicQuotas, serverReady };' };
   }
 });
 const priorDelay = process.env.RELAY_RETRY_DELAY_MS;
 process.env.RELAY_RETRY_DELAY_MS = '1';
-const { call, defaults, state, store, publicQuotas } = await import(indexUrl).finally(() => {
+const { call, defaults, state, store, publicQuotas, serverReady } = await import(indexUrl).finally(() => {
   hooks.deregister();
   if (priorDelay === undefined) delete process.env.RELAY_RETRY_DELAY_MS;
   else process.env.RELAY_RETRY_DELAY_MS = priorDelay;
 });
+await serverReady;
 const { fake, pacificDay } = await import(providersUrl);
 const { resetDatabase } = await import(sqliteUrl);
 

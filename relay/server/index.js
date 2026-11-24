@@ -7,9 +7,11 @@ import { fileURLToPath } from 'node:url';
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { realpath } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import { applyEdits, applyFiles, attemptChanges, attemptState, checkpoint, editContexts, git, isSafePath, mergeWorktree, removeWorktreeFolder, repository, restoreAttempt, snapshot, worktreePaths } from './git.js';
 import { editSchema, generate, names, pacificDay, planSchema, quota, refreshClaudeCode, refreshCodex, reviewSchema, subtaskCheckSchema, USAGE } from './providers.js';
 import { openStore } from './store.js';
+import { createRestartController, defaultSelfUpdateSettings, normalizeSelfUpdateSettings, shouldAutoRestart } from './restart.js';
 import { PROFILES, rank } from './router.js';
 import { closeMonitorStages, createMonitor, liveStage, monitorFiles, recordMonitor } from './monitor.js';
 import { cardToJob, outOfScope, taskCardSchema, validateCard } from './cards.js';
@@ -20,6 +22,7 @@ import {
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const dataDir = path.resolve(process.env.RELAY_DATA_DIR || path.join(root, '.relay'));
+const serverBoot = { bootId: randomUUID(), startedAt: Date.now(), supervised: process.env.RELAY_SUPERVISED === '1' };
 const roles = { plan: 'วางแผน', backend: 'Backend', frontend: 'Frontend', review: 'รีวิว' };
 const defaults = {
   routes: { plan: ['claudecode', 'gemini'], backend: ['claudecode', 'codex'], frontend: ['gemini', 'claudecode'], review: ['codex', 'gemini'] },
@@ -31,14 +34,14 @@ const defaults = {
   // Routing: "auto" lets Relay score the AIs for every step; "fixed" uses the primary/fallback table above.
   routing: { mode: 'auto', profile: 'balanced', minSamples: 5 },
   approvals: { afterPlan: false },
+  selfUpdate: defaultSelfUpdateSettings,
   // Team mode: split medium and hard tasks and schedule ready pieces within each role.
   team: normalizeTeamSettings({ mode: 'auto', maxSubtasks: 4 }),
   // Budgets in USD; 0 = no limit. countSubscription also counts the API-equivalent value of subscription runs.
   budget: { perJobUsd: 0, dailyUsd: 0, countSubscription: true }
 };
-mkdirSync(dataDir, { recursive: true });
-const store = openStore(dataDir);
-const state = store.load({ settings: structuredClone(defaults), jobs: [], usage: {}, projects: [] });
+let store;
+let state;
 // Claude API was removed; saved routes that named it move to Claude Code.
 function migrateSettings(settings) {
   for (const [role, route] of Object.entries(settings.routes)) {
@@ -52,50 +55,79 @@ function migrateSettings(settings) {
   settings.agentEdits ??= defaults.agentEdits;
   settings.routing = { ...defaults.routing, ...settings.routing };
   settings.approvals = { ...defaults.approvals, ...settings.approvals };
+  settings.selfUpdate = normalizeSelfUpdateSettings(settings.selfUpdate);
   settings.budget = { ...defaults.budget, ...settings.budget };
   settings.team = normalizeTeamSettings({ ...defaults.team, ...settings.team });
 }
-migrateSettings(state.settings);
-state.projects ??= [];
-for (const job of state.jobs) {
-  if (['queued', 'running', 'waiting_approval'].includes(job.status)) migrateSettings(job.settings);
-  else if (job.settings) job.settings.team = normalizeTeamSettings({ ...defaults.team, ...job.settings.team });
+function initializeState() {
+  mkdirSync(dataDir, { recursive: true });
+  store = openStore(dataDir);
+  state = store.load({ settings: structuredClone(defaults), jobs: [], usage: {}, projects: [] });
+  migrateSettings(state.settings);
+  state.projects ??= [];
+  for (const job of state.jobs) {
+    const update = job.selfUpdate;
+    if (update?.restart && !update.restarted && Number.isFinite(update.at) && update.at < serverBoot.startedAt) {
+      update.restarted = true;
+      update.restartedAt = serverBoot.startedAt;
+    }
+    if (['queued', 'running', 'waiting_approval'].includes(job.status)) migrateSettings(job.settings);
+    else if (job.settings) job.settings.team = normalizeTeamSettings({ ...defaults.team, ...job.settings.team });
+  }
+  for (const project of state.projects) project.checks ??= [];
+  // A job that was running when the app closed goes back to the queue and continues from its last finished step.
+  // After three restarts in a row it stops, so a job that crashes the app cannot loop forever.
+  store.closeOpenSteps();
+  for (const job of state.jobs) {
+    if (job.status === 'stopping') {
+      job.status = 'cancelled';
+      job.finishedAt ??= Date.now();
+    }
+    if (job.status === 'waiting_approval') { job.status = 'running'; job.approval = null; }
+    if (job.status !== 'running') {
+      closeJobStages(job, job.status === 'queued' ? 'pending' : job.status === 'cancelled' ? 'cancelled' : 'failed');
+      continue;
+    }
+    job.restarts = (job.restarts || 0) + 1;
+    if (job.restarts > 3) {
+      job.status = 'interrupted';
+      job.finishedAt = Date.now();
+      closeJobStages(job, 'failed');
+      job.error = 'แอปปิดระหว่างงานนี้เกิน 3 ครั้ง จึงหยุดไว้ กด "ทำต่อจากจุดที่ค้าง" เพื่อเริ่มอีกครั้ง';
+      continue;
+    }
+    job.status = 'queued';
+    job.resuming = true;
+    closeJobStages(job, 'pending');
+    job.events.push({ title: 'ทำต่อ', detail: 'แอปปิดระหว่างทำงาน เมื่อเปิดใหม่จะทำต่อจากขั้นที่ค้าง', at: Date.now() });
+  }
+  monitor = createMonitor(state, () => active?.id, restartController.getState);
+  save();
 }
-for (const project of state.projects) project.checks ??= [];
-// A job that was running when the app closed goes back to the queue and continues from its last finished step.
-// After three restarts in a row it stops, so a job that crashes the app cannot loop forever.
-store.closeOpenSteps();
-for (const job of state.jobs) {
-  if (job.status === 'stopping') {
-    job.status = 'cancelled';
-    job.finishedAt ??= Date.now();
-  }
-  if (job.status === 'waiting_approval') { job.status = 'running'; job.approval = null; }
-  if (job.status !== 'running') {
-    closeJobStages(job, job.status === 'queued' ? 'pending' : job.status === 'cancelled' ? 'cancelled' : 'failed');
-    continue;
-  }
-  job.restarts = (job.restarts || 0) + 1;
-  if (job.restarts > 3) {
-    job.status = 'interrupted';
-    job.finishedAt = Date.now();
-    closeJobStages(job, 'failed');
-    job.error = 'แอปปิดระหว่างงานนี้เกิน 3 ครั้ง จึงหยุดไว้ กด "ทำต่อจากจุดที่ค้าง" เพื่อเริ่มอีกครั้ง';
-    continue;
-  }
-  job.status = 'queued';
-  job.resuming = true;
-  closeJobStages(job, 'pending');
-  job.events.push({ title: 'ทำต่อ', detail: 'แอปปิดระหว่างทำงาน เมื่อเปิดใหม่จะทำต่อจากขั้นที่ค้าง', at: Date.now() });
-}
+
 const cooldowns = {};
 let active;
-const monitor = createMonitor(state, () => active?.id);
+let monitor;
+let httpServer;
+const pendingWrites = new Set();
+const restartController = createRestartController({
+  getJobs: () => state.jobs,
+  closeServer,
+  reopenServer,
+  supervised: serverBoot.supervised,
+  onStateChange: () => monitor.publish()
+});
+const isRestarting = () => restartController.getState().status === 'restarting';
+const shutdownError = 'Relay กำลังรีสตาร์ท กรุณาลองอีกครั้งหลังเชื่อมต่อใหม่';
+function requireJobIntake() {
+  if (isRestarting()) throw Object.assign(Error(shutdownError), { status: 503 });
+}
+
 function save() {
   store.persist(state);
+  void restartController.onJobsChanged();
   monitor.publish();
 }
-save();
 
 function closeJobStages(job, status) {
   const now = Date.now();
@@ -1266,7 +1298,7 @@ function stopJob(job, reason) {
 }
 
 async function drain() {
-  if (active) return;
+  if (active || isRestarting()) return;
   const job = state.jobs.find(item => item.status === 'queued');
   if (!job) return;
   active = { id: job.id, controller: new AbortController() };
@@ -1325,27 +1357,64 @@ function readSettings(input) {
     auto: { allProviders: auto.allProviders, waitMinutes: auto.waitMinutes, retries: auto.retries, maxJobMinutes: auto.maxJobMinutes },
     agentEdits: input.agentEdits ?? true, approvals: { afterPlan: approvals.afterPlan },
     routing: { mode: routing.mode, profile: routing.profile, minSamples: routing.minSamples },
-    team,
+    team, selfUpdate: normalizeSelfUpdateSettings(input.selfUpdate ?? state.settings.selfUpdate),
     budget: { perJobUsd: budget.perJobUsd, dailyUsd: budget.dailyUsd, countSubscription: budget.countSubscription } };
 }
 
 const app = express();
-const port = Number(process.env.RELAY_PORT || 4782);
+let port = Number(process.env.RELAY_PORT || 4782);
 const host = '127.0.0.1';
 app.disable('x-powered-by');
+const restartPath = '/api/system/restart';
+const restartActions = new Set([restartPath, restartPath + '/cancel']);
 app.use((req, res, next) => {
   if (![host + ':' + port, 'localhost:' + port].includes(req.get('host'))) return res.sendStatus(403);
-  if (req.method !== 'GET' && (!req.is('application/json') || (req.get('origin') &&
-    req.get('origin') !== 'http://' + req.get('host')))) return res.sendStatus(403);
+  if (req.method !== 'GET') {
+    const restartAction = req.method === 'POST' && restartActions.has(req.path);
+    const origin = req.get('origin');
+    const emptyBody = !req.get('transfer-encoding') && Number(req.get('content-length') || 0) === 0;
+    if ((origin && origin !== 'http://' + req.get('host')) ||
+        (!req.is('application/json') && !(restartAction && emptyBody))) return res.sendStatus(403);
+  }
   next();
 });
 app.use(express.json({ limit: '200kb' }));
-app.get('/api/monitor', monitor.json);
-app.get('/api/monitor/events', monitor.events);
-app.get('/api/monitor/jobs/:id', monitor.jobJson);
-app.get('/api/jobs/:id/monitor', monitor.jobJson);
+app.use((req, res, next) => {
+  if (isRestarting() && req.method !== 'GET' &&
+      !(req.method === 'POST' && restartActions.has(req.path))) return res.status(503).json({ error: shutdownError });
+  next();
+});
+app.get('/api/monitor', (req, res) => monitor.json(req, res));
+app.get('/api/monitor/events', (req, res) => monitor.events(req, res));
+app.get('/api/monitor/jobs/:id', (req, res) => monitor.jobJson(req, res));
+app.get('/api/jobs/:id/monitor', (req, res) => monitor.jobJson(req, res));
+
+function restartPayload(restart = restartController.getState()) {
+  return { server: serverBoot, restart };
+}
+app.get('/api/health', (_req, res) => res.set('Cache-Control', 'no-store').json({
+  ok: true, ...serverBoot, restart: restartController.getState()
+}));
+app.get(restartPath, (_req, res) => res.set('Cache-Control', 'no-store').json(restartPayload()));
+app.post(restartPath, async (req, res) => {
+  const { jobId, reason } = req.body || {};
+  const job = typeof jobId === 'string' ? findJob(jobId) : null;
+  const message = (typeof reason === 'string' && reason.trim().slice(0, 400)) || job?.title || null;
+  const restart = await restartController.requestRestart({ source: 'manual', reason: message });
+  if (restart.status === 'failed') {
+    return res.status(500).json({ ok: false, error: restart.error, ...restartPayload(restart) });
+  }
+  res.status(202).json({ ok: true, ...restartPayload(restart) });
+});
+app.post(restartPath + '/cancel', (_req, res) => {
+  const restart = restartController.cancelRestart();
+  if (restart.status === 'restarting') {
+    return res.status(409).json({ ok: false, error: 'Relay กำลังรีสตาร์ทอยู่ ไม่สามารถยกเลิกได้', ...restartPayload(restart) });
+  }
+  res.json({ ok: true, ...restartPayload(restart) });
+});
 app.get('/api/state', (_req, res) => res.json({
-  ...state, jobs: state.jobs.map(publicJob), usage: undefined, quotas: publicQuotas()
+  ...state, jobs: state.jobs.map(publicJob), usage: undefined, quotas: publicQuotas(), ...restartPayload()
 }));
 app.post('/api/quota/refresh', async (_req, res) => { await Promise.all([refreshCodex(root), refreshClaudeCode(root)]); res.json(publicQuotas()); });
 app.put('/api/settings', (req, res) => { state.settings = readSettings(req.body); save(); res.json(state.settings); });
@@ -1422,6 +1491,7 @@ app.post('/api/jobs/:id/approve', (req, res) => {
 });
 // One more fix round on a finished job's own branch: the open review findings plus the user's note, then test and review again.
 app.post('/api/jobs/:id/fix', async (req, res) => {
+  requireJobIntake();
   const job = findJob(req.params.id);
   if (!job) return res.status(404).json({ error: 'ไม่พบงานนี้' });
   if (!['complete', 'needs_review'].includes(job.status)) return res.status(409).json({ error: 'แก้ต่อได้เฉพาะงานที่ทำเสร็จแล้ว' });
@@ -1434,6 +1504,7 @@ app.post('/api/jobs/:id/fix', async (req, res) => {
   if (provider && !Object.hasOwn(names, provider)) throw Error('AI ที่เลือกไม่ถูกต้อง');
   const findings = (job.review?.findings || []).slice(0, 30);
   if (!findings.length && !text) throw Error('งานนี้ไม่มีปัญหาค้าง บอกด้วยว่าต้องการให้แก้อะไร');
+  requireJobIntake();
   job.fixRequest = { note: text, provider: provider || null, findings, at: Date.now() };
   job.status = 'queued';
   job.resuming = true;
@@ -1462,6 +1533,7 @@ app.get('/api/routing/preview', (_req, res) => {
 app.get('/api/cards/schema', (_req, res) => res.json(taskCardSchema));
 
 async function createJob({ title, prompt, repo, runChecks, routes, fromJob, extraChecks = [], maxPrompt = 8000, card, cardSubtasks, budgetUsd, type, scope, approvals, pinned, profile }) {
+  requireJobIntake();
   if (type !== undefined && !Object.hasOwn(jobTypes, type)) throw Error('ประเภทงานไม่ถูกต้อง');
   if (approvals !== undefined && (!Array.isArray(approvals) || approvals.some(item => item !== 'after_plan'))) throw Error('จุดอนุมัติไม่ถูกต้อง');
   if (![title, prompt, repo].every(value => typeof value === 'string' && value.trim()) ||
@@ -1506,6 +1578,7 @@ async function createJob({ title, prompt, repo, runChecks, routes, fromJob, extr
   if (pinned && Object.keys(pinned).length) job.pinned = Object.fromEntries(Object.entries(pinned).filter(([role, provider]) => Object.hasOwn(roles, role) && Object.hasOwn(names, provider)));
   if (budgetUsd !== null && budgetUsd !== undefined) job.budgetUsd = budgetUsd;
   else if (settings.budget?.perJobUsd > 0) job.budgetUsd = settings.budget.perJobUsd;
+  requireJobIntake();
   state.jobs.push(job);
   save();
   setImmediate(drain);
@@ -1558,7 +1631,7 @@ function saveProject(root, name) {
   save();
   return project;
 }
-app.post('/api/projects', async (req, res) => {
+app.post('/api/projects', finishBeforeRestart(async (req, res) => {
   const folder = await folderOf(req.body?.path);
   if (unsafeRoot(folder)) throw Error('เลือกโฟลเดอร์ของโปรเจกต์ ไม่ใช่ root ของไดรฟ์หรือโฟลเดอร์ผู้ใช้');
   const repo = await gitState(folder);
@@ -1572,8 +1645,8 @@ app.post('/api/projects', async (req, res) => {
     hasGitignore: existsSync(path.join(folder, '.gitignore')), entries: readdirSync(folder).filter(name => name !== '.git').length,
     error: kind === 'none' ? 'โฟลเดอร์นี้ยังไม่เป็น Git repo' : kind === 'empty' ? 'Git repo นี้ยังไม่มี commit' :
       'โฟลเดอร์นี้อยู่ใน Git repo ที่ใหญ่กว่า: ' + repo.root });
-});
-app.post('/api/projects/init', async (req, res) => {
+}));
+app.post('/api/projects/init', finishBeforeRestart(async (req, res) => {
   const folder = await folderOf(req.body?.path);
   if (unsafeRoot(folder)) throw Error('ไม่สร้าง Git repo ที่ root ของไดรฟ์หรือโฟลเดอร์ผู้ใช้ เลือกโฟลเดอร์ของโปรเจกต์แทน');
   let repo = await gitState(folder);
@@ -1590,7 +1663,7 @@ app.post('/api/projects/init', async (req, res) => {
   const identity = await git(repo.root, 'config', 'user.name').catch(() => '') ? [] : ['-c', 'user.name=Relay', '-c', 'user.email=relay@localhost'];
   await git(repo.root, ...identity, 'commit', '-m', 'Initial commit (Relay)');
   res.status(201).json({ ...saveProject(repo.root, req.body?.name), committed: staged.length, createdIgnore });
-});
+}));
 app.post('/api/projects/pick', async (_req, res) => {
   if (process.platform !== 'win32') return res.status(501).json({ error: 'เลือกโฟลเดอร์ได้บน Windows เท่านั้น พิมพ์พาธแทน' });
   // A native folder dialog; the encoded command keeps Thai text intact.
@@ -1686,7 +1759,7 @@ app.get('/api/jobs/:id/merge-check', async (req, res) => {
   res.json(await mergeCheck(job));
 });
 
-app.post('/api/jobs/:id/merge', async (req, res) => {
+app.post('/api/jobs/:id/merge', finishBeforeRestart(async (req, res) => {
   const job = findJob(req.params.id);
   if (!job) return res.status(404).json({ error: 'ไม่พบงานนี้' });
   if (busy(job)) return res.status(409).json({ error: 'งานยังทำไม่เสร็จ' });
@@ -1711,14 +1784,17 @@ app.post('/api/jobs/:id/merge', async (req, res) => {
   job.merged = { at: Date.now(), into: check.target, commit, tip, fastForward: check.fastForward, before: check.alreadyMerged ? null : headBefore };
   addEvent(job, 'Merge', (check.alreadyMerged ? 'branch นี้อยู่ใน ' : 'merge เข้า ') + check.target + ' แล้ว (' + commit.slice(0, 7) + (check.fastForward ? ', fast-forward' : '') + ')');
   job.selfUpdate = await rebuildSelf(job, check.alreadyMerged ? job.base : headBefore, commit);
+  save();
+  if (shouldAutoRestart(job.selfUpdate, state.settings)) {
+    void restartController.requestRestart({ source: 'auto', reason: job.title });
+  }
   if (req.body?.cleanup) {
     await cleanup(job, false);
     await git(job.repo, 'branch', '-d', job.branch).then(() => { job.branchKept = false; }).catch(() => {});
     addEvent(job, 'Merge', 'ล้าง worktree และลบ branch ' + job.branch + ' แล้ว');
   }
-  save();
   res.json(publicJob(job));
-});
+}));
 // A job that changed Relay itself: after its merge, rebuild the web page Relay serves (dist) when the UI changed,
 // and say when the server or MCP code changed, since those need a restart.
 async function rebuildSelf(job, from, to) {
@@ -1730,7 +1806,7 @@ async function rebuildSelf(job, from, to) {
   const restart = changed.some(name => /^(server\/|mcp\/)/.test(name));
   const dependencies = changed.includes('package.json') || changed.includes('package-lock.json');
   if (!ui && !restart && !dependencies) return null;
-  const result = { at: Date.now(), ui, restart, dependencies, built: null, error: '' };
+  const result = { ui, restart, dependencies, built: null, error: '' };
   if (ui) {
     addEvent(job, 'อัปเดต Relay', 'งานนี้แก้หน้าเว็บของ Relay กำลัง build หน้าเว็บใหม่');
     const build = await npm(root, ['run', 'build'], AbortSignal.timeout(180_000)).catch(error => ({ code: -1, output: error.message }));
@@ -1740,7 +1816,7 @@ async function rebuildSelf(job, from, to) {
   }
   if (restart) addEvent(job, 'อัปเดต Relay', 'งานนี้แก้โค้ด server หรือ MCP ของ Relay ต้องรีสตาร์ท Relay ถึงจะมีผล');
   if (dependencies) addEvent(job, 'อัปเดต Relay', 'งานนี้แก้ package.json ต้องรัน npm install ใน ' + root + ' ก่อน build หรือรีสตาร์ท');
-  return result;
+  return { ...result, at: Date.now() };
 }
 const busy = job => ['queued', 'running', 'stopping', 'waiting_approval'].includes(job.status);
 async function cleanup(job, deleteBranch) {
@@ -1764,20 +1840,20 @@ app.post('/api/jobs/:id/open', (req, res) => {
   spawn(process.platform === 'win32' ? 'explorer.exe' : 'xdg-open', [job.worktree], { detached: true, stdio: 'ignore' }).unref();
   res.json({ ok: true });
 });
-app.post('/api/jobs/:id/cleanup', async (req, res) => {
+app.post('/api/jobs/:id/cleanup', finishBeforeRestart(async (req, res) => {
   const job = findJob(req.params.id);
   if (!job || busy(job)) return res.status(409).json({ error: 'ล้างงานที่ยังทำงานอยู่ไม่ได้' });
   await cleanup(job, req.body?.deleteBranch === true);
   res.json(publicJob(job));
-});
-app.delete('/api/jobs/:id', async (req, res) => {
+}));
+app.delete('/api/jobs/:id', finishBeforeRestart(async (req, res) => {
   const job = findJob(req.params.id);
   if (!job || busy(job)) return res.status(409).json({ error: 'ลบงานที่ยังทำงานอยู่ไม่ได้' });
   await cleanup(job, req.body?.deleteBranch === true);
   state.jobs = state.jobs.filter(item => item !== job);
   save();
   res.json({ ok: true });
-});
+}));
 app.post('/api/jobs/:id/cancel', (req, res) => {
   const job = state.jobs.find(item => item.id === req.params.id);
   if (!job || !['queued', 'running', 'waiting_approval'].includes(job.status)) return res.status(409).json({ error: 'งานนี้หยุดไม่ได้แล้ว' });
@@ -1791,11 +1867,68 @@ app.post('/api/jobs/:id/cancel', (req, res) => {
   res.json(publicJob(job));
 });
 app.use(express.static(path.join(root, 'dist')));
-app.use((error, _req, res, _next) => res.status(400).json({ error: error.message.slice(0, 1800) }));
-app.listen(port, host, () => {
+app.use((error, _req, res, _next) => res.status(error.status === 503 ? 503 : 400).json({ error: error.message.slice(0, 1800) }));
+
+// Let admitted writes finish even when their client disconnects before receiving the response.
+function finishBeforeRestart(handler) {
+  return async (req, res) => {
+    const write = handler(req, res);
+    pendingWrites.add(write);
+    try { await write; }
+    finally { pendingWrites.delete(write); }
+  };
+}
+
+async function closeServer() {
+  await Promise.allSettled(pendingWrites);
+  monitor.close();
+  if (httpServer?.listening) {
+    await new Promise((resolve, reject) => {
+      httpServer.close(error => error ? reject(error) : resolve());
+      httpServer.closeAllConnections();
+    });
+  }
+  store.close();
+  store = null;
+}
+
+async function listen() {
+  // On Windows a recently closed listener can briefly leave the port unavailable.
+  for (let attempt = 0; ; attempt++) {
+    try {
+      httpServer = await new Promise((resolve, reject) => {
+        const server = app.listen(port, host, error => error ? reject(error) : resolve(server));
+      });
+      port = httpServer.address().port;
+      return;
+    } catch (error) {
+      if (error.code !== 'EADDRINUSE' || attempt >= 8) throw error;
+      await delay(125);
+    }
+  }
+}
+
+async function reopenServer() {
+  if (!store) {
+    store = openStore(dataDir);
+    store.load(state); // Restore the store's cache of persisted rows for subsequent updates and deletions.
+  }
+  if (!httpServer?.listening) await listen();
+}
+
+async function startServer() {
+  await listen();
+  // A process waiting for the port must leave the live server's database alone.
+  initializeState();
   console.log('Relay · http://' + host + ':' + port);
-  void refreshCodex(root);
-  void refreshClaudeCode(root);
-  setInterval(() => { void refreshCodex(root); void refreshClaudeCode(root); }, 180_000).unref();
+  const refreshProviders = () => { void refreshCodex(root); void refreshClaudeCode(root); };
+  refreshProviders();
+  setInterval(refreshProviders, 180_000).unref();
   void drain();
+}
+
+const serverReady = startServer();
+void serverReady.catch(error => {
+  console.error('เปิด Relay ไม่สำเร็จ · ' + error.message);
+  process.exit(1);
 });

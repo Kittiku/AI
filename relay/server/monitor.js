@@ -90,8 +90,8 @@ function projectJob(job, projects) {
 }
 
 // The live snapshot and job history share a projection. Unrelated writes do not publish new snapshots.
-export function createMonitor(state, activeId) {
-  const clients = new Set();
+export function createMonitor(state, activeId, getRestartState) {
+  const clients = new Map();
   let previous;
   let snapshot;
 
@@ -116,14 +116,14 @@ export function createMonitor(state, activeId) {
         lastFinishedJob = { id: job.id, title: job.title, status: job.status, finishedAt: job.finishedAt };
       }
     }
-    const data = { queuedCount, activeJob, lastFinishedJob };
+    const data = { queuedCount, activeJob, lastFinishedJob, restart: getRestartState?.() };
     const serialized = JSON.stringify(data);
     if (serialized === previous) return;
     previous = serialized;
     // Keep separate revisions ordered even when multiple stages change in the same millisecond.
     snapshot = { updatedAt: Math.max(Date.now(), (snapshot?.updatedAt ?? 0) + 1), ...data };
     const message = frame('snapshot', snapshot);
-    for (const res of clients) send(res, message);
+    for (const res of clients.keys()) send(res, message);
   }
 
   function json(_req, res) {
@@ -148,9 +148,17 @@ export function createMonitor(state, activeId) {
       clients.delete(res);
       clearInterval(heartbeat);
     });
-    clients.add(res);
+    clients.set(res, heartbeat);
     send(res, frame('snapshot', snapshot));
   }
 
-  return { publish, json, jobJson, events };
+  function close() {
+    for (const [res, heartbeat] of clients) {
+      clearInterval(heartbeat);
+      res.end();
+    }
+    clients.clear();
+  }
+
+  return { publish, json, jobJson, events, close };
 }
