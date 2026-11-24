@@ -80,7 +80,8 @@ summary { cursor: pointer; }
 .sidebar footer small { display: block; color: var(--muted); }
 
 .workspace { min-width: 0; }
-.topbar { position: sticky; top: 0; z-index: 3; min-height: 64px; background: rgba(244, 245, 249, .88); backdrop-filter: blur(8px); border-bottom: 1px solid var(--line); padding: 10px 28px; display: flex; align-items: center; gap: 16px; }
+.workspace-header { position: sticky; top: 0; z-index: 3; }
+.topbar { min-height: 64px; background: rgba(244, 245, 249, .88); backdrop-filter: blur(8px); border-bottom: 1px solid var(--line); padding: 10px 28px; display: flex; align-items: center; gap: 16px; }
 .page-title { min-width: 0; margin-right: auto; }
 .page-title h1 { font-size: 19px; font-weight: 750; letter-spacing: -.02em; }
 .page-title p { color: var(--muted); font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -90,6 +91,30 @@ summary { cursor: pointer; }
 .idle-dot { background: #a8afbd; }
 @keyframes pulse { 50% { opacity: .35; transform: scale(.75); } }
 .actions { display: flex; gap: 8px; }
+.restart-banner {
+  --restart-ink: var(--brand-ink);
+  --restart-bg: var(--brand-soft);
+  --restart-line: var(--line-strong);
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  padding: 9px 28px;
+  color: var(--restart-ink);
+  background: var(--restart-bg);
+  border-bottom: 1px solid var(--restart-line);
+}
+.restart-banner.warn { --restart-ink: var(--warn); --restart-bg: var(--warn-soft); --restart-line: var(--warn-line); }
+.restart-banner.bad { --restart-ink: var(--bad); --restart-bg: var(--bad-soft); --restart-line: var(--bad-line); }
+.restart-banner.ok { --restart-ink: var(--ok); --restart-bg: var(--ok-soft); --restart-line: var(--ok-line); }
+.restart-banner-icon { flex: none; }
+.restart-banner.progress .restart-banner-icon { animation: spin 1.4s linear infinite; }
+.restart-banner-message { flex: 1 1 12rem; min-width: 0; overflow-wrap: anywhere; }
+.restart-banner-message p { color: var(--ink-2); font-size: 13px; }
+.restart-banner .button { max-width: 100%; white-space: normal; }
+.restart-banner .button svg { flex: none; }
+.workspace:has(.restart-banner) :is(.ai-status, .settings-nav, .facts-column) { position: static; }
+.workspace:has(.restart-banner) .approval-panel { scroll-margin-top: 160px; }
 main { max-width: 1440px; margin-inline: auto; padding: 22px 28px 40px; }
 .heading { margin-bottom: 18px; }
 .heading h1 { font-size: 24px; font-weight: 780; letter-spacing: -.03em; }
@@ -1020,7 +1045,8 @@ details.fact summary::marker { color: var(--muted); }
 
 /* ---------- Responsive ---------- */
 @media (prefers-reduced-motion: reduce) {
-  .pulse, .monitor-connection.live::before, .stage .stage-dot, .subtask.parallel .subtask-no { animation: none !important; }
+  .pulse, .monitor-connection.live::before, .stage .stage-dot, .subtask.parallel .subtask-no,
+  .restart-banner.progress .restart-banner-icon { animation: none !important; }
   .kpi:hover { transform: none; }
 }
 @media (max-width: 1180px) {
@@ -1050,7 +1076,7 @@ details.fact summary::marker { color: var(--muted); }
   .sidebar nav button { justify-content: center; padding-inline: 0; }
   .nav-badge { position: absolute; top: 2px; right: 2px; min-width: 16px; height: 16px; font-size: 10px; padding: 0 4px; }
   .sidebar footer { justify-content: center; padding: 12px 0 0; }
-  .topbar { padding-inline: 14px; }
+  .topbar, .restart-banner { padding-inline: 14px; }
   main { padding: 16px 14px 32px; }
   .ai-status ul { grid-template-columns: minmax(0, 1fr); }
   .monitor-timeline { grid-auto-flow: row; grid-template-columns: minmax(0, 1fr); gap: 6px; }
@@ -1072,7 +1098,11 @@ details.fact summary::marker { color: var(--muted); }
   .sidebar nav { display: flex; margin-top: 0; gap: 2px; }
   .sidebar nav button { width: 40px; min-height: 38px; }
   .sidebar footer { display: none; }
-  .topbar { position: static; min-height: 54px; padding: 8px 12px; flex-wrap: wrap; gap: 8px; }
+  .workspace-header { position: static; }
+  .workspace-header:has(> .restart-banner) { position: sticky; top: 51px; }
+  .workspace:has(.restart-banner) .approval-panel { scroll-margin-top: 220px; }
+  .restart-banner { padding-inline: 12px; }
+  .topbar { min-height: 54px; padding: 8px 12px; flex-wrap: wrap; gap: 8px; }
   .page-title h1 { font-size: 17px; }
   .topbar-status { order: 3; width: 100%; justify-content: center; font-size: 12px; }
   .actions { gap: 6px; }

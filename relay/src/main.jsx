@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import '@fontsource-variable/inter';
 import '@fontsource-variable/noto-sans-thai';
@@ -215,9 +215,14 @@ function useSavedJobMonitor(id, isLive, status, isStale) {
   return savedJob;
 }
 
-function useMonitor() {
+function useMonitor(paused, epoch, onSnapshot) {
   const [monitor, setMonitor] = useState({ snapshot: null, receivedAt: null, connection: 'connecting' });
   useEffect(() => {
+    if (paused) {
+      setMonitor(previous => ({ ...previous, connection: 'stale' }));
+      return;
+    }
+    setMonitor({ snapshot: null, receivedAt: null, connection: 'connecting' });
     const silenceLimit = 25_000;
     const pollInterval = 2200;
     let disposed = false;
@@ -232,6 +237,7 @@ function useMonitor() {
     function applySnapshot(snapshot, connection) {
       latestUpdatedAt = snapshot.updatedAt;
       setMonitor({ snapshot, receivedAt: Date.now(), connection });
+      onSnapshot(snapshot, epoch);
     }
 
     function stopPolling() {
@@ -320,8 +326,289 @@ function useMonitor() {
       clearTimeout(reconnectTimer);
       stopPolling();
     };
-  }, []);
+  }, [paused, epoch, onSnapshot]);
   return monitor;
+}
+
+function useRelayConnection() {
+  const [data, setData] = useState(null);
+  const [networkError, setNetworkError] = useState('');
+  const [restart, setRestart] = useState(null);
+  const [phase, setPhase] = useState(null);
+  const [monitorEpoch, setMonitorEpoch] = useState(0);
+  const [pending, setPending] = useState(false);
+  const [requestError, setRequestError] = useState('');
+  const session = useRef(null);
+  const onSnapshot = useCallback((snapshot, epoch) => session.current?.receiveSnapshot(snapshot, epoch), []);
+  const monitor = useMonitor(phase === 'reconnecting' || phase === 'timeout', monitorEpoch, onSnapshot);
+  const approval = monitor.snapshot?.activeJob?.approval;
+  const approvalJobId = approval ? monitor.snapshot.activeJob.id : null;
+  const approvalKind = approval?.kind;
+  const approvalRequestedAt = approval?.requestedAt;
+
+  useEffect(() => {
+    const checkInterval = 800;
+    const checkTimeout = 2500;
+    const reconnectTimeout = 20_000;
+    let server;
+    let currentRestart;
+    let restartVersion = 0;
+    let restartAt = -Infinity;
+    let epoch = 0;
+    let recovery;
+    let timedOut = false;
+    let stateRequest;
+    let stateTimer;
+    let actionPending = false;
+    let disposed = false;
+
+    function stopStatePoll() {
+      clearTimeout(stateTimer);
+      stateRequest?.abort();
+      stateRequest = undefined;
+    }
+
+    function stopRecovery() {
+      clearTimeout(recovery?.timer);
+      recovery?.request?.abort();
+      recovery = undefined;
+    }
+
+    function reopenMonitor(nextPhase) {
+      timedOut = false;
+      setPhase(nextPhase);
+      setMonitorEpoch(++epoch);
+    }
+
+    function receiveRestart(next, version = restartVersion, snapshotAt) {
+      if (!next) return;
+      const updatedAt = next.updatedAt ?? -Infinity;
+      // A state request or action response can arrive after a newer monitor snapshot.
+      if ((next.updatedAt != null && updatedAt < restartAt) ||
+          (next.updatedAt == null && snapshotAt <= restartAt) ||
+          (version !== restartVersion && updatedAt <= restartAt)) return;
+      if (currentRestart && ['status', 'updatedAt', 'busyCount', 'error'].every(key => currentRestart[key] === next[key])) return;
+      if (next.status !== currentRestart?.status) setRequestError('');
+      currentRestart = next;
+      if (next.status !== 'idle') setPhase(previous => previous === 'connected' ? null : previous);
+      restartAt = Math.max(restartAt, updatedAt);
+      restartVersion++;
+      setRestart(next);
+      if (next.status === 'restarting' && !timedOut) startRecovery();
+    }
+
+    function receiveSnapshot(snapshot, snapshotEpoch) {
+      if (snapshotEpoch !== epoch || recovery || timedOut) return;
+      receiveRestart(snapshot.restart, restartVersion, snapshot.updatedAt);
+    }
+
+    function receiveState(next, version, recovered = false) {
+      const newBoot = server?.bootId && next.server?.bootId && server.bootId !== next.server.bootId;
+      const reachableAfterTimeout = timedOut && next.server?.bootId && next.restart?.status !== 'restarting';
+      if (newBoot) {
+        currentRestart = null;
+        restartAt = -Infinity;
+        restartVersion++;
+        setRestart(null);
+      }
+      if (newBoot || recovered || reachableAfterTimeout) {
+        setRequestError('');
+        reopenMonitor(next.restart?.status === 'idle' ? 'connected' : null);
+      }
+      server = next.server ?? server;
+      setData(next);
+      setNetworkError('');
+      receiveRestart(next.restart, newBoot || recovered ? restartVersion : version);
+    }
+
+    async function pollState() {
+      if (recovery) return;
+      stopStatePoll();
+      const controller = new AbortController();
+      stateRequest = controller;
+      const version = restartVersion;
+      try {
+        const next = await readState(controller.signal);
+        if (!controller.signal.aborted) receiveState(next, version);
+      } catch (error) {
+        if (controller.signal.aborted) return;
+        setNetworkError(error.message);
+        if (server?.bootId && !timedOut) startRecovery(true);
+      }
+      if (!controller.signal.aborted) stateTimer = setTimeout(pollState, 2200);
+    }
+
+    function startRecovery(connectionLost = false) {
+      if (recovery || disposed) return;
+      stopStatePoll();
+      timedOut = false;
+      setPhase('reconnecting');
+      const attempt = recovery = {
+        bootId: server?.bootId, connectionLost, deadline: performance.now() + reconnectTimeout
+      };
+      void checkHealth(attempt);
+    }
+
+    function expireRecovery() {
+      stopRecovery();
+      timedOut = true;
+      setPhase('timeout');
+      void pollState();
+    }
+
+    async function checkHealth(attempt) {
+      const started = performance.now();
+      const remaining = attempt.deadline - started;
+      if (remaining <= 0) {
+        expireRecovery();
+        return;
+      }
+      const canReconnect = (bootId, status) => Boolean(attempt.bootId && bootId !== attempt.bootId) ||
+        (status !== 'restarting' && (attempt.connectionLost || !attempt.bootId));
+      const controller = new AbortController();
+      attempt.request = controller;
+      const timer = setTimeout(() => controller.abort(), Math.min(checkTimeout, remaining));
+      try {
+        const health = await api('/health', 'GET', undefined, { signal: controller.signal, cache: 'no-store' });
+        if (recovery !== attempt || controller.signal.aborted) return;
+        if (!health?.ok || typeof health.bootId !== 'string' || !health.bootId || !health.restart) throw Error('Invalid Relay health');
+        const sameBoot = !attempt.bootId || health.bootId === attempt.bootId;
+        if (sameBoot && health.restart.status === 'failed') {
+          receiveRestart(health.restart);
+          stopRecovery();
+          setNetworkError('');
+          reopenMonitor(null);
+          void pollState();
+          return;
+        }
+        if (canReconnect(health.bootId, health.restart.status)) {
+          const next = await readState(controller.signal);
+          if (recovery !== attempt || controller.signal.aborted) return;
+          const nextBootId = next.server?.bootId;
+          if (nextBootId && canReconnect(nextBootId, next.restart?.status)) {
+            stopRecovery();
+            receiveState(next, restartVersion, true);
+            if (!recovery) stateTimer = setTimeout(pollState, 2200);
+            return;
+          }
+        }
+        attempt.bootId ??= health.bootId;
+      } catch {
+        if (recovery === attempt) attempt.connectionLost = true;
+      } finally {
+        clearTimeout(timer);
+        attempt.request = undefined;
+        if (recovery === attempt) {
+          const now = performance.now();
+          attempt.timer = setTimeout(() => { void checkHealth(attempt); },
+            Math.max(0, Math.min(checkInterval - (now - started), attempt.deadline - now)));
+        }
+      }
+    }
+
+    async function changeRestart(cancel, jobId) {
+      if (actionPending || recovery || timedOut) return;
+      actionPending = true;
+      setPending(true);
+      setRequestError('');
+      const version = restartVersion;
+      const requestEpoch = epoch;
+      function receiveAction(result) {
+        if (requestEpoch !== epoch || disposed) return;
+        if (server?.bootId && result.server?.bootId && server.bootId !== result.server.bootId) {
+          void pollState();
+          return;
+        }
+        server ??= result.server;
+        receiveRestart(result.restart, version);
+      }
+      try {
+        receiveAction(cancel ? await api('/system/restart/cancel', 'POST') :
+          await api('/system/restart', 'POST', { jobId }));
+      } catch (error) {
+        if (disposed || epoch !== requestEpoch) return;
+        if (error.data?.restart) receiveAction(error.data);
+        if (!error.data?.restart?.error) setRequestError(error.message);
+        if (!cancel && !error.status) startRecovery(true);
+      } finally {
+        actionPending = false;
+        if (!disposed) setPending(false);
+      }
+    }
+
+    session.current = {
+      pollState, receiveSnapshot, changeRestart,
+      retry: () => { setRequestError(''); startRecovery(true); }
+    };
+    return () => {
+      disposed = true;
+      session.current = null;
+      stopStatePoll();
+      stopRecovery();
+    };
+  }, []);
+
+  useEffect(() => { void session.current?.pollState(); }, [approvalJobId, approvalKind, approvalRequestedAt]);
+  return {
+    data, setData, networkError, setNetworkError, monitor,
+    relayRestart: {
+      restart, phase, pending, requestError,
+      changeRestart: (cancel, jobId) => session.current?.changeRestart(cancel, jobId),
+      retry: () => session.current?.retry(),
+      dismiss: () => setPhase(null)
+    }
+  };
+}
+
+function RestartBanner({ relayRestart }) {
+  const { restart, phase, pending, requestError, changeRestart, retry, dismiss } = relayRestart;
+  const waiting = restart?.status === 'waiting';
+  const timedOut = phase === 'timeout';
+  const failed = restart?.status === 'failed' || Boolean(requestError);
+  let tone, title, detail, Icon, action;
+  if (phase === 'reconnecting') {
+    tone = 'progress';
+    Icon = RefreshCw;
+    title = restart?.status === 'restarting' ? 'กำลังรีสตาร์ท Relay และรอเชื่อมต่อใหม่…' : 'กำลังรอเชื่อมต่อ Relay ใหม่…';
+  } else if (timedOut) {
+    tone = 'bad';
+    Icon = TriangleExclamationPoint;
+    title = 'หมดเวลารอเชื่อมต่อ Relay';
+    action = <Button icon={RefreshCw} onClick={retry}>ลองเชื่อมต่อใหม่</Button>;
+  } else if (waiting) {
+    tone = 'warn';
+    Icon = Clock;
+    title = 'รอให้งานค้างเสร็จก่อนรีสตาร์ท (' + restart.busyCount + ' งาน)';
+    detail = requestError;
+    action = <Button icon={X} onClick={() => changeRestart(true)} disabled={pending}>ยกเลิกการรอรีสตาร์ท</Button>;
+  } else if (pending) {
+    tone = 'progress';
+    Icon = RefreshCw;
+    title = 'กำลังส่งคำขอรีสตาร์ท Relay…';
+  } else if (failed) {
+    tone = 'bad';
+    Icon = TriangleExclamationPoint;
+    title = 'รีสตาร์ท Relay ไม่สำเร็จ';
+    detail = restart?.error || requestError;
+    action = <Button icon={RefreshCw} onClick={retry}>ลองเชื่อมต่อใหม่</Button>;
+  } else if (phase === 'connected') {
+    tone = 'ok';
+    Icon = CircleCheck;
+    title = 'เชื่อมต่อ Relay ใหม่เรียบร้อยแล้ว';
+    action = <button type="button" className="icon-button" aria-label="ปิดแถบสถานะการเชื่อมต่อ" onClick={dismiss}><X size={18} aria-hidden="true" /></button>;
+  } else {
+    return null;
+  }
+
+  return <div className={'restart-banner ' + tone}>
+    <Icon className="restart-banner-icon" size={19} aria-hidden="true" />
+    <div className="restart-banner-message" role={tone === 'bad' ? 'alert' : 'status'}>
+      <strong>{title}</strong>
+      {detail ? <p>{detail}</p> : null}
+      {tone === 'bad' ? <p>ตรวจข้อความในหน้าต่าง <code>start-relay.bat</code> แล้วเปิด Relay เองหากจำเป็น</p> : null}
+    </div>
+    {action}
+  </div>;
 }
 
 function monitorStageStatus(stage) {
@@ -1174,30 +1461,15 @@ function FixPanel({ job, updated }) {
   </div>;
 }
 
-function SelfUpdatePanel({ job, restart, onRestartChange }) {
-  const [pending, setPending] = useState(false);
-  const [requestError, setRequestError] = useState('');
+function SelfUpdatePanel({ job, relayRestart }) {
+  const { restart, phase, pending, requestError, changeRestart } = relayRestart;
   const { ui, built, dependencies, restarted } = job.selfUpdate;
   const needsRestart = job.selfUpdate.restart === true && !restarted;
   const status = restart?.status;
   const waiting = status === 'waiting';
-  const restarting = status === 'restarting';
+  const restarting = phase === 'reconnecting';
+  const timedOut = phase === 'timeout';
   const failed = status === 'failed';
-
-  async function changeRestart(cancel) {
-    setPending(true);
-    setRequestError('');
-    try {
-      const result = cancel ? await api('/system/restart/cancel', 'POST') :
-        await api('/system/restart', 'POST', { jobId: job.id });
-      onRestartChange(result);
-    } catch (error) {
-      if (error.data?.restart) onRestartChange(error.data);
-      if (!error.data?.restart?.error) setRequestError(error.message);
-    } finally {
-      setPending(false);
-    }
-  }
 
   return <div className={'self-update' + (built === false || needsRestart || dependencies ? ' warn' : '')}>
     <strong>อัปเดต Relay</strong>
@@ -1207,9 +1479,9 @@ function SelfUpdatePanel({ job, restart, onRestartChange }) {
     </ul> : null}
     {restarted ? <p role="status" className="self-update-status success"><Check size={16} aria-hidden="true" />รีสตาร์ท Relay แล้ว</p> : null}
     {needsRestart ? <>
-      {waiting ? <p role="status" className="self-update-status warn-text"><Clock size={16} aria-hidden="true" />รอให้งานค้างเสร็จก่อนรีสตาร์ท ({restart.busyCount} งาน)</p> : null}
-      {restarting ? <p role="status" className="self-update-status">กำลังรีสตาร์ท Relay…</p> : null}
-      {failed ? <div role="alert" className="error">
+      {waiting && !restarting && !timedOut ? <p role="status" className="self-update-status warn-text"><Clock size={16} aria-hidden="true" />รอให้งานค้างเสร็จก่อนรีสตาร์ท ({restart.busyCount} งาน)</p> : null}
+      {restarting ? <p className="self-update-status">กำลังรอเชื่อมต่อ Relay ใหม่…</p> : null}
+      {failed && !restarting && !timedOut ? <div className="error">
         <TriangleExclamationPoint size={16} aria-hidden="true" />
         <div>
           <strong>รีสตาร์ท Relay ไม่สำเร็จ</strong>
@@ -1217,16 +1489,16 @@ function SelfUpdatePanel({ job, restart, onRestartChange }) {
           <p>ตรวจข้อความในหน้าต่าง <code>start-relay.bat</code> แล้วเปิด Relay เองหากจำเป็น</p>
         </div>
       </div> : null}
-      {requestError ? <p role="alert" className="error">{requestError}</p> : null}
-      {!restarting ? <div className="action-row">
+      {requestError && !restarting && !timedOut ? <p className="error">{requestError}</p> : null}
+      {!restarting && !timedOut ? <div className="action-row">
         {waiting ? <Button icon={X} disabled={pending} onClick={() => changeRestart(true)}>ยกเลิกการรอรีสตาร์ท</Button> :
-          <Button primary icon={RotateCcw} disabled={pending} onClick={() => changeRestart(false)}>รีสตาร์ท Relay ตอนนี้</Button>}
+          <Button primary icon={RotateCcw} disabled={pending} onClick={() => changeRestart(false, job.id)}>รีสตาร์ท Relay ตอนนี้</Button>}
       </div> : null}
     </> : null}
   </div>;
 }
 
-function JobActions({ job, restart, onRestartChange, updated, removed, setError }) {
+function JobActions({ job, relayRestart, updated, removed, setError }) {
   const [working, setWorking] = useState(false);
   const hasBranch = Boolean(job.worktree || job.branchKept);
   async function run(task) {
@@ -1244,7 +1516,7 @@ function JobActions({ job, restart, onRestartChange, updated, removed, setError 
       {merged.before !== null ? <><small>ถ้าต้องการย้อน ใช้คำสั่งนี้ จะได้ commit ใหม่ที่ยกเลิกการเปลี่ยนแปลง ประวัติเดิมไม่หาย</small>
         <div className="action-row"><CopyButton text={undoCommand}>คัดลอกคำสั่งย้อน</CopyButton></div></> : null}
     </div> : null}
-    {merged && job.selfUpdate ? <SelfUpdatePanel job={job} restart={restart} onRestartChange={onRestartChange} /> : null}
+    {merged && job.selfUpdate ? <SelfUpdatePanel job={job} relayRestart={relayRestart} /> : null}
     {merged && job.status === 'needs_review' ? <div className="fix-panel attention">
       <p className="fix-lead"><Wrench size={15} aria-hidden="true" /> merge แล้วแต่ยังมีปัญหาค้าง ส่งต่อให้ Claude Code แก้บน {merged.into} ได้</p>
       <div className="action-row"><CopyButton text={handoffPrompt(job)}>คัดลอก prompt ให้ Claude Code</CopyButton></div>
@@ -1422,7 +1694,7 @@ function EventItem({ event }) {
   </li>;
 }
 
-function JobDetail({ job, projectName, monitor, restart, onRestartChange, approvalRequested, onApproval, onApprovalFocused, back, retry, updated, removed }) {
+function JobDetail({ job, projectName, monitor, relayRestart, approvalRequested, onApproval, onApprovalFocused, back, retry, updated, removed }) {
   const [tab, setTab] = useState('events');
   const [diff, setDiff] = useState(null);
   const [focus, setFocus] = useState(null);
@@ -1505,7 +1777,7 @@ function JobDetail({ job, projectName, monitor, restart, onRestartChange, approv
           <ol className="events timeline">{job.events.length ? [...job.events].reverse().map((event, i) => <EventItem key={job.events.length - i} event={event} />) : <li><p>รอเริ่มงาน</p></li>}</ol>}
       </section>
       <aside className="facts-column">
-        {!busy ? <section className="card detail"><JobActions job={job} restart={restart} onRestartChange={onRestartChange}
+        {!busy ? <section className="card detail"><JobActions job={job} relayRestart={relayRestart}
           updated={updated} removed={removed} setError={setError} /></section> : null}
         <section className="card detail facts">
           <h2>สรุปงาน</h2>
@@ -1869,10 +2141,7 @@ function isEditableTarget(node) {
 }
 
 function App() {
-  const [data, setData] = useState(null);
-  const restartRevision = useRef(0);
-  const monitor = useMonitor();
-  const [networkError, setNetworkError] = useState('');
+  const { data, setData, monitor, networkError, setNetworkError, relayRestart } = useRelayConnection();
   const [page, setPage] = useState('queue');
   const [selection, setSelection] = useState(null);
   const [approvalTarget, setApprovalTarget] = useState(null);
@@ -1881,31 +2150,6 @@ function App() {
   const [refreshing, setRefreshing] = useState(false);
   const [settingsDirty, setSettingsDirty] = useState(false);
   const { snapshot, connection } = monitor;
-  const activeJob = snapshot?.activeJob;
-  const approvalJobId = activeJob?.approval ? activeJob.id : null;
-  const approvalKind = activeJob?.approval?.kind;
-  const approvalRequestedAt = activeJob?.approval?.requestedAt;
-  useEffect(() => {
-    const controller = new AbortController();
-    const { signal } = controller;
-    let timer;
-    async function poll() {
-      const revision = restartRevision.current;
-      try {
-        const next = await readState(signal);
-        if (!signal.aborted) {
-          // A state request already in flight may predate the restart action's response.
-          const restartChanged = revision !== restartRevision.current;
-          setData(previous => restartChanged && next.server?.bootId === previous?.server?.bootId
-            ? { ...next, restart: previous?.restart } : next);
-          setNetworkError('');
-        }
-      } catch (error) { if (!signal.aborted) setNetworkError(error.message); }
-      if (!signal.aborted) timer = window.setTimeout(poll, 2200);
-    }
-    void poll();
-    return () => { controller.abort(); clearTimeout(timer); };
-  }, [approvalJobId, approvalKind, approvalRequestedAt]);
   useEffect(() => {
     if (!settingsDirty) return;
     const warn = event => { event.preventDefault(); event.returnValue = ''; };
@@ -1937,11 +2181,6 @@ function App() {
   function removeJob(id) {
     setData(previous => ({ ...previous, jobs: previous.jobs.filter(item => item.id !== id) }));
     setSelection(null);
-  }
-  function updateRestart({ server, restart }) {
-    restartRevision.current++;
-    setData(previous => previous && (!previous.server || previous.server.bootId === server?.bootId)
-      ? { ...previous, server: server ?? previous.server, restart } : previous);
   }
   async function refresh() {
     setRefreshing(true);
@@ -1981,17 +2220,20 @@ function App() {
       <footer><span className={data && !networkError ? 'live' : ''} /><div>Local Server · {networkError ? 'ออฟไลน์' : data ? 'พร้อมใช้งาน' : 'กำลังเชื่อมต่อ'}<small>{location.host}</small></div></footer>
     </aside>
     <div className="workspace">
-      <header className="topbar">
-        <div className="page-title"><h1>{pageInfo[pageKey][0]}</h1><p>{pageInfo[pageKey][1]}</p></div>
-        <div className="topbar-status" role="status">
-          {runningCount ? <span className="pulse" aria-hidden="true" /> : <span className="idle-dot" aria-hidden="true" />}
-          {runningCount ? 'กำลังทำ ' + runningCount + ' งาน' : 'ว่าง'}{waitingCount ? ' · รออนุมัติ ' + waitingCount : ''}{queuedCount ? ' · รอ ' + queuedCount : ''}</div>
-        <div className="actions"><Button icon={RefreshCw} onClick={refresh} disabled={refreshing}>{refreshing ? 'กำลังรีเฟรช' : 'รีเฟรชโควตา'}</Button><Button primary icon={Plus} onClick={() => setDialog({})} disabled={!data} title="สร้างงาน (N)" aria-keyshortcuts="n">สร้างงาน</Button></div>
-      </header>
+      <div className="workspace-header">
+        <header className="topbar">
+          <div className="page-title"><h1>{pageInfo[pageKey][0]}</h1><p>{pageInfo[pageKey][1]}</p></div>
+          <div className="topbar-status" role="status">
+            {runningCount ? <span className="pulse" aria-hidden="true" /> : <span className="idle-dot" aria-hidden="true" />}
+            {runningCount ? 'กำลังทำ ' + runningCount + ' งาน' : 'ว่าง'}{waitingCount ? ' · รออนุมัติ ' + waitingCount : ''}{queuedCount ? ' · รอ ' + queuedCount : ''}</div>
+          <div className="actions"><Button icon={RefreshCw} onClick={refresh} disabled={refreshing}>{refreshing ? 'กำลังรีเฟรช' : 'รีเฟรชโควตา'}</Button><Button primary icon={Plus} onClick={() => setDialog({})} disabled={!data} title="สร้างงาน (N)" aria-keyshortcuts="n">สร้างงาน</Button></div>
+        </header>
+        <RestartBanner relayRestart={relayRestart} />
+      </div>
       <main>
-        {networkError ? <p className="error banner" role="alert">{networkError}</p> : null}
-        {job ? <JobDetail key={job.id} job={job} projectName={projectName} monitor={monitor} restart={data.restart}
-          onRestartChange={updateRestart} approvalRequested={approvalTarget === job.id}
+        {networkError && !relayRestart.phase ? <p className="error banner" role="alert">{networkError}</p> : null}
+        {job ? <JobDetail key={job.id} job={job} projectName={projectName} monitor={monitor} relayRestart={relayRestart}
+          approvalRequested={approvalTarget === job.id}
           onApproval={openApproval} onApprovalFocused={() => setApprovalTarget(null)} back={() => open('queue')}
           retry={setDialog} updated={updateJob} removed={removeJob} /> :
           page === 'settings' ? <>
