@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import {
-  Activity, Check, CircleCheck, ClipboardList, Clock, FlaskConical, GitBranch, TriangleExclamationPoint, Wrench, X
+  Activity, Check, CircleCheck, ClipboardList, Clock, FlaskConical, GitBranch, TriangleAlert, Wrench, X
 } from 'lucide-react';
 
 // Panels for the job detail page: outcome tiles, the acceptance checklist from the Task Card,
@@ -56,16 +56,17 @@ const checkOk = check => typeof check?.ok === 'boolean' ? check.ok : check?.code
 const checkExit = check => check?.exitCode !== undefined ? check.exitCode : check?.code ?? null;
 const checkRan = check => typeof check?.ok === 'boolean' || (check?.code !== null && check?.code !== undefined) || check?.exitCode != null;
 
+function reviewOk(review) {
+  if (review.ok !== undefined) return review.ok;
+  return Array.isArray(review.findings) ? review.findings.length === 0 : null;
+}
+
 // The last review result: the final reviewHistory round, or job.review for older jobs.
 export function latestReview(job) {
   const history = Array.isArray(job?.reviewHistory) ? job.reviewHistory : [];
-  const last = history.at(-1);
-  if (last) return { ok: typeof last.ok === 'boolean' ? last.ok : Array.isArray(last.findings) ? last.findings.length === 0 : null,
-    summary: last.summary || '', findings: last.findings || [] };
-  const review = job?.review;
+  const review = history.at(-1) ?? job?.review;
   if (!review) return null;
-  return { ok: typeof review.ok === 'boolean' ? review.ok : Array.isArray(review.findings) ? review.findings.length === 0 : null,
-    summary: review.summary || '', findings: review.findings || [] };
+  return { ok: reviewOk(review), summary: review.summary || '', findings: review.findings || [] };
 }
 
 // Client-side twin of the server's evaluateAcceptance(job), used when the job came from /api/state
@@ -112,8 +113,8 @@ export function OutcomeTiles({ job, diffStat, diffText, onOpenTab }) {
   const tiles = [
     {
       key: 'review', icon: ClipboardList, label: 'ผลรีวิว',
-      tone: !review ? '' : review.ok ? 'ok' : 'warn',
-      value: !review ? 'ยังไม่รีวิว' : review.ok ? 'ไม่พบปัญหา' : findings ? 'เหลือ ' + findings + ' ข้อ' : 'ไม่ผ่าน',
+      tone: review?.ok == null ? '' : review.ok ? 'ok' : 'warn',
+      value: review?.ok == null ? 'ยังไม่รีวิว' : review.ok ? 'ไม่พบปัญหา' : findings ? 'เหลือ ' + findings + ' ข้อ' : 'ไม่ผ่าน',
       note: rounds > 1 ? 'รีวิว ' + rounds + ' รอบ' : review?.summary ? 'ดูสรุปจากรีวิว' : null
     },
     {
@@ -178,7 +179,11 @@ function AcceptanceStatus({ status }) {
 // PATCH /api/jobs/:id/acceptance; onUpdated({ id, manualChecks, acceptance }) lets the page sync the job.
 // `acceptance` may be the evaluated list from /api/jobs/:id/summary; otherwise it is computed here.
 // Jobs that did not come from a card show plan.acceptance as text.
-export function AcceptanceChecklist({ job, acceptance, onUpdated, readOnly = false }) {
+export function AcceptanceChecklist(props) {
+  return <JobAcceptanceChecklist key={props.job?.id} {...props} />;
+}
+
+function JobAcceptanceChecklist({ job, acceptance, onUpdated, readOnly = false }) {
   const [manualChecks, setManualChecks] = useState(() => ({ ...(job?.manualChecks || {}) }));
   const [saving, setSaving] = useState({});
   const [notice, setNotice] = useState(null);
@@ -189,7 +194,8 @@ export function AcceptanceChecklist({ job, acceptance, onUpdated, readOnly = fal
     const base = Array.isArray(acceptance) && acceptance.length ? acceptance : evaluateAcceptance(job);
     return base.map(item => {
       if (item.check !== 'manual') return item;
-      const checked = Boolean(manualChecks[String(item.index)]);
+      const key = String(item.index);
+      const checked = Object.hasOwn(manualChecks, key) ? manualChecks[key] : item.checked;
       return { ...item, checked, status: checked ? 'passed' : 'pending' };
     });
   }, [acceptance, job, manualChecks]);
@@ -217,7 +223,12 @@ export function AcceptanceChecklist({ job, acceptance, onUpdated, readOnly = fal
       setNotice({ text: 'บันทึกแล้ว' });
       onUpdated?.(result);
     } catch (error) {
-      setManualChecks(current => ({ ...current, [key]: previous }));
+      setManualChecks(current => {
+        const next = { ...current };
+        if (previous === undefined) delete next[key];
+        else next[key] = previous;
+        return next;
+      });
       setNotice({ text: 'บันทึก "' + item.text + '" ไม่สำเร็จ: ' + error.message, error: true });
     } finally {
       setSaving(current => { const next = { ...current }; delete next[key]; return next; });
@@ -283,14 +294,16 @@ export function ReviewHistoryList({ job, renderFinding }) {
     <ol className="review-rounds">
       {rounds.map((entry, position) => {
         const findings = Array.isArray(entry.findings) ? entry.findings : [];
-        const ok = typeof entry.ok === 'boolean' ? entry.ok : findings.length === 0;
+        const ok = reviewOk(entry);
+        const tone = ok === null ? 'pending' : ok ? 'ok' : 'warn';
+        const Icon = ok === null ? Clock : ok ? CircleCheck : TriangleAlert;
         const fixedBy = Array.isArray(entry.fixedBy) ? entry.fixedBy : [];
-        return <li key={(entry.round ?? 'latest') + ':' + position} className={'review-round ' + (ok ? 'ok' : 'warn') + (entry === latest ? ' latest' : '')}>
+        return <li key={(entry.round ?? 'latest') + ':' + position} className={'review-round ' + tone + (entry === latest ? ' latest' : '')}>
           <header className="review-round-head">
-            <span className="review-round-icon" aria-hidden="true">{ok ? <CircleCheck size={16} /> : <TriangleExclamationPoint size={16} />}</span>
+            <span className="review-round-icon" aria-hidden="true"><Icon size={16} /></span>
             <strong>{entry.round ? 'รอบ ' + entry.round : 'ผลรีวิวล่าสุด'}</strong>
             {entry.trigger ? <span className={'chip review-trigger ' + entry.trigger}>{triggerLabels[entry.trigger] || entry.trigger}</span> : null}
-            <span className={'review-result ' + (ok ? 'ok' : 'warn')}>{ok ? 'ไม่พบปัญหา' : findings.length ? 'พบ ' + findings.length + ' ข้อ' : 'ไม่ผ่าน'}</span>
+            <span className={'review-result ' + tone}>{ok === null ? 'ยังไม่ตรวจ' : ok ? 'ไม่พบปัญหา' : findings.length ? 'พบ ' + findings.length + ' ข้อ' : 'ไม่ผ่าน'}</span>
             {entry.provider || entry.at ? <small className="review-meta">
               {entry.provider ? 'รีวิวโดย ' + providerName(entry.provider) : ''}{entry.provider && entry.at ? ' · ' : ''}{entry.at ? dateTime(entry.at) : ''}
             </small> : null}
@@ -339,7 +352,7 @@ export function StageStepper({ job, children, defaultOpen = false }) {
         title={stageTitle(job, stage.key) + ' · ' + (stageStatusLabels[stage.status] || stage.status)}>
         <span className="stage-line-dot" aria-hidden="true">
           {stage.status === 'done' ? <Check size={12} /> : stage.status === 'failed' || stage.status === 'cancelled' ? <X size={12} /> :
-            stage.status === 'warning' ? <TriangleExclamationPoint size={12} /> : null}
+            stage.status === 'warning' ? <TriangleAlert size={12} /> : null}
         </span>
         <span className="stage-line-label">{stageTitle(job, stage.key)}</span>
         <span className="visually-hidden"> {stageStatusLabels[stage.status] || stage.status}</span>
