@@ -1350,8 +1350,18 @@ app.get('/api/state', (_req, res) => res.json({
 app.post('/api/quota/refresh', async (_req, res) => { await Promise.all([refreshCodex(root), refreshClaudeCode(root)]); res.json(publicQuotas()); });
 app.put('/api/settings', (req, res) => { state.settings = readSettings(req.body); save(); res.json(state.settings); });
 app.post('/api/jobs', async (req, res) => {
-  const { title, prompt, repo, runChecks, routes, fromJob, type, approvals } = req.body || {};
-  const job = await createJob({ title, prompt, repo, runChecks, routes, fromJob, type, approvals });
+  const { title, prompt, repo, runChecks, routes, fromJob, type, approvals, cardFrom } = req.body || {};
+  // Re-running or resuming a Task Card job keeps what the card asked for: file scope, command checks, AI preferences,
+  // budget and its own subtasks. They are rebuilt from the stored card the same way /api/cards builds them.
+  // Title, prompt, type, plan approval and the AI table still come from the dialog, where the user can change them.
+  const origin = typeof cardFrom === 'string' ? findJob(cardFrom) : null;
+  const spec = origin?.card ? cardToJob(origin.card, state.settings) : null;
+  const job = await createJob({ title, prompt, repo, routes, fromJob, type, approvals,
+    runChecks: runChecks === true || Boolean(spec?.commands.length),
+    ...(spec ? {
+      card: origin.card, scope: spec.scope, extraChecks: spec.commands, pinned: spec.pinned, profile: spec.profile,
+      cardSubtasks: spec.cardSubtasks, budgetUsd: spec.budgetUsd, maxPrompt: Math.max(20_000, origin.prompt.length)
+    } : {}) });
   res.status(201).json(publicJob(job));
 });
 

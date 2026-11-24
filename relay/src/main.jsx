@@ -636,11 +636,13 @@ function NewJob({ close, created, previous, jobs, projects, settings, quotas }) 
       if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission().catch(() => {});
       const job = mode === 'card' ? await api('/cards', 'POST', { card: { ...card, source: card.source || { kind: 'paste' } } }) :
         await api('/jobs', 'POST', { title: form.title, repo: form.repo, prompt: form.prompt, runChecks: form.runChecks, type: form.type,
-          approvals: form.approvePlan ? ['after_plan'] : [], routes: override ? routes : undefined, fromJob: previous?.id });
+          approvals: form.approvePlan ? ['after_plan'] : [], routes: override ? routes : undefined, fromJob: previous?.id,
+          cardFrom: previous?.card ? previous.cardFrom ?? previous.id : undefined });
       if (!previous?.title) writeStorage(draftKey, null);
       created(job);
     } catch (error) { setError(error.message); setPending(false); }
   }
+  const limit = previous?.card ? Math.max(20_000, previous.prompt?.length || 0) : promptLimit;
   const canReusePlan = previous?.plan && previous.prompt === form.prompt.trim();
   const resumable = previous?.stages?.backend?.status === 'done' && previous?.stages?.frontend?.status === 'done' && (previous.worktree || previous.branchKept);
   return <div className="overlay">
@@ -673,8 +675,15 @@ function NewJob({ close, created, previous, jobs, projects, settings, quotas }) 
         {repoInfo.uncommitted ? <span className="warn-text"> · มี {repoInfo.uncommitted} ไฟล์ที่ยังไม่ commit จะไม่ถูกส่งไป</span> : null}</p> :
         repoInfo ? <p className="repo-info bad">{repoInfo.error}</p> :
         <small>แอปส่งไฟล์โค้ดจาก commit HEAD และโจทย์ไปยัง AI ที่เลือกตามการตั้งค่า</small>}
-      <label>โจทย์และเกณฑ์รับงาน<textarea required name="prompt" maxLength={promptLimit} rows={6} placeholder="ระบุสิ่งที่ต้องการให้ AI ทำและวิธีตรวจว่าเสร็จแล้ว" value={form.prompt} onChange={event => set('prompt', event.target.value)} /></label>
-      <small className={'counter' + (form.prompt.length > promptLimit * 0.9 ? ' warn-text' : '')}>{form.prompt.length.toLocaleString()} / {promptLimit.toLocaleString()} ตัวอักษร{previous?.title ? '' : ' · บันทึกร่างอัตโนมัติ'}</small>
+      <label>โจทย์และเกณฑ์รับงาน<textarea required name="prompt" maxLength={limit} rows={6} placeholder="ระบุสิ่งที่ต้องการให้ AI ทำและวิธีตรวจว่าเสร็จแล้ว" value={form.prompt} onChange={event => set('prompt', event.target.value)} /></label>
+      <small className={'counter' + (form.prompt.length > limit * 0.9 ? ' warn-text' : '')}>{form.prompt.length.toLocaleString()} / {limit.toLocaleString()} ตัวอักษร{previous?.title ? '' : ' · บันทึกร่างอัตโนมัติ'}</small>
+      {previous?.card ? <p className="repo-info">ใช้ค่าจาก Task Card เดิมด้วย: {[
+        previous.scope ? 'ขอบเขตไฟล์' : null,
+        previous.checkCommands?.length ? 'คำสั่งตรวจ ' + previous.checkCommands.length + ' คำสั่ง' : null,
+        previous.pinned ? 'AI ที่ต้องการ' : null,
+        previous.cardSubtasks ? 'งานย่อยที่กำหนดเอง' : null,
+        previous.card.routing?.budget_usd !== undefined ? 'งบของการ์ด' : null
+      ].filter(Boolean).join(' · ') || 'ที่มาของการ์ด'}</p> : null}
       {canReusePlan ? <p className="repo-info">{resumable ?
         'ทำต่อจากจุดที่ค้างได้ ถ้า repo ยังอยู่ที่ commit เดิม Relay จะใช้แผนและผล Backend / Frontend เดิม แล้วไปขั้นทดสอบและรีวิวต่อ' :
         'ใช้แผนจากงานเดิมได้ ถ้า repo ยังอยู่ที่ commit เดิม Relay จะข้ามขั้นวางแผนเพื่อประหยัดโควตา'}</p> : null}
@@ -1409,7 +1418,7 @@ function JobDetail({ job, projectName, monitor, approvalRequested, onApproval, o
       <div className="job-header-actions">
         {['queued', 'running', 'waiting_approval'].includes(job.status) ? <Button danger icon={X} onClick={cancel}>หยุดงาน</Button> : null}
         {!busy && stuckStatuses.has(job.status) && job.plan ? <Button primary icon={RotateCcw} onClick={() => retry(job)}>ทำต่อจากจุดที่ค้าง</Button> : null}
-        {!busy ? <Button icon={RotateCcw} onClick={() => retry({ ...job, plan: undefined, id: undefined })}>สั่งงานนี้อีกครั้ง</Button> : null}
+        {!busy ? <Button icon={RotateCcw} onClick={() => retry({ ...job, plan: undefined, id: undefined, cardFrom: job.id })}>สั่งงานนี้อีกครั้ง</Button> : null}
       </div>
     </header>
     {job.error ? <p className="error banner" role="alert"><TriangleExclamationPoint size={16} aria-hidden="true" /> {job.error}</p> : null}
