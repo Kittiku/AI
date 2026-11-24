@@ -421,7 +421,7 @@ function MonitorActivityList({ job, expanded }) {
   </details>;
 }
 
-function LiveMonitor({ monitor, job, fallbackJob, saved, onDetails, onApproval, children }) {
+function LiveMonitor({ monitor, job, fallbackJob, saved, onDetails, onApproval, showTeam, children }) {
   const { snapshot, receivedAt, connection } = monitor;
   const [now, setNow] = useState(Date.now);
   const latest = snapshot?.lastFinishedJob;
@@ -482,6 +482,7 @@ function LiveMonitor({ monitor, job, fallbackJob, saved, onDetails, onApproval, 
       {roles.length ? <div className={'monitor-roles' + (roles.length === 1 ? ' single' : '')} key={job.id}>
         {roles.map(stage => <MonitorRole key={stage.key} stage={stage} single={job.single} activities={job.activities} />)}
       </div> : null}
+      {showTeam && job.team ? <TeamTree key={'team:' + job.id} job={job} team={job.team} compact /> : null}
       {job.activities.length ? <MonitorActivityList key={job.id} job={job} expanded={Boolean(fallbackJob) && !saved} /> : null}
     </> : children}
   </section>;
@@ -1005,7 +1006,7 @@ const subtaskStatus = {
 };
 const subtaskFinished = new Set(['passed', 'skipped', 'done']);
 const subtaskActive = new Set(['running', 'checking', 'fixing', 'merging', 'rerun']);
-const subtaskNumber = (item, index) => Number.isInteger(item.id) ? item.id : Number.isInteger(Number(item.id)) && String(item.id).trim() ? Number(item.id) : index + 1;
+const subtaskNumber = (item, index) => Number.isInteger(item.index) ? item.index : Number.isInteger(item.id) ? item.id : Number.isInteger(Number(item.id)) && String(item.id).trim() ? Number(item.id) : index + 1;
 
 // Use the server's waitingOn list, including an empty list. Infer dependencies only for older records.
 function waitingFor(item, items) {
@@ -1018,11 +1019,17 @@ function waitingFor(item, items) {
 }
 
 // Team view: each role's lead, its subtasks in order, who did each one and what the lead's check said.
-function TeamTree({ job }) {
-  const groups = Object.entries(job.team || {}).filter(([, items]) => items?.length);
+// Takes the full job.team from /api/state, or the monitor's { fromCard, backend, frontend } via `team`.
+// `compact` is the short form shown inside the live monitor on the home page.
+function TeamTree({ job = {}, team = job.team, compact = false }) {
+  const groups = ['backend', 'frontend'].map(role => [role, team?.[role]]).filter(([, items]) => Array.isArray(items) && items.length);
   if (!groups.length) return null;
-  return <section className="card team" aria-label="ทีมงาน">
-    <div className="card-head"><h2>ทีมงาน</h2>{job.plan?.complexity ? <span className="chip">{complexityNames[job.plan.complexity]}</span> : null}</div>
+  const fromCard = team?.fromCard === true || job.plan?.subtasksFromCard === true;
+  const Wrapper = compact ? 'div' : 'section';
+  const Title = compact ? 'h3' : 'h2';
+  return <Wrapper className={compact ? 'team compact' : 'card team'} aria-label="ทีมงาน">
+    <div className="card-head"><Title>ทีมงาน{fromCard ? <> <span className="plan-source-badge">งานย่อยจากการ์ด</span></> : null}</Title>
+      {!compact && job.plan?.complexity ? <span className="chip">{complexityNames[job.plan.complexity]}</span> : null}</div>
     <div className={'team-groups' + (groups.length === 1 ? ' single' : '')}>
       {groups.map(([role, items]) => {
         const passed = items.filter(item => subtaskFinished.has(item.status)).length;
@@ -1030,7 +1037,7 @@ function TeamTree({ job }) {
         const waiting = items.filter(item => waitingFor(item, items).length).length;
         return <div key={role} className="team-group">
           <header><strong>{job.single ? 'ผู้ลงมือ' : role === 'frontend' ? 'UX/UI' : 'Backend'}</strong>
-            <small>หัวหน้าแบ่ง {items.length} งานย่อย · ผ่านแล้ว {passed}</small>
+            <small>{compact ? '' : fromCard ? 'จากการ์ด ' : 'หัวหน้าแบ่ง '}{items.length} งานย่อย · ผ่านแล้ว {passed}</small>
             {active > 1 || waiting ? <span className="team-badges">
               {active > 1 ? <span className="team-badge parallel">ทำพร้อมกัน {active} ชิ้น</span> : null}
               {waiting ? <span className="team-badge waiting">รอชิ้นอื่น {waiting}</span> : null}
@@ -1042,7 +1049,9 @@ function TeamTree({ job }) {
               const [text, tone] = waits.length ? ['รอ #' + waits.join(', #'), 'waiting'] : subtaskStatus[item.status] || [item.status, ''];
               const parallel = active > 1 && subtaskActive.has(item.status);
               const deps = Array.isArray(item.dependsOn) ? item.dependsOn : [];
-              return <li key={item.id ?? index} className={'subtask ' + (tone || 'idle') + (parallel ? ' parallel' : '')}>
+              const worker = item.provider && item.provider !== 'reused' ? item.provider : null;
+              const prefer = providers[item.prefer] && item.prefer !== worker ? item.prefer : null;
+              return <li key={item.id ?? item.index ?? index} className={'subtask ' + (tone || 'idle') + (parallel ? ' parallel' : '')}>
                 <span className="subtask-no">{subtaskNumber(item, index)}</span>
                 <div className="subtask-body">
                   <div className="subtask-line"><strong>{item.title}</strong><em className={'subtask-status ' + tone}
@@ -1051,12 +1060,13 @@ function TeamTree({ job }) {
                     {parallel ? <span className="subtask-flag parallel">ทำพร้อมกัน</span> : null}
                     {deps.length && !waits.length && !subtaskFinished.has(item.status) ? <span className="subtask-flag">ต่อจาก #{deps.join(', #')}</span> : null}
                   </div> : null}
-                  <div className="subtask-who">
-                    {item.provider && item.provider !== 'reused' ? <span><ProviderIcon id={item.provider} size={12} /> ทำโดย {providerName(item.provider)}</span> : null}
+                  {worker || prefer || item.checker || item.fixes ? <div className="subtask-who">
+                    {worker ? <span><ProviderIcon id={worker} size={12} /> ทำโดย {providerName(worker)}</span> : null}
+                    {prefer ? <span className="subtask-prefer">AI ที่ต้องการ · {providerName(prefer)}</span> : null}
                     {item.checker ? <span><ProviderIcon id={item.checker} size={12} /> ตรวจโดย {providerName(item.checker)}</span> : null}
                     {item.fixes ? <span>แก้ {item.fixes} รอบ</span> : null}
-                  </div>
-                  {item.check ? <p className="subtask-check">{item.check}</p> : item.summary ? <p className="subtask-check">{item.summary}</p> : null}
+                  </div> : null}
+                  {compact ? null : item.check ? <p className="subtask-check">{item.check}</p> : item.summary ? <p className="subtask-check">{item.summary}</p> : null}
                 </div>
               </li>;
             })}
@@ -1064,7 +1074,7 @@ function TeamTree({ job }) {
         </div>;
       })}
     </div>
-  </section>;
+  </Wrapper>;
 }
 
 // A ready-to-paste brief for a Claude Code session: where the work is, what is still wrong, and what done means.
@@ -1907,7 +1917,7 @@ function App() {
             <Kpis jobs={jobs} onFilter={setFilter} onApproval={openApproval} />
             <div className="home-grid">
               <div className="home-main">
-                <LiveMonitor monitor={monitor} job={snapshot?.activeJob} onDetails={select} onApproval={openApproval} />
+                <LiveMonitor monitor={monitor} job={snapshot?.activeJob} onDetails={select} onApproval={openApproval} showTeam />
                 <Queue jobs={jobs} projects={projects} filter={filter} setFilter={setFilter} select={select} create={() => setDialog({})} hasProjects={projects.length > 0} addProject={() => open('projects')} />
               </div>
               <AiStatus quotas={data?.quotas} reserve={reserve} onMore={() => open('quota')} />
