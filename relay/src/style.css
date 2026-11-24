@@ -429,6 +429,9 @@ details.fact summary::marker { color: var(--muted); }
 .plan-tasks ol { margin: 4px 0 0; padding-left: 18px; }
 .plan-tasks li { margin-top: 6px; font-size: 13px; }
 .plan-tasks li p { margin-top: 1px; }
+.plan-source-badge, .plan-task-prefer { display: inline-block; border-radius: 10px; padding: 1px 8px; font-size: 12px; font-weight: 650; line-height: 1.5; }
+.plan-source-badge { margin-inline-start: 8px; background: var(--info-soft); color: var(--info); }
+.plan-task-prefer { background: var(--brand-soft); color: var(--brand-ink); }
 
 .diff-summary { font-size: 13px; color: var(--muted); margin-bottom: 8px; }
 .plus { color: var(--ok); font-weight: 650; margin-left: 6px; }

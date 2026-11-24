@@ -1232,6 +1232,27 @@ function UsageView({ job }) {
   </div>;
 }
 
+function PlanTaskGroups({ plan, single, Heading = 'h3' }) {
+  const minTasks = plan.subtasksFromCard === true ? 1 : 2;
+  return ['backend', 'frontend'].map(role => {
+    const tasks = plan[role + 'Tasks'];
+    if (!tasks || tasks.length < minTasks) return null;
+    return <div key={role} className="plan-tasks">
+      <Heading>งานย่อย {single ? '' : roleNames[role]} ({tasks.length})</Heading>
+      <ol>{tasks.map((task, index) => <li key={index}>
+        <strong>{task.title}</strong>
+        {task.prefer ? <> <span className="plan-task-prefer">AI ที่ต้องการ · {providerName(task.prefer)}</span></> : null}
+        <p>{task.goal}</p>
+        {task.files?.length ? <small>ไฟล์: {task.files.join(', ')}</small> : null}
+      </li>)}</ol>
+    </div>;
+  });
+}
+
+function CardSubtaskBadge({ plan }) {
+  return plan?.subtasksFromCard === true ? <> <span className="plan-source-badge">งานย่อยจากการ์ด</span></> : null;
+}
+
 // Shown while a job waits: the plan to approve, revise or reject, or a budget question.
 function ApprovalPanel({ job, panelRef }) {
   const [note, setNote] = useState('');
@@ -1264,17 +1285,14 @@ function ApprovalPanel({ job, panelRef }) {
     }
   }
   return <section ref={panelRef} tabIndex={-1} className="card approval-panel" aria-label="รออนุมัติ">
-    <h2>{plan ? 'ตรวจแผนก่อนลงมือ' : 'ถึงงบที่ตั้งไว้'}</h2>
+    <h2>{plan ? 'ตรวจแผนก่อนลงมือ' : 'ถึงงบที่ตั้งไว้'}<CardSubtaskBadge plan={plan} /></h2>
     <p>{job.approval.message}</p>
     {plan ? <div className="plan-view">
       <div><h3>{job.single ? 'สิ่งที่จะทำ' : 'Backend'}</h3><p className="preline">{plan.backend}</p>{plan.backendFiles?.length ? <small>ไฟล์: {plan.backendFiles.join(', ')}</small> : null}</div>
       {job.single ? null : <div><h3>UX/UI</h3><p className="preline">{plan.frontend}</p>{plan.frontendFiles?.length ? <small>ไฟล์: {plan.frontendFiles.join(', ')}</small> : null}</div>}
       <div><h3>ข้อตกลงระหว่างส่วน</h3><p className="preline">{plan.contract}</p></div>
       <div><h3>เกณฑ์รับงาน</h3><p className="preline">{plan.acceptance}</p></div>
-      {['backend', 'frontend'].map(role => plan[role + 'Tasks']?.length >= 2 ? <div key={role} className="plan-tasks">
-        <h3>งานย่อย {job.single ? '' : role === 'backend' ? 'Backend' : 'UX/UI'} ({plan[role + 'Tasks'].length})</h3>
-        <ol>{plan[role + 'Tasks'].map((task, index) => <li key={index}><strong>{task.title}</strong><p>{task.goal}</p>{task.files?.length ? <small>ไฟล์: {task.files.join(', ')}</small> : null}</li>)}</ol>
-      </div> : null)}
+      <PlanTaskGroups plan={plan} single={job.single} />
     </div> : null}
     {plan?.complexity ? <p className="muted">ความยากที่ประเมิน: {complexityNames[plan.complexity] || plan.complexity}</p> : null}
     {plan ? <label>หมายเหตุ (ต้องใส่ถ้าขอแก้แผน)<textarea rows={3} value={note} onChange={event => setNote(event.target.value)} placeholder="เช่น อย่าแตะไฟล์ CSS ของหน้า Records" /></label> : null}
@@ -1423,8 +1441,10 @@ function JobDetail({ job, projectName, monitor, approvalRequested, onApproval, o
           {skippedRoles.length ? <div className="fact"><h3>ส่วนที่ข้าม</h3><ul className="skipped-roles">{skippedRoles.map(([key, stage]) =>
             <li key={key}><span className="skipped-chip">{stageName(job, key)}</span> {stage.note}</li>)}</ul></div> : null}
           <details className="fact" open={job.prompt.length < 500}><summary><h3>โจทย์</h3></summary><p className="preline">{job.prompt}</p></details>
-          {job.plan ? <details className="fact"><summary><h3>แผนงาน</h3></summary>
-            <h4>ข้อตกลงระหว่างส่วน</h4><p className="preline">{job.plan.contract}</p><h4>เกณฑ์รับงาน</h4><p className="preline">{job.plan.acceptance}</p></details> : null}
+          {job.plan ? <details className="fact"><summary><h3>แผนงาน</h3><CardSubtaskBadge plan={job.plan} /></summary>
+            <h4>ข้อตกลงระหว่างส่วน</h4><p className="preline">{job.plan.contract}</p><h4>เกณฑ์รับงาน</h4><p className="preline">{job.plan.acceptance}</p>
+            {job.plan.subtasksFromCard === true ? <PlanTaskGroups plan={job.plan} single={job.single} Heading="h4" /> : null}
+          </details> : null}
           {job.scope ? <div className="fact"><h3>Scope</h3><p>{job.scope.include?.length ? 'แก้ได้เฉพาะ ' + job.scope.include.join(', ') : ''}{job.scope.exclude?.length ? ' · ห้ามแก้ ' + job.scope.exclude.join(', ') : ''}</p></div> : null}
           {job.branch && hasResult ? <div className="fact"><h3>Branch ผลลัพธ์</h3><code>{job.branch}</code>{job.worktree ? <small>{job.worktree}</small> : null}</div> : null}
           {job.budgetUsd != null ? <div className="fact"><h3>งบ</h3><p>{'$' + job.budgetUsd}</p></div> : null}
