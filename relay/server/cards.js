@@ -157,6 +157,36 @@ export function validateCard(card, { maxSubtasks } = {}) {
   return '';
 }
 
+const normalizeCommand = command => command.trim().replace(/\s+/g, ' ');
+
+export function evaluateAcceptance(job) {
+  const criteria = job.card?.acceptance;
+  if (!Array.isArray(criteria)) return [];
+
+  const review = job.reviewHistory?.at(-1) ?? job.review;
+  return criteria.map(({ text, check = 'review', command }, index) => {
+    const item = { index, text, check, command: check === 'command' ? command : null,
+      status: 'pending', checked: false, matchedCheck: null };
+
+    if (check === 'command') {
+      const normalized = normalizeCommand(command);
+      const result = job.checks?.findLast(({ label }) => normalizeCommand(label) === normalized);
+      if (result) {
+        const ok = result.code === 0;
+        item.matchedCheck = { command: result.label, ok, exitCode: result.code };
+        item.status = result.code === null ? 'skipped' : ok ? 'passed' : 'failed';
+      }
+    } else if (check === 'review') {
+      if (review?.ok === true) item.status = 'passed';
+      if (review?.ok === false) item.status = 'failed';
+    } else if (check === 'manual') {
+      item.checked = Boolean(job.manualChecks?.[String(index)]);
+      if (item.checked) item.status = 'passed';
+    }
+    return item;
+  });
+}
+
 // Turns a card into the fields of a Relay job. The prompt keeps every part of the card readable for the AIs.
 export function cardToJob(card, settings) {
   const lines = ['# ' + card.title.trim(), '', '## Goal', card.goal.trim()];

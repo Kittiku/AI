@@ -23,7 +23,7 @@ const providersUrl = moduleUrl(`
 const expressUrl = moduleUrl(`
   const noop = () => {};
   export default Object.assign(() => ({
-    disable: noop, use: noop, get: noop, post: noop, put: noop, delete: noop, listen: (port, _host, callback) => {
+    disable: noop, use: noop, get: noop, post: noop, put: noop, patch: noop, delete: noop, listen: (port, _host, callback) => {
       queueMicrotask(callback);
       return { address: () => ({ port }) };
     }

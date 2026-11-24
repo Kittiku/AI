@@ -15,7 +15,7 @@ import { buildStats } from './stats.js';
 import { createRestartController, defaultSelfUpdateSettings, normalizeSelfUpdateSettings, restartMessages, shouldAutoRestart } from './restart.js';
 import { PROFILES, rank } from './router.js';
 import { closeMonitorStages, createMonitor, liveStage, monitorFiles, recordMonitor } from './monitor.js';
-import { cardToJob, outOfScope, taskCardSchema, validateCard } from './cards.js';
+import { cardToJob, evaluateAcceptance, outOfScope, taskCardSchema, validateCard } from './cards.js';
 import {
   NO_WORK_NOTE, isNoWorkRole, mergeCardSubtasks, normalizeSubtasks, normalizeTeamSettings,
   preferredSubtaskProvider, runSubtaskScheduler, shouldCheckSubtask, shouldRunSubtasks
@@ -1521,11 +1521,28 @@ app.get('/api/jobs/:id/summary', async (req, res) => {
     mergeCommand: (job.worktree || job.branchKept) && !job.merged ? `git -C "${job.repo}" merge ${job.branch}` : null,
     type: job.type || 'feature', approval: job.approval || null, plan: job.plan || null, scope: job.scope || null, budgetUsd: job.budgetUsd ?? null,
     stages: job.stages || {}, card: job.card ?? null, review: job.review || null,
-    ...reviewDetails(job),
+    ...reviewDetails(job), manualChecks: job.manualChecks ?? {}, acceptance: evaluateAcceptance(job),
     checks: (job.checks || []).map(item => ({ label: item.label, code: item.code, output: String(item.output ?? '').slice(-1500) })),
     usage: job.usage || null, startedAt: job.startedAt || null, finishedAt: job.finishedAt || null,
     events: job.events.slice(-15), diffStatText, diff: diff.slice(0, limit), diffTruncated: diff.length > limit });
 });
+app.patch('/api/jobs/:id/acceptance', finishBeforeRestart((req, res) => {
+  const job = findJob(req.params.id);
+  if (!job) return res.status(404).json({ error: 'ไม่พบงานนี้' });
+  const { index, checked } = req.body || {};
+  const criteria = job.card?.acceptance;
+  if (!Number.isInteger(index) || index < 0 || !Array.isArray(criteria) || index >= criteria.length) {
+    return res.status(400).json({ error: 'index ต้องเป็นจำนวนเต็มในช่วงเกณฑ์รับงานของ Task Card' });
+  }
+  if (criteria[index]?.check !== 'manual') {
+    return res.status(400).json({ error: 'ติ๊กได้เฉพาะเกณฑ์รับงานแบบ manual' });
+  }
+  if (typeof checked !== 'boolean') return res.status(400).json({ error: 'checked ต้องเป็น true หรือ false' });
+
+  job.manualChecks = { ...job.manualChecks, [String(index)]: checked };
+  save();
+  res.json({ ok: true, id: job.id, manualChecks: job.manualChecks, acceptance: evaluateAcceptance(job) });
+}));
 app.post('/api/jobs/:id/approve', (req, res) => {
   const job = state.jobs.find(item => item.id === req.params.id);
   const approval = job?.approval;
@@ -1617,7 +1634,7 @@ async function createJob({ title, prompt, repo, runChecks, routes, fromJob, extr
     settings.routing = { ...settings.routing, profile };
   }
   const job = { id, repo: repoRoot, base, baseBranch: startBranch === 'HEAD' ? null : startBranch, branch: 'relay/' + id.slice(0, 12), title: title.trim(),
-    prompt: prompt.trim(), runChecks: runChecks === true, settings, status: 'queued', events: [], reviewHistory: [], createdAt: Date.now(),
+    prompt: prompt.trim(), runChecks: runChecks === true, settings, status: 'queued', events: [], reviewHistory: [], manualChecks: {}, createdAt: Date.now(),
     type: type || 'feature', single: jobTypes[type || 'feature'].single, scope: scope || null,
     approvalGates: [...new Set([...(approvals || []), ...(settings.approvals?.afterPlan ? ['after_plan'] : [])])] };
   // Resuming reuses the earlier plan when the task, repo and HEAD are unchanged, so the plan step costs no quota.
@@ -1784,7 +1801,7 @@ function reviewDetails(job) {
 }
 
 function publicJob({ monitor: _monitor, lastReviewedRound: _lastReviewedRound, ...job }) {
-  return { ...job, ...reviewDetails(job) };
+  return { ...job, ...reviewDetails(job), manualChecks: job.manualChecks ?? {} };
 }
 
 const findJob = id => state.jobs.find(item => item.id === id);

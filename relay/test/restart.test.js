@@ -387,7 +387,8 @@ test('the restart API reports boot and queue state and restores HTTP, SSE and SQ
         const { selfUpdate, ...settings } = fallback.settings;
         const common = { repo: ${JSON.stringify(repo)}, status: 'complete', events: [], branchKept: true, base: 'base' };
         store.persist({ ...fallback, settings, jobs: [
-          { ...common, id: 'merged', title: 'Relay server change', branch: 'relay/merged', selfUpdate: { at: 1, restart: true } },
+          { ...common, id: 'merged', title: 'Relay server change', branch: 'relay/merged', selfUpdate: { at: 1, restart: true },
+            card: { acceptance: [{ text: 'Check the result', check: 'manual' }] } },
           { ...common, id: 'docs', title: 'Docs change', branch: 'relay/docs' },
           { ...common, id: 'ui', title: 'Relay UI change', selfUpdate: { at: 1, ui: true, restart: false } }
         ] });
@@ -657,14 +658,15 @@ test('the restart API reports boot and queue state and restores HTTP, SSE and SQ
   const restarting = await request(restartPath, 'POST');
   assert.equal(restarting.status, 202);
   assert.equal(restarting.body.restart.status, 'restarting');
-  const [duplicate, conflict, newJob, newCard, newFix] = await Promise.all([
+  const [duplicate, conflict, newJob, newCard, newFix, acceptancePatch] = await Promise.all([
     request(restartPath, 'POST'), request(restartPath + '/cancel', 'POST'),
-    request('/api/jobs', 'POST', {}), request('/api/cards', 'POST', {}), request('/api/jobs/merged/fix', 'POST', {})
+    request('/api/jobs', 'POST', {}), request('/api/cards', 'POST', {}), request('/api/jobs/merged/fix', 'POST', {}),
+    request('/api/jobs/merged/acceptance', 'PATCH', { index: 0, checked: true })
   ]);
   assert.deepEqual(duplicate.body, restarting.body);
   assert.equal(conflict.status, 409);
   assert.equal(conflict.body.error, 'Relay กำลังรีสตาร์ทอยู่ ไม่สามารถยกเลิกได้');
-  for (const response of [newJob, newCard, newFix]) assert.equal(response.status, 503);
+  for (const response of [newJob, newCard, newFix, acceptancePatch]) assert.equal(response.status, 503);
   assert.deepEqual(await nextSnapshot(value => value.status === 'restarting'), restarting.body.restart);
 
   // Closing the old HTTP connections may end the stream normally or reset its socket.

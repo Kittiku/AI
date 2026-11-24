@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { registerHooks } from 'node:module';
 import { after, before, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { evaluateAcceptance } from '../server/cards.js';
 
 const serverDir = new URL('../server/', import.meta.url);
 const indexUrl = new URL('index.js', serverDir).href;
@@ -127,6 +128,7 @@ async function startJob(type = 'feature') {
   const { statusCode, body } = await request('POST', '/api/jobs', { title: 'Job detail', prompt: 'Update text', repo, type });
   assert.equal(statusCode, 201, body.error);
   assert.deepEqual(body.reviewHistory, []);
+  assert.deepEqual(body.manualChecks, {});
   assert.equal(body.diffStat, null);
   await server.drain();
   return body.id;
@@ -219,8 +221,11 @@ test('a legacy job exposes its existing review and can record a new manual revie
   for (const result of [state.jobs.find(job => job.id === legacy.id), summary]) {
     assert.deepEqual(result.review, legacyReview);
     assert.deepEqual(result.reviewHistory, []);
+    assert.deepEqual(result.manualChecks, {});
     assert.equal(result.diffStat, null);
   }
+  assert.deepEqual(summary.acceptance, []);
+  assert.equal(summary.plan.acceptance, plan.acceptance);
   assert.equal(summary.diff, 'the patch');
   assert.equal(Object.hasOwn(server.store.load().jobs.find(job => job.id === legacy.id), 'reviewHistory'), false);
 
@@ -275,4 +280,128 @@ test('resuming a manual round keeps its attribution and skips fixes that already
   ]);
   assert.equal(summary.reviewHistory[1].userNote, note);
   assert.deepEqual(summary.reviewHistory[1].fixedBy, [{ role: 'single', provider: 'claudecode' }]);
+});
+
+test('command acceptance uses the last matching result after normalizing whitespace', () => {
+  const commands = [' npm  test ', 'npm run  build', 'npm run lint', 'npm run format'];
+  const job = {
+    card: { acceptance: commands.map(command => ({ text: command.trim(), check: 'command', command })) },
+    checks: [
+      { label: 'npm test', code: 1 },
+      { label: 'npm run build', code: 0 },
+      { label: '  npm\ttest\n', code: 0 },
+      { label: 'npm   run build', code: 2 },
+      { label: 'npm run lint:all', code: 0 },
+      { label: 'npm run format', code: null }
+    ]
+  };
+  const results = evaluateAcceptance(job);
+  assert.deepEqual(results[0], {
+    index: 0, text: 'npm  test', check: 'command', command: ' npm  test ', status: 'passed', checked: false,
+    matchedCheck: { command: '  npm\ttest\n', ok: true, exitCode: 0 }
+  });
+  assert.deepEqual(results.map(({ status, matchedCheck }) => [status, matchedCheck]), [
+    ['passed', { command: '  npm\ttest\n', ok: true, exitCode: 0 }],
+    ['failed', { command: 'npm   run build', ok: false, exitCode: 2 }],
+    ['pending', null],
+    ['skipped', { command: 'npm run format', ok: false, exitCode: null }]
+  ]);
+  assert.ok(evaluateAcceptance({ card: job.card }).every(item => item.status === 'pending'));
+});
+
+test('review acceptance uses the last review and manual acceptance uses the saved index', () => {
+  const card = { acceptance: [
+    { text: 'Check the result', check: 'review' },
+    { text: 'Open the job', check: 'manual' },
+    { text: 'Check the layout', check: 'manual' },
+    { text: 'Review is the default' }
+  ] };
+  const statuses = job => evaluateAcceptance({ card, ...job }).map(({ status }) => status);
+  assert.deepEqual(statuses({}), ['pending', 'pending', 'pending', 'pending']);
+  assert.deepEqual(statuses({ review: { ok: true }, reviewHistory: [] }), ['passed', 'pending', 'pending', 'passed']);
+  assert.deepEqual(statuses({ review: { ok: false } }), ['failed', 'pending', 'pending', 'failed']);
+  assert.deepEqual(statuses({ review: { ok: true }, reviewHistory: [{ ok: false }, { ok: null }] }),
+    ['pending', 'pending', 'pending', 'pending']);
+
+  const [review, manual, unchecked, defaultReview] = evaluateAcceptance({
+    card, review: { ok: true }, reviewHistory: [{ ok: true }, { ok: false }], manualChecks: { 1: true, 2: false }
+  });
+  assert.deepEqual(review, {
+    index: 0, text: 'Check the result', check: 'review', command: null, status: 'failed', checked: false, matchedCheck: null
+  });
+  assert.deepEqual(manual, {
+    index: 1, text: 'Open the job', check: 'manual', command: null, status: 'passed', checked: true, matchedCheck: null
+  });
+  assert.equal(unchecked.checked, false);
+  assert.equal(unchecked.status, 'pending');
+  assert.equal(defaultReview.check, 'review');
+  assert.equal(defaultReview.status, 'failed');
+});
+
+const acceptancePath = '/api/jobs/:id/acceptance';
+function seedAcceptanceJob(id, card) {
+  server.state.jobs.push({
+    id, repo, title: 'Acceptance fixture', status: 'complete', createdAt: Date.now(), events: [], card,
+    plan, review: { ...pass, ok: true }, checks: [{ label: 'npm test', code: 0 }]
+  });
+  server.save();
+}
+
+test('PATCH acceptance saves checked and unchecked values to SQLite and returns the evaluated criteria', async () => {
+  const id = 'acceptance-detail';
+  seedAcceptanceJob(id, { acceptance: [
+    { text: 'Run the tests', check: 'command', command: 'npm  test' },
+    { text: 'Review the result', check: 'review' },
+    { text: 'Open the job', check: 'manual' },
+    { text: 'Check the layout', check: 'manual' }
+  ] });
+
+  for (const { index, checked, manualChecks } of [
+    { index: 2, checked: true, manualChecks: { 2: true } },
+    { index: 3, checked: true, manualChecks: { 2: true, 3: true } },
+    { index: 2, checked: false, manualChecks: { 2: false, 3: true } }
+  ]) {
+    const { statusCode, body } = await request('PATCH', acceptancePath, { index, checked }, id);
+    assert.equal(statusCode, 200, body.error);
+    assert.equal(body.ok, true);
+    assert.equal(body.id, id);
+    assert.deepEqual(body.manualChecks, manualChecks);
+    assert.equal(body.acceptance[index].checked, checked);
+    assert.equal(body.acceptance[index].status, checked ? 'passed' : 'pending');
+
+    const saved = server.store.load().jobs.find(job => job.id === id);
+    assert.deepEqual(saved.manualChecks, manualChecks);
+    const { body: state } = await request('GET', '/api/state');
+    assert.deepEqual(state.jobs.find(job => job.id === id).manualChecks, manualChecks);
+    const { body: summary, statusCode: summaryStatus } = await request('GET', '/api/jobs/:id/summary', undefined, id);
+    assert.equal(summaryStatus, 200);
+    assert.deepEqual(summary.manualChecks, manualChecks);
+    assert.deepEqual(summary.acceptance, body.acceptance);
+    assert.deepEqual(summary.acceptance.slice(0, 2).map(item => item.status), ['passed', 'passed']);
+  }
+});
+
+test('PATCH acceptance rejects unknown jobs, invalid indices, non-manual criteria and non-boolean values', async () => {
+  const id = 'acceptance-validation';
+  seedAcceptanceJob(id, { acceptance: [
+    { text: 'Open the job', check: 'manual' },
+    { text: 'Review the result', check: 'review' },
+    { text: 'Run the tests', check: 'command', command: 'npm test' }
+  ] });
+  seedAcceptanceJob('acceptance-no-card');
+
+  for (const [jobId, body, status, error] of [
+    ['missing-job', { index: 0, checked: true }, 404, /ไม่พบงาน/],
+    [id, { index: 1, checked: true }, 400, /manual/],
+    [id, { index: 2, checked: true }, 400, /manual/],
+    ...[-1, 3, 0.5, '0', undefined].map(index => [id, { index, checked: true }, 400, /index/]),
+    ...['true', 1, null, undefined].map(checked => [id, { index: 0, checked }, 400, /checked/]),
+    ['acceptance-no-card', { index: 0, checked: true }, 400, /index/]
+  ]) {
+    const response = await request('PATCH', acceptancePath, body, jobId);
+    assert.equal(response.statusCode, status);
+    assert.match(response.body.error, error);
+  }
+  assert.deepEqual((await request('GET', '/api/jobs/:id/summary', undefined, id)).body.manualChecks, {});
+  assert.equal(server.store.load().jobs.find(job => job.id === id).manualChecks, undefined);
 });

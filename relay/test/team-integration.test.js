@@ -34,7 +34,7 @@ const expressUrl = inlineModule(`
   export const routes = new Map();
   const register = method => (path, handler) => routes.set(method + ' ' + path, handler);
   export default Object.assign(() => ({
-    disable: noop, use: noop, get: register('GET'), post: register('POST'), put: register('PUT'), delete: noop, listen: (port, _host, callback) => {
+    disable: noop, use: noop, get: register('GET'), post: register('POST'), put: register('PUT'), patch: noop, delete: noop, listen: (port, _host, callback) => {
       queueMicrotask(callback);
       return { address: () => ({ port }) };
     }
