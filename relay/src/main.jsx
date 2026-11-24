@@ -28,10 +28,10 @@ const statusLabels = {
   queued: 'รอเริ่ม', running: 'กำลังดำเนินการ', stopping: 'กำลังหยุด', complete: 'พร้อมตรวจผล',
   needs_review: 'ต้องตรวจเพิ่ม', failed: 'งานติดขัด', cancelled: 'หยุดแล้ว', interrupted: 'ถูกขัดจังหวะ', waiting_approval: 'รออนุมัติ'
 };
-const jobTypes = { feature: 'ฟีเจอร์ใหม่ (Backend + UX/UI)', bugfix: 'แก้ bug (AI ตัวเดียว)', refactor: 'ปรับโครงสร้างโค้ด (AI ตัวเดียว)', docs: 'เอกสาร (AI ตัวเดียว)', other: 'อื่นๆ (Backend + UX/UI)' };
+const jobTypes = { feature: 'ฟีเจอร์ใหม่ (Backend + Frontend)', bugfix: 'แก้ bug (AI ตัวเดียว)', refactor: 'ปรับโครงสร้างโค้ด (AI ตัวเดียว)', docs: 'เอกสาร (AI ตัวเดียว)', other: 'อื่นๆ (Backend + Frontend)' };
 const stageName = (job, key) => job.single && key === 'backend' ? 'ลงมือทำ' : stageNames[key];
-const roleNames = { plan: 'วางแผน', backend: 'Backend', frontend: 'UX/UI', review: 'รีวิว' };
-const stageNames = { plan: 'วางแผน', backend: 'Backend', frontend: 'UX/UI', checks: 'ทดสอบ', review: 'รีวิว' };
+const roleNames = { plan: 'วางแผน', backend: 'Backend', frontend: 'Frontend', review: 'รีวิว' };
+const stageNames = { plan: 'วางแผน', backend: 'Backend', frontend: 'Frontend', checks: 'ทดสอบ', review: 'รีวิว' };
 const stageStatus = { pending: 'รอ', running: 'กำลังทำ', done: 'เสร็จ', warning: 'ตรวจเพิ่ม', failed: 'ล้มเหลว', cancelled: 'หยุด', waiting: 'รอโควตา', retrying: 'กำลังลองใหม่' };
 const busyStatuses = new Set(['queued', 'running', 'stopping', 'waiting_approval']);
 const doneStatuses = new Set(['complete', 'needs_review']);
@@ -676,7 +676,7 @@ function NewJob({ close, created, previous, jobs, projects, settings, quotas }) 
       <label>โจทย์และเกณฑ์รับงาน<textarea required name="prompt" maxLength={promptLimit} rows={6} placeholder="ระบุสิ่งที่ต้องการให้ AI ทำและวิธีตรวจว่าเสร็จแล้ว" value={form.prompt} onChange={event => set('prompt', event.target.value)} /></label>
       <small className={'counter' + (form.prompt.length > promptLimit * 0.9 ? ' warn-text' : '')}>{form.prompt.length.toLocaleString()} / {promptLimit.toLocaleString()} ตัวอักษร{previous?.title ? '' : ' · บันทึกร่างอัตโนมัติ'}</small>
       {canReusePlan ? <p className="repo-info">{resumable ?
-        'ทำต่อจากจุดที่ค้างได้ ถ้า repo ยังอยู่ที่ commit เดิม Relay จะใช้แผนและผล Backend / UX/UI เดิม แล้วไปขั้นทดสอบและรีวิวต่อ' :
+        'ทำต่อจากจุดที่ค้างได้ ถ้า repo ยังอยู่ที่ commit เดิม Relay จะใช้แผนและผล Backend / Frontend เดิม แล้วไปขั้นทดสอบและรีวิวต่อ' :
         'ใช้แผนจากงานเดิมได้ ถ้า repo ยังอยู่ที่ commit เดิม Relay จะข้ามขั้นวางแผนเพื่อประหยัดโควตา'}</p> : null}
       <label>ประเภทงาน<select value={form.type} onChange={event => set('type', event.target.value)}>
         {Object.entries(jobTypes).map(([id, label]) => <option key={id} value={id}>{label}</option>)}
@@ -815,7 +815,7 @@ function SettingsForm({ initial: storedSettings, changed, quotas, onDirty }) {
     </> : null}
     {show('quota') ? <>
     <h2>โควตาและรอบแก้</h2>
-    <p className="muted">ในขั้นวางแผน Backend และ UX/UI Relay จะข้าม AI ที่โควตาคงเหลือต่ำกว่าค่านี้ เพื่อเก็บโควตาไว้ใช้ในขั้นรีวิว หลอดโควตาจะมีเส้นบอกระดับนี้</p>
+    <p className="muted">ในขั้นวางแผน Backend และ Frontend Relay จะข้าม AI ที่โควตาคงเหลือต่ำกว่าค่านี้ เพื่อเก็บโควตาไว้ใช้ในขั้นรีวิว หลอดโควตาจะมีเส้นบอกระดับนี้</p>
     <div className="settings-grid">
       {Object.entries(providers).map(([id, model]) => <label key={id}>กันโควตา {model.name} (%)<input type="number" required min="0" max="99" value={draft.reserve[id]} onChange={event => setDraft({ ...draft, reserve: { ...draft.reserve, [id]: Number(event.target.value) } })} /></label>)}
       <label>เพดาน Gemini ต่อวัน (0 = ยังไม่ระบุ)<input type="number" required min="0" max="1000000" value={draft.geminiDailyLimit} onChange={event => setDraft({ ...draft, geminiDailyLimit: Number(event.target.value) })} /></label>
@@ -1036,7 +1036,7 @@ function TeamTree({ job = {}, team = job.team, compact = false }) {
         const active = items.filter(item => subtaskActive.has(item.status)).length;
         const waiting = items.filter(item => waitingFor(item, items).length).length;
         return <div key={role} className="team-group">
-          <header><strong>{job.single ? 'ผู้ลงมือ' : role === 'frontend' ? 'UX/UI' : 'Backend'}</strong>
+          <header><strong>{job.single ? 'ผู้ลงมือ' : role === 'frontend' ? 'Frontend' : 'Backend'}</strong>
             <small>{compact ? '' : fromCard ? 'จากการ์ด ' : 'หัวหน้าแบ่ง '}{items.length} งานย่อย · ผ่านแล้ว {passed}</small>
             {active > 1 || waiting ? <span className="team-badges">
               {active > 1 ? <span className="team-badge parallel">ทำพร้อมกัน {active} ชิ้น</span> : null}
@@ -1092,7 +1092,7 @@ function handoffPrompt(job) {
   ];
   if (findings.length) {
     lines.push('ปัญหาที่รีวิวเจอ:');
-    findings.forEach((item, index) => lines.push((index + 1) + '. ' + (item.owner ? '[' + (item.owner === 'frontend' ? 'UX/UI' : 'Backend') + '] ' : '') + item.detail));
+    findings.forEach((item, index) => lines.push((index + 1) + '. ' + (item.owner ? '[' + (item.owner === 'frontend' ? 'Frontend' : 'Backend') + '] ' : '') + item.detail));
     lines.push('');
   }
   if (failed.length) {
@@ -1299,7 +1299,7 @@ function ApprovalPanel({ job, panelRef }) {
     <p>{job.approval.message}</p>
     {plan ? <div className="plan-view">
       <div><h3>{job.single ? 'สิ่งที่จะทำ' : 'Backend'}</h3><p className="preline">{plan.backend}</p>{plan.backendFiles?.length ? <small>ไฟล์: {plan.backendFiles.join(', ')}</small> : null}</div>
-      {job.single ? null : <div><h3>UX/UI</h3><p className="preline">{plan.frontend}</p>{plan.frontendFiles?.length ? <small>ไฟล์: {plan.frontendFiles.join(', ')}</small> : null}</div>}
+      {job.single ? null : <div><h3>Frontend</h3><p className="preline">{plan.frontend}</p>{plan.frontendFiles?.length ? <small>ไฟล์: {plan.frontendFiles.join(', ')}</small> : null}</div>}
       <div><h3>ข้อตกลงระหว่างส่วน</h3><p className="preline">{plan.contract}</p></div>
       <div><h3>เกณฑ์รับงาน</h3><p className="preline">{plan.acceptance}</p></div>
       <PlanTaskGroups plan={plan} single={job.single} />

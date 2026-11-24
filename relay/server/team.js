@@ -35,7 +35,7 @@ export function mergeCardSubtasks(plan, cardSubtasks, maxSubtasks = 4) {
     for (const [index, task] of tasks.entries()) {
       const removed = task.dependsOn?.find(number => number > tasks.length && number <= requested.length);
       if (removed !== undefined) {
-        const label = role === 'backend' ? 'Backend' : 'UX/UI';
+        const label = role === 'backend' ? 'Backend' : 'Frontend';
         throw Error(`${label} งานย่อย #${index + 1} ต้องรอ #${removed} แต่ชิ้นที่รอเกินเพดานงานย่อย ${maxSubtasks} ชิ้น`);
       }
     }

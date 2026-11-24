@@ -20,7 +20,7 @@ import {
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const dataDir = path.resolve(process.env.RELAY_DATA_DIR || path.join(root, '.relay'));
-const roles = { plan: 'วางแผน', backend: 'Backend', frontend: 'UX/UI', review: 'รีวิว' };
+const roles = { plan: 'วางแผน', backend: 'Backend', frontend: 'Frontend', review: 'รีวิว' };
 const defaults = {
   routes: { plan: ['claudecode', 'gemini'], backend: ['claudecode', 'codex'], frontend: ['gemini', 'claudecode'], review: ['codex', 'gemini'] },
   reserve: { claudecode: 10, gemini: 10, codex: 20 }, geminiDailyLimit: 0, maxRounds: 2,
@@ -434,8 +434,8 @@ To change an existing file, prefer "edits": each item has the file path, a "find
 If a file you need is in omittedPaths and you can read files in the working directory, read it there. If you still cannot see the code you must change, set status to "blocked" and explain what is missing in summary instead of guessing.
 Set status "no_work" with empty arrays if this role has nothing to do, otherwise "done". Preserve unrelated code. Avoid editing shared files unless essential. Do not delete files or include binary assets.`;
 
-const planPrompt = 'Break the task into backend and UX/UI work that can run in parallel. Define a shared interface and concrete acceptance criteria. In backendFiles and frontendFiles list the existing repository paths (from trackedPaths) each role must read or change, including files listed in omittedPaths.';
-// Job types: a feature splits into Backend and UX/UI; the others use one implementer (the backend route).
+const planPrompt = 'Break the task into backend and frontend work that can run in parallel. Define a shared interface and concrete acceptance criteria. In backendFiles and frontendFiles list the existing repository paths (from trackedPaths) each role must read or change, including files listed in omittedPaths.';
+// Job types: a feature splits into Backend and Frontend; the others use one implementer (the backend route).
 const jobTypes = {
   feature: { single: false, plan: planPrompt },
   other: { single: false, plan: planPrompt },
@@ -722,7 +722,7 @@ async function work(job, signal) {
   const workRoot = path.join(dataDir, 'worktrees', job.id);
   mkdirSync(workRoot, { recursive: true });
   const integrated = path.join(workRoot, 'combined');
-  // Resuming starts from the earlier job's branch so finished Backend and UX/UI work is kept.
+  // Resuming starts from the earlier job's branch so finished Backend and Frontend work is kept.
   const resumeTip = job.resumeBranch ? await git(job.repo, 'rev-parse', '--verify', job.resumeBranch).catch(() => null) : null;
   const startPoint = resumeTip || job.base;
   // `resuming`: the app restarted while this job ran. Reuse its worktree and skip steps that already finished.
@@ -772,14 +772,14 @@ async function work(job, signal) {
   }
 
   if (resumeTip && !resuming) {
-    addEvent(job, 'ทำต่อ', 'ใช้ผล Backend และ UX/UI จาก branch ' + job.resumeBranch + ' แล้วไปขั้นทดสอบและรีวิวต่อ');
+    addEvent(job, 'ทำต่อ', 'ใช้ผล Backend และ Frontend จาก branch ' + job.resumeBranch + ' แล้วไปขั้นทดสอบและรีวิวต่อ');
     for (const role of job.single ? ['backend'] : ['backend', 'frontend']) {
       if (isNoWorkRole(job.plan, role)) skipRole(job, role, NO_WORK_NOTE);
       else finishRole(job, role, { provider: 'reused', startedAt: Date.now() });
     }
     finishStage(job, 'integrate', 'skipped', { branch: job.branch });
   } else if (resuming && built) {
-    if (!job.fixRequest) addEvent(job, 'ทำต่อ', 'Backend และ UX/UI เสร็จไว้แล้ว ไปขั้นทดสอบและรีวิวต่อ');
+    if (!job.fixRequest) addEvent(job, 'ทำต่อ', 'Backend และ Frontend เสร็จไว้แล้ว ไปขั้นทดสอบและรีวิวต่อ');
     if (!job.monitor.stages.integrate) finishStage(job, 'integrate', 'skipped', { branch: job.branch });
   } else {
     if (resuming) {
@@ -1176,7 +1176,7 @@ async function clearSubtaskWorktrees(repo, workRoot) {
   }
 }
 
-// Backend and UX/UI work in parallel worktrees, then their commits are combined.
+// Backend and Frontend work in parallel worktrees, then their commits are combined.
 // When the two changed the same lines, the second role redoes its part on top of the combined code.
 async function build(job, signal, workRoot, integrated, tracked) {
   const order = job.single ? ['backend'] : ['backend', 'frontend'];
@@ -1416,7 +1416,7 @@ app.post('/api/jobs/:id/fix', async (req, res) => {
   if (!job) return res.status(404).json({ error: 'ไม่พบงานนี้' });
   if (!['complete', 'needs_review'].includes(job.status)) return res.status(409).json({ error: 'แก้ต่อได้เฉพาะงานที่ทำเสร็จแล้ว' });
   if (job.merged) return res.status(409).json({ error: 'งานนี้ merge แล้ว สั่งงานใหม่แทน' });
-  if (!hasIntegratedBuild(job)) return res.status(409).json({ error: 'งานนี้ยังไม่มีผล Backend และ UX/UI ให้แก้ต่อ' });
+  if (!hasIntegratedBuild(job)) return res.status(409).json({ error: 'งานนี้ยังไม่มีผล Backend และ Frontend ให้แก้ต่อ' });
   const branchExists = await git(job.repo, 'rev-parse', '--verify', 'refs/heads/' + job.branch).then(() => true, () => false);
   if (!branchExists) return res.status(409).json({ error: 'ไม่พบ branch ' + job.branch + ' แล้ว (อาจถูกลบไป) สั่งงานใหม่แทน' });
   const { note, provider } = req.body || {};
@@ -1477,7 +1477,7 @@ async function createJob({ title, prompt, repo, runChecks, routes, fromJob, extr
     job.plan = structuredClone(source.plan);
     cardSubtasks ??= source.cardSubtasks && structuredClone(source.cardSubtasks);
     job.resumedFrom = source.id;
-    // Backend and UX/UI already finished on the old branch: continue from there instead of redoing them.
+    // Backend and Frontend already finished on the old branch: continue from there instead of redoing them.
     if (hasIntegratedBuild(source) && (source.worktree || source.branchKept)) {
       job.type = source.type || job.type;
       job.single = Boolean(source.single);

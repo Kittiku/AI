@@ -314,7 +314,7 @@ test('a real merge conflict is aborted before the subtask reruns on the role bra
   await assertCleanWorktrees(job);
 });
 
-test('a skipped UX/UI stage has no AI usage until review assigns it a fix on the integrated worktree', async () => {
+test('a skipped Frontend stage has no AI usage until review assigns it a fix on the integrated worktree', async () => {
   const plan = { ...planFor([], 'simple'), backendFiles: ['backend.txt'] };
   const finding = { owner: 'frontend', detail: 'Update frontend.txt to match backend.txt' };
   const { job, calls, repo } = await runJob({
@@ -345,7 +345,7 @@ test('a skipped UX/UI stage has no AI usage until review assigns it a fix on the
         assert.equal(integrated.status, 'done');
         assert.deepEqual(integrated.changedFiles, ['backend.txt']);
         assert.match(call.context.diff, /^\+backend update$/m);
-        return { summary: 'UX/UI fix required', findings: [finding] };
+        return { summary: 'Frontend fix required', findings: [finding] };
       }
       assert.match(call.context.diff, /^\+backend update$/m);
       assert.match(call.context.diff, /^\+frontend fix$/m);
@@ -438,7 +438,7 @@ test('a dependency removed by the subtask cap blocks implementation in both role
     plan, status: 'failed', contents: { 'backend.txt': 'base\n', 'ui.txt': 'base\n' },
     respond: () => assert.fail('implementation must wait for a valid plan')
   });
-  assert.match(job.error, /UX\/UI งานย่อย #1 ต้องรอ #5.*เพดานงานย่อย 4 ชิ้น/);
+  assert.match(job.error, /Frontend งานย่อย #1 ต้องรอ #5.*เพดานงานย่อย 4 ชิ้น/);
   assert.deepEqual(calls.map(call => call.kind), ['plan']);
   assert.deepEqual(stepLog(job), [['plan', 0, 'done']]);
   assert.equal(await git(job.worktree, 'rev-parse', 'HEAD'), job.base);
