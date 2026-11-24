@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { setImmediate as nextTurn } from 'node:timers/promises';
+import { cardToJob, validateCard } from '../server/cards.js';
 import {
   NO_WORK_NOTE, effectiveParallelLimit, isNoWorkRole, normalizeSubtasks, normalizeTeamSettings,
   runSubtaskScheduler, shouldCheckSubtask
@@ -302,4 +303,100 @@ test('a failed check blocks dependents and lets already running work settle befo
   independent.resolve();
   await rejection;
   assert.deepEqual(started, [1, 3]);
+});
+
+const taskCard = { title: 'Update preferences', project: 'Example', goal: 'Save user preferences' };
+const cardTask = (role, title, dependsOn, prefer) => ({
+  role, title, goal: '  Make the change  ', files: [title.trim() + '.js'], acceptance: '  The change is observable  ',
+  ...(dependsOn === undefined ? {} : { dependsOn }), ...(prefer === undefined ? {} : { prefer })
+});
+
+test('cardToJob groups interleaved subtasks by role and keeps role-local order and preferences', () => {
+  const card = {
+    ...taskCard,
+    subtasks: [
+      cardTask('backend', '  read  ', [2], 'codex'),
+      cardTask('frontend', 'form', [], 'gemini'),
+      cardTask('backend', 'store')
+    ]
+  };
+  assert.equal(validateCard(card, { maxSubtasks: 2 }), '');
+
+  const job = cardToJob(card, {});
+  assert.deepEqual(job.cardSubtasks, {
+    backend: [
+      { title: 'read', goal: 'Make the change', files: ['read.js'], acceptance: 'The change is observable', dependsOn: [2], prefer: 'codex' },
+      { title: 'store', goal: 'Make the change', files: ['store.js'], acceptance: 'The change is observable', dependsOn: [] }
+    ],
+    frontend: [
+      { title: 'form', goal: 'Make the change', files: ['form.js'], acceptance: 'The change is observable', dependsOn: [], prefer: 'gemini' }
+    ]
+  });
+  assert.match(job.prompt, /## Subtasks\n[\s\S]*### backend\n1\. read[\s\S]*Files: read\.js\n   Depends on: 2\n   Preferred AI: codex\n2\. store[\s\S]*### frontend\n1\. form[\s\S]*Preferred AI: gemini/);
+});
+
+for (const { name, subtasks, error } of [
+  { name: 'an out-of-range dependency', subtasks: [cardTask('backend', 'one', [3]), cardTask('backend', 'two')], error: /backend #1.*dependsOn.*#3 นอกช่วง/ },
+  { name: 'a dependency below one', subtasks: [cardTask('backend', 'one', [0])], error: /dependsOn\[0\].*ต้องไม่น้อยกว่า 1/ },
+  { name: 'a self-dependency', subtasks: [cardTask('frontend', 'one', [1])], error: /frontend #1.*dependsOn.*อ้างถึงตัวเอง/ },
+  {
+    name: 'a dependency cycle',
+    subtasks: [cardTask('backend', 'one', [2]), cardTask('backend', 'two', [3]), cardTask('backend', 'three', [1])],
+    error: /backend.*dependsOn.*วงจร.*#1 → #2 → #3 → #1/
+  },
+  {
+    name: 'a number that only exists in the other role',
+    subtasks: [cardTask('frontend', 'one'), cardTask('backend', 'one', [2]), cardTask('frontend', 'two')],
+    error: /backend #1.*dependsOn.*#2 นอกช่วงของฝั่งเดียวกัน/
+  }
+]) {
+  test('validateCard rejects ' + name, () => {
+    assert.match(validateCard({ ...taskCard, subtasks }, { maxSubtasks: 4 }), error);
+  });
+}
+
+test('validateCard applies the configured subtask cap separately to each role', () => {
+  const subtasks = ['backend', 'frontend'].flatMap(role => [cardTask(role, 'one'), cardTask(role, 'two')]);
+  assert.equal(validateCard({ ...taskCard, subtasks }, { maxSubtasks: 2 }), '');
+  for (const role of ['backend', 'frontend']) {
+    const card = { ...taskCard, subtasks: [...subtasks, cardTask(role, 'three')] };
+    assert.equal(validateCard(card), '');
+    assert.match(validateCard(card, { maxSubtasks: 2 }), new RegExp(role + ' มี 3 รายการ.*maxSubtasks.*2 รายการต่อฝั่ง'));
+  }
+});
+
+test('validateCard checks the required text, role and preference of a card subtask', () => {
+  const task = cardTask('backend', 'one');
+  for (const field of ['title', 'goal', 'acceptance']) {
+    const card = { ...taskCard, subtasks: [{ ...task, [field]: ' \t ' }] };
+    assert.match(validateCard(card), new RegExp(field + '.*ข้อความที่ไม่ว่าง'));
+  }
+  for (const field of ['role', 'prefer']) {
+    assert.match(validateCard({ ...taskCard, subtasks: [{ ...task, [field]: 'unknown' }] }),
+      new RegExp(field + '.*ต้องเป็นค่าใดค่าหนึ่ง'));
+  }
+});
+
+test('a legacy card and a card with an empty list produce the original job fields', () => {
+  const card = {
+    ...taskCard, context: 'Use the existing endpoint',
+    acceptance: [{ text: 'Tests pass', check: 'command', command: 'npm test' }],
+    scope: { include: ['server/**'] }, approvals: ['after_plan'],
+    routing: { prefer: { backend: 'codex' }, budget_usd: 2, profile: 'fast' }
+  };
+  const settings = { routes: { backend: ['claudecode', 'gemini'] } };
+  const expected = {
+    title: card.title,
+    prompt: [
+      '# Update preferences', '', '## Goal', 'Save user preferences', '', '## Context (agreed with the user)',
+      'Use the existing endpoint', '', '## Scope', 'Work in: server/**', '',
+      '## Acceptance criteria', '- [command] Tests pass (Relay runs: `npm test`)'
+    ].join('\n'),
+    commands: ['npm test'], routes: { backend: ['codex', 'claudecode'] }, budgetUsd: 2, type: 'feature',
+    scope: { include: ['server/**'], exclude: [] }, approvals: ['after_plan'], pinned: { backend: 'codex' }, profile: 'fast'
+  };
+  for (const input of [card, { ...card, subtasks: [] }]) {
+    assert.equal(validateCard(input, { maxSubtasks: 2 }), '');
+    assert.deepEqual(cardToJob(input, settings), expected);
+  }
 });
