@@ -570,6 +570,12 @@ function useRelayConnection() {
   };
 }
 
+function restartWaitingMessage(busyCount) {
+  return busyCount > 0
+    ? 'รอให้งานค้างเสร็จก่อนรีสตาร์ท (' + busyCount + ' งาน)'
+    : 'รอให้การดำเนินการปัจจุบันเสร็จก่อนรีสตาร์ท';
+}
+
 function RestartBanner({ relayRestart }) {
   const { restart, phase, pending, requestError, restartUnconfirmed, changeRestart, retry, dismiss } = relayRestart;
   const waiting = restart?.status === 'waiting';
@@ -588,7 +594,7 @@ function RestartBanner({ relayRestart }) {
   } else if (waiting) {
     tone = 'warn';
     Icon = Clock;
-    title = 'รอให้งานค้างเสร็จก่อนรีสตาร์ท (' + restart.busyCount + ' งาน)';
+    title = restartWaitingMessage(restart.busyCount);
     detail = requestError;
     action = <Button icon={X} onClick={() => changeRestart(true)} disabled={pending}>ยกเลิกการรอรีสตาร์ท</Button>;
   } else if (pending) {
@@ -1494,7 +1500,7 @@ function SelfUpdatePanel({ job, relayRestart }) {
     </ul> : null}
     {restarted ? <p role="status" className="self-update-status success"><Check size={16} aria-hidden="true" />รีสตาร์ท Relay แล้ว</p> : null}
     {needsRestart ? <>
-      {waiting && !restarting && !timedOut ? <p role="status" className="self-update-status warn-text"><Clock size={16} aria-hidden="true" />รอให้งานค้างเสร็จก่อนรีสตาร์ท ({restart.busyCount} งาน)</p> : null}
+      {waiting && !restarting && !timedOut ? <p role="status" className="self-update-status warn-text"><Clock size={16} aria-hidden="true" />{restartWaitingMessage(restart.busyCount)}</p> : null}
       {restarting ? <p className="self-update-status">กำลังรอเชื่อมต่อ Relay ใหม่…</p> : null}
       {failed && !restarting && !timedOut ? <div className="error">
         <TriangleExclamationPoint size={16} aria-hidden="true" />
