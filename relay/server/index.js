@@ -1785,13 +1785,14 @@ app.post('/api/jobs/:id/merge', finishBeforeRestart(async (req, res) => {
   addEvent(job, 'Merge', (check.alreadyMerged ? 'branch นี้อยู่ใน ' : 'merge เข้า ') + check.target + ' แล้ว (' + commit.slice(0, 7) + (check.fastForward ? ', fast-forward' : '') + ')');
   job.selfUpdate = await rebuildSelf(job, check.alreadyMerged ? job.base : headBefore, commit);
   save();
-  if (shouldAutoRestart(job.selfUpdate, state.settings)) {
-    void restartController.requestRestart({ source: 'auto', reason: job.title });
-  }
   if (req.body?.cleanup) {
     await cleanup(job, false);
     await git(job.repo, 'branch', '-d', job.branch).then(() => { job.branchKept = false; }).catch(() => {});
     addEvent(job, 'Merge', 'ล้าง worktree และลบ branch ' + job.branch + ' แล้ว');
+  }
+  save();
+  if (shouldAutoRestart(job.selfUpdate, state.settings)) {
+    void restartController.requestRestart({ source: 'auto', reason: job.title });
   }
   res.json(publicJob(job));
 }));
