@@ -8,6 +8,7 @@ import {
 } from 'lucide-react';
 import AddProjectModal from './AddProjectModal.jsx';
 import StatsPage from './StatsPage.jsx';
+import { AcceptanceChecklist, OutcomeTiles, ReviewHistoryList, StageStepper } from './JobDetailPanels.jsx';
 import './style.css';
 
 const providers = {
@@ -548,8 +549,17 @@ function useRelayConnection() {
       }
     }
 
+    function updateManualChecks({ id, manualChecks }) {
+      setData(previous => previous && {
+        ...previous,
+        jobs: previous.jobs.map(job => job.id === id ? { ...job, manualChecks } : job)
+      });
+      // Refresh after saving so any in-flight poll cannot restore an older set of checks.
+      void pollState();
+    }
+
     session.current = {
-      pollState, receiveSnapshot, changeRestart,
+      pollState, receiveSnapshot, changeRestart, updateManualChecks,
       retry: () => { setRequestError(''); startRecovery(true); }
     };
     return () => {
@@ -563,6 +573,7 @@ function useRelayConnection() {
   useEffect(() => { void session.current?.pollState(); }, [approvalJobId, approvalKind, approvalRequestedAt]);
   return {
     data, setData, networkError, setNetworkError, monitor,
+    onAcceptanceUpdated: result => session.current?.updateManualChecks(result),
     relayRestart: {
       restart, phase, pending, requestError, restartUnconfirmed,
       changeRestart: (cancel, jobId) => session.current?.changeRestart(cancel, jobId),
@@ -659,9 +670,10 @@ function MonitorActivity({ activity }) {
     {activity.provider ? <span> · {providerName(activity.provider)}</span> : null}</>;
 }
 
-function MonitorTimeline({ job, roles }) {
+const monitorTimelineKeys = ['prepare', 'plan', 'work', 'integrate', 'checks', 'review', 'delivery'];
+
+function MonitorTimeline({ job, roles, keys = monitorTimelineKeys }) {
   const byKey = Object.fromEntries(job.stages.map(stage => [stage.key, stage]));
-  const keys = ['prepare', 'plan', 'work', 'integrate', 'checks', 'review', 'delivery'];
   return <ol className="monitor-timeline" aria-label="ขั้นตอนการทำงาน">
     {keys.filter(key => !['prepare', 'delivery'].includes(key) || byKey[key]).map(key => {
       const stage = key === 'work' ? implementationStage(roles) : byKey[key] || { key };
@@ -713,9 +725,15 @@ function MonitorRole({ stage, single, activities }) {
       <div><dt>รอบแก้</dt><dd>{stage.round ?? '–'}</dd></div>
       <div><dt>Branch</dt><dd><code>{stage.branch || '–'}</code></dd></div>
     </dl>
+    <MonitorRoleFiles stage={stage} />
+  </article>;
+}
+
+function MonitorRoleFiles({ stage }) {
+  return <>
     <MonitorFiles label="ไฟล์ตามแผน" files={stage.plannedFiles} unknown="ยังไม่มีข้อมูลไฟล์ตามแผน" empty="ไม่มีไฟล์ในแผน" />
     <MonitorFiles label="ไฟล์ที่ตรวจพบว่าแก้แล้ว" files={stage.changedFiles} unknown="ยังไม่มีผลตรวจไฟล์" empty="ตรวจแล้วไม่พบการแก้ไข" />
-  </article>;
+  </>;
 }
 
 function MonitorActivityList({ job, expanded }) {
@@ -731,7 +749,7 @@ function MonitorActivityList({ job, expanded }) {
   </details>;
 }
 
-function LiveMonitor({ monitor, job, fallbackJob, saved, onDetails, onApproval, showTeam, children }) {
+function LiveMonitor({ monitor, job, fallbackJob, saved, onDetails, onApproval, showTeam, hideIdentity = false, detailJob, children }) {
   const { snapshot, receivedAt, connection } = monitor;
   const [now, setNow] = useState(Date.now);
   const latest = snapshot?.lastFinishedJob;
@@ -755,8 +773,8 @@ function LiveMonitor({ monitor, job, fallbackJob, saved, onDetails, onApproval, 
         {saved ? 'ข้อมูลที่บันทึกไว้' : monitorConnections[connection]}
       </span>
     </header>
-    <div className="monitor-summary">
-      <div className="monitor-job">
+    <div className={'monitor-summary' + (hideIdentity ? ' monitor-summary-detail' : '')}>
+      {!hideIdentity ? <div className="monitor-job">
         {summary ? <>
           {!job && !fallbackJob ? <small>งานล่าสุดที่จบ</small> : null}
           <h3>{summary.title}</h3>
@@ -765,13 +783,15 @@ function LiveMonitor({ monitor, job, fallbackJob, saved, onDetails, onApproval, 
             {summary.branch ? <span><GitBranch size={14} aria-hidden="true" /><code>{summary.branch}</code></span> : null}
           </p> : null}
         </> : <h3>{snapshot ? 'ไม่มีงานที่กำลังทำ' : 'ยังไม่มีข้อมูลติดตามงาน'}</h3>}
-      </div>
-      <div className="monitor-summary-right">
+      </div> : summary?.branch ? <p className="monitor-project">
+        <span><GitBranch size={14} aria-hidden="true" /><code>{summary.branch}</code></span>
+      </p> : null}
+      {!hideIdentity ? <div className="monitor-summary-right">
         {summary ? <span className={'status ' + summary.status}>{statusLabels[summary.status] || 'ยังไม่มีสถานะ'}</span> : null}
         {onDetails && summary ? <button type="button" className="monitor-link" onClick={() => onDetails(summary.id)}>
           ดูรายละเอียด <ArrowRight size={15} aria-hidden="true" />
         </button> : null}
-      </div>
+      </div> : null}
       <dl className="monitor-metrics">
         {(job && !saved) || elapsed ? <div><dt>เวลาที่ผ่านไป</dt><dd>{elapsed || '–'}</dd></div> : null}
         {finishedAt != null ? <div><dt>จบเมื่อ</dt><dd>{dateTime(finishedAt)}</dd></div> : null}
@@ -789,7 +809,8 @@ function LiveMonitor({ monitor, job, fallbackJob, saved, onDetails, onApproval, 
     </div> : null}
     {job ? <>
       <MonitorTimeline job={job} roles={roles} />
-      {roles.length ? <div className={'monitor-roles' + (roles.length === 1 ? ' single' : '')} key={job.id}>
+      {detailJob ? <TeamTree job={detailJob} team={detailJob.team ?? job.team} roleStages={roles} /> :
+        roles.length ? <div className={'monitor-roles' + (roles.length === 1 ? ' single' : '')} key={job.id}>
         {roles.map(stage => <MonitorRole key={stage.key} stage={stage} single={job.single} activities={job.activities} />)}
       </div> : null}
       {showTeam && job.team ? <TeamTree key={'team:' + job.id} job={job} team={job.team} compact /> : null}
@@ -1288,25 +1309,31 @@ function CopyButton({ text, children }) {
 }
 
 // Merge in two steps: check first (target branch, uncommitted files, predicted conflicts), then confirm.
-function MergePanel({ job, updated }) {
-  const [check, setCheck] = useState(null);
+function useJobMerge(job, updated) {
+  const [preview, setPreview] = useState(null);
+  const version = job.finishedAt ?? job.status;
+  const check = preview?.version === version ? preview.check : null;
   const [cleanupAfter, setCleanupAfter] = useState(true);
   const [busyState, setBusyState] = useState('');
   const [error, setError] = useState('');
   async function prepare() {
     setBusyState('check'); setError('');
-    try { setCheck(await api('/jobs/' + job.id + '/merge-check')); } catch (error) { setError(error.message); } finally { setBusyState(''); }
+    try { setPreview({ version, check: await api('/jobs/' + job.id + '/merge-check') }); }
+    catch (error) { setError(error.message); } finally { setBusyState(''); }
   }
   async function merge() {
     setBusyState('merge'); setError('');
-    try { updated(await api('/jobs/' + job.id + '/merge', 'POST', { target: check.target, cleanup: cleanupAfter })); setCheck(null); }
-    catch (error) { setError(error.message); if (error.data?.check) setCheck(error.data.check); }
+    try { updated(await api('/jobs/' + job.id + '/merge', 'POST', { target: check.target, cleanup: cleanupAfter })); close(); }
+    catch (error) { setError(error.message); if (error.data?.check) setPreview({ version, check: error.data.check }); }
     finally { setBusyState(''); }
   }
-  if (!check) return <div className="merge-panel">
-    <Button primary={job.status !== 'needs_review'} icon={GitBranch} onClick={prepare} disabled={Boolean(busyState)}>{busyState ? 'กำลังตรวจ…' : job.status === 'needs_review' ? 'Merge ทั้งที่ยังมีปัญหา' : 'Merge เข้า repo'}</Button>
-    {error ? <p role="alert" className="error">{error}</p> : null}
-  </div>;
+  function close() { setPreview(null); setError(''); }
+  return { check, cleanupAfter, setCleanupAfter, busyState, error, prepare, merge, close };
+}
+
+function MergePanel({ job, mergeAction }) {
+  const { check, cleanupAfter, setCleanupAfter, busyState, error, prepare, merge, close } = mergeAction;
+  if (!check) return error ? <p role="alert" className="error">{error}</p> : null;
   const blocked = check.blockers.length > 0;
   return <div className={'merge-panel open' + (blocked ? ' blocked' : '')}>
     <strong>{check.alreadyMerged ? 'branch นี้อยู่ใน ' + check.target + ' แล้ว' : 'Merge ' + job.branch + ' → ' + check.target}</strong>
@@ -1328,7 +1355,7 @@ function MergePanel({ job, updated }) {
     <div className="action-row">
       {blocked ? <Button onClick={prepare} disabled={Boolean(busyState)}>ตรวจอีกครั้ง</Button> :
         <Button primary icon={Check} onClick={merge} disabled={Boolean(busyState)}>{busyState === 'merge' ? 'กำลัง merge…' : check.alreadyMerged ? 'บันทึกว่า merge แล้ว' : 'ยืนยัน merge เข้า ' + check.target}</Button>}
-      <Button onClick={() => { setCheck(null); setError(''); }} disabled={busyState === 'merge'}>ยกเลิก</Button>
+      <Button onClick={close} disabled={busyState === 'merge'}>ยกเลิก</Button>
     </div>
   </div>;
 }
@@ -1357,8 +1384,12 @@ function waitingFor(item, items) {
 // Team view: each role's lead, its subtasks in order, who did each one and what the lead's check said.
 // Takes the full job.team from /api/state, or the monitor's { fromCard, backend, frontend } via `team`.
 // `compact` is the short form shown inside the live monitor on the home page.
-function TeamTree({ job = {}, team = job.team, compact = false }) {
-  const groups = ['backend', 'frontend'].map(role => [role, team?.[role]]).filter(([, items]) => Array.isArray(items) && items.length);
+function TeamTree({ job = {}, team = job.team, compact = false, roleStages = [], archived = false }) {
+  const groups = ['backend', 'frontend'].map(role => ({
+    role,
+    items: Array.isArray(team?.[role]) ? team[role] : [],
+    stage: roleStages.find(stage => stage.key === role)
+  })).filter(({ items, stage }) => items.length || stage);
   if (!groups.length) return null;
   const fromCard = team?.fromCard === true || job.plan?.subtasksFromCard === true;
   const Wrapper = compact ? 'div' : 'section';
@@ -1367,19 +1398,37 @@ function TeamTree({ job = {}, team = job.team, compact = false }) {
     <div className="card-head"><Title>ทีมงาน{fromCard ? <> <span className="plan-source-badge">งานย่อยจากการ์ด</span></> : null}</Title>
       {!compact && job.plan?.complexity ? <span className="chip">{complexityNames[job.plan.complexity]}</span> : null}</div>
     <div className={'team-groups' + (groups.length === 1 ? ' single' : '')}>
-      {groups.map(([role, items]) => {
+      {groups.map(({ role, items, stage }) => {
         const passed = items.filter(item => subtaskFinished.has(item.status)).length;
         const active = items.filter(item => subtaskActive.has(item.status)).length;
         const waiting = items.filter(item => waitingFor(item, items).length).length;
         return <div key={role} className="team-group">
           <header><strong>{job.single ? 'ผู้ลงมือ' : role === 'frontend' ? 'Frontend' : 'Backend'}</strong>
-            <small>{compact ? '' : fromCard ? 'จากการ์ด ' : 'หัวหน้าแบ่ง '}{items.length} งานย่อย · ผ่านแล้ว {passed}</small>
+            {items.length ? <small>{compact ? '' : fromCard ? 'จากการ์ด ' : 'หัวหน้าแบ่ง '}{items.length} งานย่อย · ผ่านแล้ว {passed}</small> : null}
+            {stage && !archived ? <span className="chip team-role-status">
+              {stage.status === 'skipped' ? 'ข้ามขั้นนี้' : monitorStageStatus(stage)}
+            </span> : null}
             {active > 1 || waiting ? <span className="team-badges">
               {active > 1 ? <span className="team-badge parallel">ทำพร้อมกัน {active} ชิ้น</span> : null}
               {waiting ? <span className="team-badge waiting">รอชิ้นอื่น {waiting}</span> : null}
             </span> : null}
           </header>
-          <ol className="subtasks">
+          {stage ? <div className="team-role-details">
+            {!archived && (stage.action || stage.waitUntil) ? <p className="monitor-role-action">
+              {monitorActions[stage.action]}
+              {stage.waitUntil ? <> ถึง <time dateTime={new Date(stage.waitUntil).toISOString()}>{dateTime(stage.waitUntil)}</time></> : null}
+            </p> : null}
+            {!archived && stage.note ? <p className="team-role-note">{stage.note}</p> : null}
+            {!archived || stage.branch ? <dl className="monitor-role-meta">
+              {!archived ? <>
+                <div><dt>AI</dt><dd>{stage.provider ? providerName(stage.provider) : '–'}</dd></div>
+                <div><dt>รอบแก้</dt><dd>{stage.round ?? '–'}</dd></div>
+              </> : null}
+              {stage.branch || !archived ? <div><dt>Branch</dt><dd><code>{stage.branch || '–'}</code></dd></div> : null}
+            </dl> : null}
+            <MonitorRoleFiles stage={stage} />
+          </div> : null}
+          {items.length ? <ol className="subtasks">
             {items.map((item, index) => {
               const waits = waitingFor(item, items);
               const [text, tone] = waits.length ? ['รอ #' + waits.join(', #'), 'waiting'] : subtaskStatus[item.status] || [item.status, ''];
@@ -1406,7 +1455,7 @@ function TeamTree({ job = {}, team = job.team, compact = false }) {
                 </div>
               </li>;
             })}
-          </ol>
+          </ol> : null}
         </div>;
       })}
     </div>
@@ -1428,7 +1477,11 @@ function handoffPrompt(job) {
   ];
   if (findings.length) {
     lines.push('ปัญหาที่รีวิวเจอ:');
-    findings.forEach((item, index) => lines.push((index + 1) + '. ' + (item.owner ? '[' + (item.owner === 'frontend' ? 'Frontend' : 'Backend') + '] ' : '') + item.detail));
+    findings.forEach((item, index) => {
+      const detail = typeof item === 'string' ? item : item.detail || item.text || item.summary || JSON.stringify(item);
+      const owner = item.owner ? '[' + (roleNames[item.owner] || item.owner) + '] ' : '';
+      lines.push((index + 1) + '. ' + owner + detail);
+    });
     lines.push('');
   }
   if (failed.length) {
@@ -1445,8 +1498,7 @@ function handoffPrompt(job) {
 }
 
 // One more fix round on the same branch, or hand the open problems to a Claude Code session.
-function FixPanel({ job, updated }) {
-  const [open, setOpen] = useState(false);
+function FixPanel({ job, updated, open, setOpen, showTrigger }) {
   const [note, setNote] = useState('');
   const [provider, setProvider] = useState('');
   const [sending, setSending] = useState(false);
@@ -1478,7 +1530,7 @@ function FixPanel({ job, updated }) {
         <Button onClick={() => { setOpen(false); setError(''); }} disabled={sending}>ยกเลิก</Button>
       </div>
     </div> : <div className="action-row">
-      <Button primary={attention} icon={Wrench} onClick={() => setOpen(true)}>แก้ต่ออีกรอบ</Button>
+      {showTrigger ? <Button icon={Wrench} onClick={() => setOpen(true)}>แก้ต่ออีกรอบ</Button> : null}
       <CopyButton text={handoffPrompt(job)}>คัดลอก prompt ให้ Claude Code</CopyButton>
     </div>}
   </div>;
@@ -1522,8 +1574,9 @@ function SelfUpdatePanel({ job, relayRestart }) {
   </div>;
 }
 
-function JobActions({ job, relayRestart, updated, removed, setError }) {
+function JobActions({ job, relayRestart, updated, removed, retry, canFix, fixOpen, setFixOpen, primaryFix, mergeAction, mergeButton }) {
   const [working, setWorking] = useState(false);
+  const [error, setError] = useState('');
   const hasBranch = Boolean(job.worktree || job.branchKept);
   async function run(task) {
     setWorking(true); setError('');
@@ -1534,7 +1587,7 @@ function JobActions({ job, relayRestart, updated, removed, setError }) {
   const undoCommand = merged && (merged.fastForward && merged.before ? 'git -C ' + quote(job.repo) + ' revert --no-edit ' + merged.before.slice(0, 10) + '..' + merged.commit.slice(0, 10)
     : 'git -C ' + quote(job.repo) + ' revert --no-edit -m 1 ' + merged.commit.slice(0, 10));
   return <div className="job-actions">
-    <h3>ขั้นต่อไป</h3>
+    <h2>ขั้นต่อไป</h2>
     {merged ? <div className="merged-box">
       <p><Check size={16} aria-hidden="true" /> merge เข้า <code>{merged.into}</code> แล้วเมื่อ {dateTime(merged.at)} · commit <code>{merged.commit.slice(0, 7)}</code>{merged.fastForward ? ' (fast-forward)' : ''}</p>
       {merged.before !== null ? <><small>ถ้าต้องการย้อน ใช้คำสั่งนี้ จะได้ commit ใหม่ที่ยกเลิกการเปลี่ยนแปลง ประวัติเดิมไม่หาย</small>
@@ -1545,8 +1598,8 @@ function JobActions({ job, relayRestart, updated, removed, setError }) {
       <p className="fix-lead"><Wrench size={15} aria-hidden="true" /> merge แล้วแต่ยังมีปัญหาค้าง ส่งต่อให้ Claude Code แก้บน {merged.into} ได้</p>
       <div className="action-row"><CopyButton text={handoffPrompt(job)}>คัดลอก prompt ให้ Claude Code</CopyButton></div>
     </div> : null}
-    {hasBranch && !merged && ['complete', 'needs_review'].includes(job.status) ? <FixPanel job={job} updated={updated} /> : null}
-    {hasBranch && !merged ? <MergePanel job={job} updated={updated} /> : null}
+    {canFix ? <FixPanel job={job} updated={updated} open={fixOpen} setOpen={setFixOpen} showTrigger={!primaryFix} /> : null}
+    {hasBranch && !merged ? <>{mergeButton}<MergePanel job={job} mergeAction={mergeAction} /></> : null}
     {hasBranch ? <>
       {merged ? null : <p>หรือ merge เองด้วย Git: branch <code>{job.branch}</code></p>}
       <div className="action-row">
@@ -1556,16 +1609,23 @@ function JobActions({ job, relayRestart, updated, removed, setError }) {
       </div>
     </> : merged ? null : <p>{job.cleanedAt ? 'ล้าง worktree และ branch ของงานนี้แล้ว' : 'งานนี้ไม่มี branch ผลลัพธ์'}</p>}
     <div className="action-row">
-      {job.worktree ? <Button icon={Trash} disabled={working} onClick={() => run(async () => {
-        if (confirm('ลบโฟลเดอร์ worktree ของงานนี้? branch ' + job.branch + ' ยังอยู่ใน repo')) updated(await api('/jobs/' + job.id + '/cleanup', 'POST', {}));
-      })}>ล้าง worktree</Button> : null}
-      {hasBranch ? <Button danger icon={GitBranch} disabled={working} onClick={() => run(async () => {
-        if (confirm('ลบ branch ' + job.branch + ' ด้วย? ถ้ายังไม่ได้ merge ผลงานจะหายและกู้คืนไม่ได้')) updated(await api('/jobs/' + job.id + '/cleanup', 'POST', { deleteBranch: true }));
-      })}>ลบ branch</Button> : null}
-      <Button danger icon={Trash} disabled={working} onClick={() => run(async () => {
-        if (confirm('ลบงานนี้ออกจากประวัติ? Relay จะล้าง worktree ด้วย แต่ branch ผลลัพธ์ยังอยู่ใน repo')) { await api('/jobs/' + job.id, 'DELETE', {}); removed(job.id); }
-      })}>ลบงานนี้</Button>
+      <Button icon={RotateCcw} onClick={() => retry({ ...job, plan: undefined, id: undefined, cardFrom: job.id })}>สั่งงานนี้อีกครั้ง</Button>
     </div>
+    <details className="job-management">
+      <summary>จัดการ worktree และงาน</summary>
+      <div className="action-row">
+        {job.worktree ? <Button icon={Trash} disabled={working} onClick={() => run(async () => {
+          if (confirm('ลบโฟลเดอร์ worktree ของงานนี้? branch ' + job.branch + ' ยังอยู่ใน repo')) updated(await api('/jobs/' + job.id + '/cleanup', 'POST', {}));
+        })}>ล้าง worktree</Button> : null}
+        {hasBranch ? <Button danger icon={GitBranch} disabled={working} onClick={() => run(async () => {
+          if (confirm('ลบ branch ' + job.branch + ' ด้วย? ถ้ายังไม่ได้ merge ผลงานจะหายและกู้คืนไม่ได้')) updated(await api('/jobs/' + job.id + '/cleanup', 'POST', { deleteBranch: true }));
+        })}>ลบ branch</Button> : null}
+        <Button danger icon={Trash} disabled={working} onClick={() => run(async () => {
+          if (confirm('ลบงานนี้ออกจากประวัติ? Relay จะล้าง worktree ด้วย แต่ branch ผลลัพธ์ยังอยู่ใน repo')) { await api('/jobs/' + job.id, 'DELETE', {}); removed(job.id); }
+        })}>ลบงานนี้</Button>
+      </div>
+    </details>
+    {error ? <p role="alert" className="error">{error}</p> : null}
   </div>;
 }
 
@@ -1718,26 +1778,77 @@ function EventItem({ event }) {
   </li>;
 }
 
-function JobDetail({ job, projectName, monitor, relayRestart, approvalRequested, onApproval, onApprovalFocused, back, retry, updated, removed }) {
+const jobDetailTabs = [
+  ['events', 'ประวัติการทำงาน'], ['review', 'รีวิว'], ['checks', 'ผลทดสอบ'],
+  ['diff', 'Git diff'], ['usage', 'การใช้ AI'], ['routing', 'การจ่ายงาน']
+];
+
+function JobChecks({ checks = [] }) {
+  if (!checks.length) return <p className="muted">ยังไม่มีผลทดสอบ</p>;
+  return checks.map((check, index) => {
+    const code = check.exitCode ?? check.code;
+    const status = check.ok ?? (code == null ? null : code === 0);
+    return <details key={index} className="check">
+      <summary><span className={'check-dot ' + (status === true ? 'ok' : status === false ? 'bad' : 'off')} />
+        {check.command ?? check.label}<em>{status === true ? 'ผ่าน' : status === false ? 'ไม่ผ่าน' : 'ไม่ได้รัน'}</em></summary>
+      <pre>{check.output}</pre>
+    </details>;
+  });
+}
+
+function JobDetail({ job, projectName, monitor, relayRestart, approvalRequested, onApproval, onApprovalFocused, back, retry, updated, removed, onAcceptanceUpdated }) {
   const [tab, setTab] = useState('events');
   const [diff, setDiff] = useState(null);
+  const [diffAttempt, setDiffAttempt] = useState(0);
   const [focus, setFocus] = useState(null);
-  const [error, setError] = useState('');
-  const [loading, setLoading] = useState(false);
+  const [cancelError, setCancelError] = useState('');
+  const [fixOpen, setFixOpen] = useState(false);
   const approvalRef = useRef(null);
+  const nextStepRef = useRef(null);
+  const detailRef = useRef(null);
+  const mergeAction = useJobMerge(job, updated);
   const { snapshot } = monitor;
-  const liveJob = snapshot?.activeJob?.id === job.id ? snapshot.activeJob : null;
-  const finishedJob = snapshot?.lastFinishedJob?.id === job.id ? snapshot.lastFinishedJob : null;
-  const savedJob = useSavedJobMonitor(job.id, Boolean(liveJob), finishedJob?.status ?? job.status, monitor.connection === 'stale');
-  const status = liveJob?.status ?? finishedJob?.status ?? savedJob?.status ?? job.status;
-  const finishedAt = finishedJob?.finishedAt ?? savedJob?.finishedAt ?? job.finishedAt;
+  const active = snapshot?.activeJob;
+  const latest = snapshot?.lastFinishedJob;
+  // A manual fix reuses the job ID. Ignore snapshots from the previous round.
+  const liveJob = active?.id === job.id && (active.startedAt ?? 0) >= (job.fixRequest?.at ?? 0) &&
+    (!job.finishedAt || active.startedAt > job.finishedAt) ? active : null;
+  const finishedJob = latest?.id === job.id &&
+    latest.finishedAt >= Math.max(job.startedAt ?? 0, job.fixRequest?.at ?? 0, job.finishedAt ?? 0) ? latest : null;
+  const status = liveJob?.status ?? finishedJob?.status ?? job.status;
+  const savedJob = useSavedJobMonitor(job.id, Boolean(liveJob), status, monitor.connection === 'stale');
+  const monitorJob = liveJob ?? (savedJob?.status === status ? savedJob : null);
   const busy = busyStatuses.has(status);
-  // The live snapshot confirms a request only while it is trustworthy. When it is missing or stale (the live channel
-  // is down), /api/state is the source of truth, and the answer is still checked against a fresh /api/state and by the server.
+  const canAct = !busy && !busyStatuses.has(job.status);
+  // Approval is also checked against fresh state before a decision is sent.
   const liveUnreliable = !snapshot || monitor.connection === 'stale';
   const showApproval = job.status === 'waiting_approval' && Number.isFinite(job.approval?.requestedAt) &&
     (job.approval.kind !== 'plan' || Boolean(job.plan)) && (liveUnreliable || sameApproval(job.approval, liveJob?.approval));
-  const hasResult = Boolean(job.worktree || job.branchKept || job.merged);
+  const hasBranch = Boolean(job.worktree || job.branchKept);
+  const hasResult = hasBranch || Boolean(job.merged);
+  const canMerge = canAct && hasBranch && !job.merged;
+  const canFix = canMerge && doneStatuses.has(job.status);
+  const primaryMerge = canMerge && status === 'complete';
+  const primaryFix = canFix && status === 'needs_review';
+  const primaryResume = canAct && stuckStatuses.has(status);
+  const canCancel = ['queued', 'running', 'waiting_approval'].includes(status);
+
+  // Fetch the diff for the tab or for older finished jobs that lack diffStat.
+  const needsDiffStat = !busy && !job.diffStat && job.diff == null;
+  const shouldLoadDiff = hasResult && (tab === 'diff' || needsDiffStat);
+  const diffVersion = (busy ? 'live' : finishedJob?.finishedAt ?? job.finishedAt ?? 'finished') + ':' + diffAttempt;
+  const currentDiff = diff?.version === diffVersion ? diff : null;
+  useEffect(() => {
+    if (!shouldLoadDiff || currentDiff) return;
+    const controller = new AbortController();
+    const { signal } = controller;
+    api('/jobs/' + job.id + '/diff', 'GET', undefined, { signal, cache: 'no-store' }).then(
+      value => { if (!signal.aborted) setDiff({ version: diffVersion, value }); },
+      error => { if (!signal.aborted) setDiff({ version: diffVersion, error: error.message }); }
+    );
+    return () => controller.abort();
+  }, [job.id, shouldLoadDiff, diffVersion, currentDiff]);
+
   useEffect(() => {
     if (!approvalRequested || !showApproval) return;
     const panel = approvalRef.current;
@@ -1745,23 +1856,45 @@ function JobDetail({ job, projectName, monitor, relayRestart, approvalRequested,
     panel.scrollIntoView({ block: 'start' });
     onApprovalFocused();
   }, [approvalRequested, showApproval, onApprovalFocused]);
-  async function showDiff(file) {
-    setTab('diff'); setError(''); setFocus(file || null);
-    if (diff && !busy && file) return;
-    setLoading(true);
-    try { setDiff(await api('/jobs/' + job.id + '/diff')); }
-    catch (error) { setError(error.message); }
-    finally { setLoading(false); }
+
+  function openDetailTab(nextTab, file) {
+    if (nextTab === 'diff') {
+      setFocus(file || null);
+      if (currentDiff && (busy || currentDiff.error)) setDiffAttempt(attempt => attempt + 1);
+    }
+    setTab(nextTab);
   }
+
+  function jumpTo(ref) {
+    ref.current?.focus({ preventScroll: true });
+    ref.current?.scrollIntoView({ block: 'start' });
+  }
+
   async function cancel() {
+    setCancelError('');
     try { updated(await api('/jobs/' + job.id + '/cancel', 'POST')); }
-    catch (error) { setError(error.message); }
+    catch (error) { setCancelError(error.message); }
   }
-  const assigned = Object.entries(job.stages || {}).filter(([, stage]) => Object.hasOwn(providers, stage.provider));
-  const skippedRoles = ['backend', 'frontend'].map(key => [key, job.stages?.[key]])
-    .filter(([key, stage]) => stage?.status === 'skipped' && stage.note && !(job.single && key === 'frontend'));
-  const manualChecks = job.card?.acceptance?.filter(item => item.check === 'manual') || [];
-  return <>
+
+  const mergeButton = canMerge ? <Button primary={primaryMerge} icon={GitBranch}
+    onClick={() => {
+      jumpTo(nextStepRef);
+      if (!mergeAction.check) void mergeAction.prepare();
+    }} disabled={Boolean(mergeAction.busyState)}>
+    {mergeAction.busyState === 'check' ? 'กำลังตรวจ…' : primaryMerge ? 'Merge เข้า repo' :
+      job.status === 'needs_review' ? 'Merge ทั้งที่ยังมีปัญหา' : 'Merge เข้า repo'}
+  </Button> : null;
+  const roleStages = monitorJob?.stages.filter(stage => workKeys.has(stage.key)) ?? [];
+  const archivedStages = monitorJob?.stages.filter(stage =>
+    ['prepare', 'integrate', 'delivery'].includes(stage.key) && stage.status !== 'pending') ?? [];
+  const stepperStages = { ...job.stages, ...Object.fromEntries(
+    (monitorJob?.stages ?? []).map(stage => [stage.key, { ...job.stages?.[stage.key], ...stage }])
+  ) };
+  const diffText = currentDiff?.value?.diff;
+  const emptyDiffStat = diffText === '' ? { files: 0, additions: 0, deletions: 0 } : undefined;
+  const detailTab = tab === 'routing' && !job.routing?.length ? 'events' : tab;
+
+  return <div className="job-detail">
     <button type="button" className="back" onClick={back}><ChevronLeft size={16} /> กลับไปภาพรวม</button>
     <header className="job-header card">
       <div className="job-header-main">
@@ -1769,58 +1902,72 @@ function JobDetail({ job, projectName, monitor, relayRestart, approvalRequested,
           {job.merged ? <span className="tag merged">merge แล้ว</span> : null}</div>
         <p className="job-meta">
           <span>{projectName}</span><span>{jobTypes[job.type || 'feature']}</span><span>สร้าง {dateTime(job.createdAt)}</span>
-          {job.startedAt ? <span>ใช้เวลา {jobDuration(job)}</span> : null}{job.card ? <span>{job.source && job.source !== 'card' ? 'Task Card · ' + (sourceNames[job.source] || job.source) : 'Task Card'}</span> : null}
+          {!busy && job.startedAt ? <span>ใช้เวลา {jobDuration({ ...job, finishedAt: finishedJob?.finishedAt ?? job.finishedAt })}</span> : null}
+          {job.card ? <span>{job.source && job.source !== 'card' ? 'Task Card · ' + (sourceNames[job.source] || job.source) : 'Task Card'}</span> : null}
           {job.resumedFrom ? <span>ทำต่อจากงานเดิม</span> : null}
         </p>
       </div>
-      <div className="job-header-actions">
-        {['queued', 'running', 'waiting_approval'].includes(job.status) ? <Button danger icon={X} onClick={cancel}>หยุดงาน</Button> : null}
-        {!busy && stuckStatuses.has(job.status) && job.plan ? <Button primary icon={RotateCcw} onClick={() => retry(job)}>ทำต่อจากจุดที่ค้าง</Button> : null}
-        {!busy ? <Button icon={RotateCcw} onClick={() => retry({ ...job, plan: undefined, id: undefined, cardFrom: job.id })}>สั่งงานนี้อีกครั้ง</Button> : null}
-      </div>
+      {canCancel || primaryMerge || primaryFix || primaryResume ? <div className="job-header-actions">
+        {canCancel ? <Button danger icon={X} onClick={cancel}>หยุดงาน</Button> : null}
+        {primaryMerge ? mergeButton : null}
+        {primaryFix ? <Button primary icon={Wrench} aria-expanded={fixOpen} onClick={() => { setFixOpen(true); jumpTo(nextStepRef); }}>แก้ต่ออีกรอบ</Button> : null}
+        {primaryResume ? <Button primary icon={RotateCcw} onClick={() => retry(job)}>ทำต่อจากจุดที่ค้าง</Button> : null}
+      </div> : null}
     </header>
     {job.error ? <p className="error banner" role="alert"><TriangleExclamationPoint size={16} aria-hidden="true" /> {job.error}</p> : null}
-    <LiveMonitor monitor={monitor} job={liveJob ?? savedJob} saved={!liveJob && Boolean(savedJob)}
-      fallbackJob={{ ...job, status, finishedAt, projectName }} onApproval={onApproval}>
-      <div className="monitor-legacy-progress">
-        {savedJob === undefined ? <p className="muted" role="status">กำลังโหลดข้อมูลติดตามงาน…</p> :
-          <Stepper job={{ ...job, status }} inactive={Boolean(snapshot) || !busy || status === 'queued'} />}
+    {cancelError ? <p className="error banner" role="alert">{cancelError}</p> : null}
+    {busy ? <>
+      <LiveMonitor monitor={monitor} job={monitorJob} saved={!liveJob && Boolean(monitorJob)}
+        fallbackJob={{ ...job, status }} onApproval={onApproval} hideIdentity detailJob={job}>
+        <div className="monitor-legacy-progress">
+          {savedJob === undefined ? <p className="muted" role="status">กำลังโหลดข้อมูลติดตามงาน…</p> :
+            <Stepper job={{ ...job, status }} inactive={Boolean(snapshot) || status === 'queued'} />}
+          <TeamTree job={job} />
+        </div>
+      </LiveMonitor>
+      {showApproval ? <ApprovalPanel key={job.approval.kind + ':' + job.approval.requestedAt} job={job} panelRef={approvalRef} /> : null}
+    </> : <>
+      <OutcomeTiles job={job} diffStat={emptyDiffStat} diffText={diffText}
+        onOpenTab={nextTab => { openDetailTab(nextTab); jumpTo(detailRef); }} />
+      <div className={'job-overview' + (canAct ? '' : ' single')}>
+        {canAct ? <section ref={nextStepRef} tabIndex={-1} className="card detail next-step" aria-label="ขั้นต่อไป">
+          <JobActions job={job} relayRestart={relayRestart} updated={updated} removed={removed} retry={retry}
+            canFix={canFix} fixOpen={fixOpen} setFixOpen={setFixOpen} primaryFix={primaryFix}
+            mergeAction={mergeAction} mergeButton={primaryMerge || mergeAction.check ? null : mergeButton} />
+        </section> : null}
+        <AcceptanceChecklist job={job} onUpdated={onAcceptanceUpdated} readOnly={!canAct} />
       </div>
-    </LiveMonitor>
-    {showApproval ? <ApprovalPanel key={job.approval.kind + ':' + job.approval.requestedAt} job={job} panelRef={approvalRef} /> : null}
-    <TeamTree job={job} />
+      <StageStepper job={{ ...job, status, stages: stepperStages }}>
+        <div className="archived-stage-details">
+          {archivedStages.length ? <MonitorTimeline job={monitorJob} keys={archivedStages.map(stage => stage.key)} /> : null}
+          <TeamTree job={job} team={job.team ?? monitorJob?.team} roleStages={roleStages} archived />
+          {monitorJob?.activities.length ? <MonitorActivityList key={job.id} job={monitorJob} /> : null}
+        </div>
+      </StageStepper>
+    </>}
     <div className="detail-grid">
-      <section className="card detail">
-        <div className="filters tabs"><button aria-pressed={tab === 'events'} onClick={() => { setTab('events'); setError(''); }}>ประวัติการทำงาน</button>
-          <button aria-pressed={tab === 'diff'} onClick={() => showDiff()} disabled={!hasResult}>Git diff</button>
-          <button aria-pressed={tab === 'usage'} onClick={() => { setTab('usage'); setError(''); }}>การใช้ AI</button>
-          {job.routing?.length ? <button aria-pressed={tab === 'routing'} onClick={() => { setTab('routing'); setError(''); }}>การจ่ายงาน</button> : null}</div>
-        {error ? <p role="alert" className="error">{error}</p> : null}
-        {tab === 'routing' ? <RoutingView job={job} /> : tab === 'usage' ? <UsageView job={job} /> :
-          tab === 'diff' ? loading ? <p>กำลังโหลด diff…</p> : diff ? <DiffView diff={diff} focus={focus} /> : null :
+      <section className="card detail job-detail-tabs" ref={detailRef} tabIndex={-1} aria-label="รายละเอียดผลและประวัติงาน">
+        <div className="filters tabs" role="group" aria-label="รายละเอียดงาน">
+          {jobDetailTabs.filter(([key]) => key !== 'routing' || job.routing?.length).map(([key, label]) =>
+            <button key={key} type="button" aria-pressed={detailTab === key} onClick={() => openDetailTab(key)}>{label}</button>)}
+        </div>
+        {detailTab === 'review' ? <ReviewHistoryList job={job}
+          renderFinding={hasResult ? text => <Finding text={text} openFile={file => openDetailTab('diff', file)} /> : undefined} /> :
+          detailTab === 'checks' ? <JobChecks checks={job.checks} /> :
+          detailTab === 'routing' ? <RoutingView job={job} /> :
+          detailTab === 'usage' ? <UsageView job={job} /> :
+          detailTab === 'diff' ? !hasResult ? <p className="muted">ยังไม่มีผลลัพธ์ของงานนี้</p> :
+            currentDiff?.error ? <p role="alert" className="error">{currentDiff.error}</p> :
+            currentDiff?.value ? <DiffView diff={currentDiff.value} focus={focus} /> : <p role="status">กำลังโหลด diff…</p> :
           <ol className="events timeline">{job.events.length ? [...job.events].reverse().map((event, i) => <EventItem key={job.events.length - i} event={event} />) : <li><p>รอเริ่มงาน</p></li>}</ol>}
       </section>
       <aside className="facts-column">
-        {!busy ? <section className="card detail"><JobActions job={job} relayRestart={relayRestart}
-          updated={updated} removed={removed} setError={setError} /></section> : null}
         <section className="card detail facts">
           <h2>สรุปงาน</h2>
-          {manualChecks.length ? <div className="callout warn"><strong>ต้องตรวจเองหลังส่งมอบ</strong>
-            <ul>{manualChecks.map(item => <li key={item.text}>{item.text}</li>)}</ul></div> : null}
-          {job.review ? <div className={'callout ' + (job.review.findings.length ? 'warn' : 'ok')}>
-            <strong>{job.review.findings.length ? 'ผลรีวิว: เหลือ ' + job.review.findings.length + ' ข้อ' : 'ผลรีวิว: ไม่พบปัญหา'}</strong>
-            <p className="preline">{job.review.summary}</p>
-            {job.review.findings.length ? <ul>{job.review.findings.map((item, index) => <li key={index}><b>{roleNames[item.owner]}</b> · <Finding text={item.detail} openFile={file => hasResult && showDiff(file)} /></li>)}</ul> : null}
-          </div> : null}
-          {job.checks?.length ? <div className="fact"><h3>ผลทดสอบ</h3>{job.checks.map(check => <details key={check.label} className="check">
-            <summary><span className={'check-dot ' + (check.code === 0 ? 'ok' : check.code === null ? 'off' : 'bad')} />{check.label}<em>{check.code === 0 ? 'ผ่าน' : check.code === null ? 'ไม่ได้รัน' : 'ไม่ผ่าน'}</em></summary><pre>{check.output}</pre></details>)}</div> : null}
-          {assigned.length ? <div className="fact"><h3>AI ที่รับงาน</h3><div className="chips">{assigned.map(([key, stage]) =>
-            <span key={key} className="chip"><ProviderIcon id={stage.provider} size={12} />{stageName(job, key)} · {providerName(stage.provider)}</span>)}</div></div> : null}
-          {skippedRoles.length ? <div className="fact"><h3>ส่วนที่ข้าม</h3><ul className="skipped-roles">{skippedRoles.map(([key, stage]) =>
-            <li key={key}><span className="skipped-chip">{stageName(job, key)}</span> {stage.note}</li>)}</ul></div> : null}
           <details className="fact" open={job.prompt.length < 500}><summary><h3>โจทย์</h3></summary><p className="preline">{job.prompt}</p></details>
           {job.plan ? <details className="fact"><summary><h3>แผนงาน</h3><CardSubtaskBadge plan={job.plan} /></summary>
-            <h4>ข้อตกลงระหว่างส่วน</h4><p className="preline">{job.plan.contract}</p><h4>เกณฑ์รับงาน</h4><p className="preline">{job.plan.acceptance}</p>
+            <h4>ข้อตกลงระหว่างส่วน</h4><p className="preline">{job.plan.contract}</p>
+            {busy && !(showApproval && job.approval.kind === 'plan') && job.plan.acceptance ? <><h4>เกณฑ์รับงาน</h4><p className="preline">{job.plan.acceptance}</p></> : null}
             {job.plan.subtasksFromCard === true ? <PlanTaskGroups plan={job.plan} single={job.single} Heading="h4" /> : null}
           </details> : null}
           {job.scope ? <div className="fact"><h3>Scope</h3><p>{job.scope.include?.length ? 'แก้ได้เฉพาะ ' + job.scope.include.join(', ') : ''}{job.scope.exclude?.length ? ' · ห้ามแก้ ' + job.scope.exclude.join(', ') : ''}</p></div> : null}
@@ -1829,7 +1976,7 @@ function JobDetail({ job, projectName, monitor, relayRestart, approvalRequested,
         </section>
       </aside>
     </div>
-  </>;
+  </div>;
 }
 
 // Notes the AIs read on every job in this project: how to run it, conventions, things to avoid.
@@ -2165,7 +2312,7 @@ function isEditableTarget(node) {
 }
 
 function App() {
-  const { data, setData, monitor, networkError, setNetworkError, relayRestart } = useRelayConnection();
+  const { data, setData, monitor, networkError, setNetworkError, relayRestart, onAcceptanceUpdated } = useRelayConnection();
   const [page, setPage] = useState('queue');
   const [selection, setSelection] = useState(null);
   const [approvalTarget, setApprovalTarget] = useState(null);
@@ -2259,7 +2406,7 @@ function App() {
         {job ? <JobDetail key={job.id} job={job} projectName={projectName} monitor={monitor} relayRestart={relayRestart}
           approvalRequested={approvalTarget === job.id}
           onApproval={openApproval} onApprovalFocused={() => setApprovalTarget(null)} back={() => open('queue')}
-          retry={setDialog} updated={updateJob} removed={removeJob} /> :
+          retry={setDialog} updated={updateJob} removed={removeJob} onAcceptanceUpdated={onAcceptanceUpdated} /> :
           page === 'settings' ? <>
             {data ? <SettingsForm initial={data.settings} quotas={data.quotas} onDirty={setSettingsDirty} changed={settings => setData(previous => ({ ...previous, settings }))} /> : null}</> :
           page === 'projects' ? (data ? <ProjectsPage projects={projects} jobs={jobs} createJob={repo => setDialog({ repo })}
