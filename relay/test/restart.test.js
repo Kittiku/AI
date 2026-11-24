@@ -40,8 +40,10 @@ test('the spawn specification keeps the invocation and environment and disables 
     command: current.execPath, args: [envFlag, '--trace-warnings', 'server/index.js', '--test-arg'],
     cwd: current.cwd(), env: { RELAY_PORT: '4783', RELAY_NO_BROWSER: '1' }
   });
+  // A direct launch without the .env flag must not gain it, or a RELAY_PORT in .env would move the server.
   assert.deepEqual(buildRestartSpawnSpec({ ...current, execArgv: ['--trace-warnings'] }).args,
-    [envFlag, '--trace-warnings', 'server/index.js', '--test-arg']);
+    ['--trace-warnings', 'server/index.js', '--test-arg']);
+  assert.deepEqual(buildRestartSpawnSpec({ ...current, execArgv: [] }).args, ['server/index.js', '--test-arg']);
   assert.deepEqual(buildRestartSpawnSpec({ ...current, execArgv: ['--env-file-if-exists', '.env'] }).args,
     ['--env-file-if-exists', '.env', 'server/index.js', '--test-arg']);
   assert.equal(current.env.RELAY_NO_BROWSER, '0');

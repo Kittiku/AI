@@ -1911,12 +1911,17 @@ async function listen() {
 }
 
 async function reopenServer() {
+  acceptingRequests = false;
+  // Reclaim the port before touching SQLite. If another Relay took the port, listen fails here and this
+  // process leaves that Relay's database alone.
+  if (!httpServer?.listening) await listen();
   if (!store) {
     store = openStore(dataDir);
     store.load(state); // Restore the store's cache of persisted rows for subsequent updates and deletions.
     store.persist(state); // Undo boot bookkeeping a replacement may have saved before failing to start.
   }
-  if (!httpServer?.listening) await listen();
+  // Serve requests only once the state is restored.
+  acceptingRequests = true;
 }
 
 async function startServer() {

@@ -25,13 +25,12 @@ export function busyJobs(jobs = []) {
     .map(({ id, title, status }) => ({ id, title, status }));
 }
 
+// Repeat the original invocation exactly. `npm start` already passes --env-file-if-exists=.env in execArgv;
+// adding it to a direct launch could move the replacement to a RELAY_PORT the open tab does not use.
 export function buildRestartSpawnSpec(current = process) {
-  const envFileFlag = '--env-file-if-exists';
-  const hasEnvFile = current.execArgv.some((arg, index) =>
-    arg === envFileFlag + '=.env' || (arg === envFileFlag && current.execArgv[index + 1] === '.env'));
   return {
     command: current.execPath,
-    args: [...(hasEnvFile ? [] : [envFileFlag + '=.env']), ...current.execArgv, ...current.argv.slice(1)],
+    args: [...current.execArgv, ...current.argv.slice(1)],
     cwd: current.cwd(),
     env: { ...current.env, RELAY_NO_BROWSER: '1' }
   };
