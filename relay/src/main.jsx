@@ -330,6 +330,8 @@ function useMonitor(paused, epoch, onSnapshot) {
   return monitor;
 }
 
+const restartUnconfirmedMessage = 'Relay ยังไม่ได้ยืนยันคำขอรีสตาร์ท';
+
 function useRelayConnection() {
   const [data, setData] = useState(null);
   const [networkError, setNetworkError] = useState('');
@@ -338,6 +340,7 @@ function useRelayConnection() {
   const [monitorEpoch, setMonitorEpoch] = useState(0);
   const [pending, setPending] = useState(false);
   const [requestError, setRequestError] = useState('');
+  const [restartUnconfirmed, setRestartUnconfirmed] = useState(false);
   const session = useRef(null);
   const onSnapshot = useCallback((snapshot, epoch) => session.current?.receiveSnapshot(snapshot, epoch), []);
   const monitor = useMonitor(phase === 'reconnecting' || phase === 'timeout', monitorEpoch, onSnapshot);
@@ -387,6 +390,7 @@ function useRelayConnection() {
       if ((next.updatedAt != null && updatedAt < restartAt) ||
           (next.updatedAt == null && snapshotAt <= restartAt) ||
           (version !== restartVersion && updatedAt <= restartAt)) return;
+      if (next.status !== 'idle') setRestartUnconfirmed(false);
       if (currentRestart && ['status', 'updatedAt', 'busyCount', 'error'].every(key => currentRestart[key] === next[key])) return;
       if (next.status !== currentRestart?.status) setRequestError('');
       currentRestart = next;
@@ -406,6 +410,7 @@ function useRelayConnection() {
       const newBoot = server?.bootId && next.server?.bootId && server.bootId !== next.server.bootId;
       const reachableAfterTimeout = timedOut && next.server?.bootId && next.restart?.status !== 'restarting';
       if (newBoot) {
+        setRestartUnconfirmed(false);
         currentRestart = null;
         restartAt = -Infinity;
         restartVersion++;
@@ -511,6 +516,7 @@ function useRelayConnection() {
       actionPending = true;
       setPending(true);
       setRequestError('');
+      setRestartUnconfirmed(false);
       const version = restartVersion;
       const requestEpoch = epoch;
       function receiveAction(result) {
@@ -528,8 +534,12 @@ function useRelayConnection() {
       } catch (error) {
         if (disposed || epoch !== requestEpoch) return;
         if (error.data?.restart) receiveAction(error.data);
-        if (!error.data?.restart?.error) setRequestError(error.message);
-        if (!cancel && !error.status) startRecovery(true);
+        if (!cancel && !error.status) {
+          setRestartUnconfirmed(true);
+          startRecovery(true);
+        } else if (!error.data?.restart?.error) {
+          setRequestError(error.message);
+        }
       } finally {
         actionPending = false;
         if (!disposed) setPending(false);
@@ -552,7 +562,7 @@ function useRelayConnection() {
   return {
     data, setData, networkError, setNetworkError, monitor,
     relayRestart: {
-      restart, phase, pending, requestError,
+      restart, phase, pending, requestError, restartUnconfirmed,
       changeRestart: (cancel, jobId) => session.current?.changeRestart(cancel, jobId),
       retry: () => session.current?.retry(),
       dismiss: () => setPhase(null)
@@ -561,7 +571,7 @@ function useRelayConnection() {
 }
 
 function RestartBanner({ relayRestart }) {
-  const { restart, phase, pending, requestError, changeRestart, retry, dismiss } = relayRestart;
+  const { restart, phase, pending, requestError, restartUnconfirmed, changeRestart, retry, dismiss } = relayRestart;
   const waiting = restart?.status === 'waiting';
   const timedOut = phase === 'timeout';
   const failed = restart?.status === 'failed' || Boolean(requestError);
@@ -591,6 +601,11 @@ function RestartBanner({ relayRestart }) {
     title = 'รีสตาร์ท Relay ไม่สำเร็จ';
     detail = restart?.error || requestError;
     action = <Button icon={RefreshCw} onClick={retry}>ลองเชื่อมต่อใหม่</Button>;
+  } else if (restartUnconfirmed) {
+    tone = 'warn';
+    Icon = TriangleExclamationPoint;
+    title = restartUnconfirmedMessage;
+    detail = 'กด “รีสตาร์ท Relay ตอนนี้” ในกล่อง “อัปเดต Relay” เพื่อส่งคำขออีกครั้ง';
   } else if (phase === 'connected') {
     tone = 'ok';
     Icon = CircleCheck;
@@ -1462,7 +1477,7 @@ function FixPanel({ job, updated }) {
 }
 
 function SelfUpdatePanel({ job, relayRestart }) {
-  const { restart, phase, pending, requestError, changeRestart } = relayRestart;
+  const { restart, phase, pending, requestError, restartUnconfirmed, changeRestart } = relayRestart;
   const { ui, built, dependencies, restarted } = job.selfUpdate;
   const needsRestart = job.selfUpdate.restart === true && !restarted;
   const status = restart?.status;
@@ -1490,6 +1505,7 @@ function SelfUpdatePanel({ job, relayRestart }) {
         </div>
       </div> : null}
       {requestError && !restarting && !timedOut ? <p className="error">{requestError}</p> : null}
+      {restartUnconfirmed && status === 'idle' && !restarting && !timedOut ? <p className="self-update-status warn-text">{restartUnconfirmedMessage}</p> : null}
       {!restarting && !timedOut ? <div className="action-row">
         {waiting ? <Button icon={X} disabled={pending} onClick={() => changeRestart(true)}>ยกเลิกการรอรีสตาร์ท</Button> :
           <Button primary icon={RotateCcw} disabled={pending} onClick={() => changeRestart(false, job.id)}>รีสตาร์ท Relay ตอนนี้</Button>}
