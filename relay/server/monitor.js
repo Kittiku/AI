@@ -53,6 +53,28 @@ function projectStage(job, key) {
   };
 }
 
+const subtaskNumbers = numbers => Array.isArray(numbers) ? numbers.filter(number => Number.isInteger(number) && number > 0) : [];
+
+function projectSubtasks(items) {
+  if (!Array.isArray(items)) return [];
+  return items.map((item, index) => ({
+    index: Number.isInteger(item.id) && item.id > 0 ? item.id : index + 1,
+    title: item.title ?? '',
+    status: item.status ?? 'pending',
+    provider: providerId(item.provider),
+    prefer: providerId(item.prefer),
+    dependsOn: subtaskNumbers(item.dependsOn),
+    waitingOn: subtaskNumbers(item.waitingOn)
+  }));
+}
+
+function projectTeam(job) {
+  const backend = projectSubtasks(job.team?.backend);
+  const frontend = projectSubtasks(job.team?.frontend);
+  if (!backend.length && !frontend.length) return null;
+  return { fromCard: job.plan?.subtasksFromCard === true, backend, frontend };
+}
+
 function projectJob(job, projects) {
   const project = projects.find(item => item.path.toLowerCase() === job.repo.toLowerCase());
   const single = Boolean(job.single);
@@ -62,7 +84,8 @@ function projectJob(job, projects) {
     branch: job.branch ?? null, status: job.status, startedAt: job.startedAt ?? null, single,
     approval: approval ? { kind: approval.kind, requestedAt: approval.requestedAt } : null,
     stages: stageKeys.filter(key => !single || key !== 'frontend').map(key => projectStage(job, key)),
-    activities: job.monitor?.activities.slice() ?? []
+    activities: job.monitor?.activities.slice() ?? [],
+    team: projectTeam(job)
   };
 }
 
