@@ -45,6 +45,28 @@ export async function worktreePaths(repo) {
   return output.split('\0').filter(field => field.startsWith('worktree ')).map(field => field.slice(9));
 }
 
+// Remove a worktree even when git and Windows disagree. git can drop its record of the worktree before Windows has
+// released every file in the folder, leaving a folder that a retry reports as "is not a working tree". In that case
+// the leftover folder is deleted directly. Throws only when git still lists the worktree after the retries.
+export async function removeWorktreeFolder(repo, cwd, { retries = 2, delayMs = 1500 } = {}) {
+  const target = path.resolve(cwd);
+  const registered = async () => (await worktreePaths(repo)).some(entry => path.resolve(entry).toLowerCase() === target.toLowerCase());
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await git(repo, 'worktree', 'remove', '--force', target);
+      return;
+    } catch (error) {
+      if (!(await registered())) {
+        await rm(target, { recursive: true, force: true, maxRetries: 5, retryDelay: 300 }).catch(() => {});
+        await git(repo, 'worktree', 'prune').catch(() => {});
+        return;
+      }
+      if (attempt >= retries) throw error;
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+    }
+  }
+}
+
 export async function repository(folder) {
   if (!path.isAbsolute(folder) || folder.startsWith('\\\\')) throw Error('ระบุพาธเต็มของ Git repo บนเครื่อง');
   const cwd = await realpath(folder);

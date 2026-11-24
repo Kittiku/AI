@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { realpath } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
-import { applyEdits, applyFiles, attemptChanges, attemptState, checkpoint, editContexts, git, isSafePath, mergeWorktree, repository, restoreAttempt, snapshot, worktreePaths } from './git.js';
+import { applyEdits, applyFiles, attemptChanges, attemptState, checkpoint, editContexts, git, isSafePath, mergeWorktree, removeWorktreeFolder, repository, restoreAttempt, snapshot, worktreePaths } from './git.js';
 import { editSchema, generate, names, pacificDay, planSchema, quota, refreshClaudeCode, refreshCodex, reviewSchema, subtaskCheckSchema, USAGE } from './providers.js';
 import { openStore } from './store.js';
 import { PROFILES, rank } from './router.js';
@@ -994,7 +994,10 @@ async function runTeam(job, role, cwd, branch, tracked, signal, tasks) {
       },
       async mergeSubtask(_task, tip, number) {
         const outcome = tip ? await mergeWorktree(cwd, tip) : { conflict: false };
-        await removeWorktree(job.repo, temporary.get(number));
+        // The subtask's work is already merged into the role branch here; a folder that will not go away is a
+        // leftover to report, not a reason to fail the role.
+        await removeWorktree(job.repo, temporary.get(number))
+          .catch(error => addEvent(job, 'Git worktree', 'ลบ worktree ของงานย่อย #' + number + ' ไม่สำเร็จ (งานรวมแล้ว ไม่กระทบผล): ' + error.message.slice(0, 300)));
         temporary.delete(number);
         if (!outcome.conflict) remember(items[number - 1]);
         return outcome;
@@ -1116,15 +1119,10 @@ async function runTeam(job, role, cwd, branch, tracked, signal, tasks) {
 }
 
 async function removeWorktree(repo, cwd) {
-  // Windows can keep the folder locked briefly after the AI process exits.
+  // Windows can keep the folder locked briefly after the AI process exits; removeWorktreeFolder retries and
+  // cleans up a folder git has already forgotten.
   unlinkDependencies(cwd);
-  try {
-    await git(repo, 'worktree', 'remove', '--force', cwd);
-  } catch {
-    if (!existsSync(cwd) && !(await worktreePaths(repo)).some(entry => sameFolder(path.resolve(entry), cwd))) return;
-    await new Promise(resolve => setTimeout(resolve, 1500));
-    await git(repo, 'worktree', 'remove', '--force', cwd);
-  }
+  await removeWorktreeFolder(repo, cwd);
 }
 
 async function clearSubtaskWorktrees(repo, workRoot) {
