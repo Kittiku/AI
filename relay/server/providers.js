@@ -232,7 +232,8 @@ async function claudeCodeTurn(cwd, prompt, schema, signal, write = false) {
       inputTokens: (tokens.input_tokens || 0) + (tokens.cache_read_input_tokens || 0) + (tokens.cache_creation_input_tokens || 0),
       outputTokens: tokens.output_tokens || 0,
       costUsd: Number.isFinite(data.total_cost_usd) ? data.total_cost_usd : null,
-      billing: claudeCodeBilling
+      billing: claudeCodeBilling,
+      model: mainModel(data.modelUsage) || process.env.RELAY_CLAUDE_CODE_MODEL || null
     };
     return data.structured_output;
   }
@@ -287,9 +288,38 @@ function extractJsonObject(raw) {
   throw Error('ไม่ได้ส่งผลเป็น JSON ที่ถูกต้อง');
 }
 
-function parseCliJsonOutput(stdout) {
+// The model that did most of the work, from a usage map keyed by model id (Claude Code's modelUsage, Gemini CLI's stats.models).
+export function mainModel(usageByModel) {
+  if (!usageByModel || typeof usageByModel !== 'object') return null;
+  const size = value => {
+    const tokens = value?.tokens || value || {};
+    return Number(tokens.outputTokens ?? tokens.output_tokens ?? tokens.candidates ?? tokens.total ?? tokens.costUSD ?? 0) || 0;
+  };
+  const entries = Object.entries(usageByModel);
+  if (!entries.length) return null;
+  return entries.sort((a, b) => size(b[1]) - size(a[1]))[0][0];
+}
+
+// Token totals from Gemini CLI's stats.models, when present.
+function geminiCliTokens(models) {
+  if (!models || typeof models !== 'object') return null;
+  let input = 0, output = 0, seen = false;
+  for (const value of Object.values(models)) {
+    const tokens = value?.tokens;
+    if (!tokens) continue;
+    seen = true;
+    input += Number(tokens.prompt ?? tokens.input ?? 0) || 0;
+    output += Number(tokens.candidates ?? tokens.output ?? 0) || 0;
+  }
+  return seen ? { inputTokens: input, outputTokens: output } : null;
+}
+
+function parseCliJsonOutput(stdout, meta = {}) {
   const outer = extractJsonObject(stdout);
   if (outer && typeof outer === 'object') {
+    const models = outer.stats?.models;
+    if (models) { meta.model = mainModel(models); Object.assign(meta, geminiCliTokens(models)); }
+    if (typeof outer.model === 'string') meta.model ??= outer.model;
     if (outer.error) {
       const errMsg = typeof outer.error === 'string' ? outer.error : (outer.error.message || JSON.stringify(outer.error));
       throw Error(errMsg);
@@ -301,13 +331,13 @@ function parseCliJsonOutput(stdout) {
   return outer;
 }
 
-function parseAgyOutput(stdout) {
+function parseAgyOutput(stdout, meta = {}) {
   for (const line of stdout.trimEnd().split('\n').reverse()) {
     let event;
     try { event = JSON.parse(line); } catch { continue; }
     if (event.event !== 'result') continue;
     if (event.result?.status !== 'SUCCESS') throw Error(event.result?.error || 'Antigravity CLI ไม่ได้ทำงานจนเสร็จ');
-    return parseCliJsonOutput(JSON.stringify(event.result));
+    return parseCliJsonOutput(JSON.stringify(event.result), meta);
   }
   throw Error('Antigravity CLI ไม่ส่งผลลัพธ์กลับ');
 }
@@ -407,7 +437,13 @@ async function geminiCliTurn(cwd, prompt, context, schema, signal, onUsage) {
   if (code === 0) onUsage?.();
   try {
     if (code !== 0) throw Error(stderr.trim() || `exit ${code}`);
-    return useStream ? parseAgyOutput(stdout) : parseCliJsonOutput(stdout);
+    const meta = {};
+    const result = useStream ? parseAgyOutput(stdout, meta) : parseCliJsonOutput(stdout, meta);
+    if (result && typeof result === 'object') {
+      result[USAGE] = { inputTokens: meta.inputTokens ?? null, outputTokens: meta.outputTokens ?? null, costUsd: null, billing: 'subscription',
+        model: meta.model || geminiCliModel || (backend === 'agy' ? 'agy (ค่าเริ่มต้น)' : 'gemini-cli (ค่าเริ่มต้น)') };
+    }
+    return result;
   } catch (parseError) {
     const detail = String(stderr || stdout || parseError.message || `exit ${code}`).trim();
     if (/auth|login|credential|unauthenticated|sign in|no longer supported/i.test(detail)) {
@@ -623,11 +659,14 @@ export async function generate(provider, cwd, prompt, schema, jobSignal, onUsage
     }
     output = data.candidates?.[0]?.content?.parts?.filter(x => !x.thought).map(x => x.text || '').join('');
     usage = { inputTokens: data.usageMetadata?.promptTokenCount || 0,
-      outputTokens: (data.usageMetadata?.candidatesTokenCount || 0) + (data.usageMetadata?.thoughtsTokenCount || 0), costUsd: null, billing: 'api' };
+      outputTokens: (data.usageMetadata?.candidatesTokenCount || 0) + (data.usageMetadata?.thoughtsTokenCount || 0), costUsd: null, billing: 'api',
+      model: data.modelVersion || geminiApiModel };
   }
   let result;
   try { result = JSON.parse(output); } catch { throw Error(names[provider] + ' ส่ง JSON ไม่สมบูรณ์'); }
   if (!validate(result, schema)) throw Error(names[provider] + ' ส่งข้อมูลไม่ตรงกับรูปแบบที่กำหนด');
-  result[USAGE] = usage || { inputTokens: 0, outputTokens: 0, costUsd: null, billing: provider === 'codex' || useCli ? 'subscription' : 'api' };
+  // Codex does not report tokens to Relay; the model is the one codexTurn picked for this call.
+  result[USAGE] = usage || { inputTokens: null, outputTokens: null, costUsd: null, billing: provider === 'codex' || useCli ? 'subscription' : 'api',
+    model: provider === 'codex' ? lastCodexModel || null : null };
   return result;
 }

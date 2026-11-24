@@ -11,6 +11,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { applyEdits, applyFiles, attemptChanges, attemptState, checkpoint, editContexts, git, isSafePath, mergeWorktree, removeWorktreeFolder, repository, restoreAttempt, snapshot, worktreePaths } from './git.js';
 import { editSchema, generate, names, pacificDay, planSchema, quota, refreshClaudeCode, refreshCodex, reviewSchema, subtaskCheckSchema, USAGE } from './providers.js';
 import { openStore } from './store.js';
+import { buildStats } from './stats.js';
 import { createRestartController, defaultSelfUpdateSettings, normalizeSelfUpdateSettings, restartMessages, shouldAutoRestart } from './restart.js';
 import { PROFILES, rank } from './router.js';
 import { closeMonitorStages, createMonitor, liveStage, monitorFiles, recordMonitor } from './monitor.js';
@@ -382,7 +383,7 @@ async function callCore(job, role, cwd, task, context, schema, signal, accept, o
     stageSet({ status: 'running', provider, startedAt, endedAt: null, waitUntil: null, round });
     stageTrack({ status: 'running', action, provider, startedAt, endedAt: null, waitUntil: null, changedFiles: null },
       (candidate.row ? candidate.row.rank === 1 : provider === (options.subtask?.prefer ?? job.settings.routes[role][0])) ? 'started' : 'provider_fallback');
-    const step = store.startStep({ jobId: job.id, role, provider, round });
+    const step = store.startStep({ jobId: job.id, role, provider, round, action });
     let day;
     try {
       if (provider === 'gemini') {
@@ -1521,6 +1522,13 @@ app.post('/api/jobs/:id/fix', async (req, res) => {
   res.json(publicJob(job));
 });
 app.get('/api/jobs/:id/steps', (req, res) => res.json(store.steps(req.params.id)));
+// AI usage statistics for the stats page: which AI and model did what kind of work, how often, how fast and at what cost.
+app.get('/api/stats', (req, res) => {
+  const days = Math.min(365, Math.max(1, Math.round(Number(req.query.days) || 30)));
+  const now = Date.now();
+  const jobs = new Map(state.jobs.map(job => [job.id, job.title]));
+  res.json(buildStats(store.stepsSince(now - days * 86_400_000, now + 1), { jobs, now, days, providers: Object.keys(names) }));
+});
 // What automatic routing would pick right now for each role, with the scores and the data behind them.
 app.get('/api/routing/preview', (_req, res) => {
   const values = publicQuotas();

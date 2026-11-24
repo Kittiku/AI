@@ -3,10 +3,11 @@ import { createRoot } from 'react-dom/client';
 import '@fontsource-variable/inter';
 import '@fontsource-variable/noto-sans-thai';
 import {
-  ArrowRight, ChartPie, Check, ChevronLeft, ClipboardList, CodeXml, Copy, Ellipsis, FlaskConical, FolderGit2, FolderOpen, FolderPlus,
+  ArrowRight, ChartColumn, ChartPie, Check, ChevronLeft, ClipboardList, CodeXml, Copy, Ellipsis, FlaskConical, FolderGit2, FolderOpen, FolderPlus,
   TriangleExclamationPoint, CircleCheck, Clock, GitBranch, Layers, LayoutDashboard, Plus, RefreshCw, RotateCcw, Search, Settings, Sparkle, Terminal, Trash, Wrench, X
 } from 'lucide-react';
 import AddProjectModal from './AddProjectModal.jsx';
+import StatsPage from './StatsPage.jsx';
 import './style.css';
 
 const providers = {
@@ -15,12 +16,13 @@ const providers = {
   codex: { name: 'Codex', company: 'OpenAI', icon: CodeXml }
 };
 const pages = [
-  ['queue', 'ภาพรวม', LayoutDashboard], ['projects', 'โปรเจกต์', FolderGit2], ['quota', 'โควตา AI', ChartPie], ['settings', 'ตั้งค่า', Settings]
+  ['queue', 'ภาพรวม', LayoutDashboard], ['projects', 'โปรเจกต์', FolderGit2], ['quota', 'โควตา AI', ChartPie], ['stats', 'สถิติ AI', ChartColumn], ['settings', 'ตั้งค่า', Settings]
 ];
 const pageInfo = {
   queue: ['ภาพรวม', 'งานที่กำลังทำ สิ่งที่รอคุณ และคิวทั้งหมด'],
   projects: ['โปรเจกต์', 'โฟลเดอร์งานที่บันทึกไว้ คำสั่งทดสอบ และบันทึกที่ AI อ่านทุกงาน'],
   quota: ['โควตา AI', 'โควตาคงเหลือ เวลารีเซ็ต และระดับที่กันไว้ของแต่ละ AI'],
+  stats: ['สถิติ AI', 'เรียก AI ตัวไหน โมเดลอะไร ทำงานอะไร บ่อยแค่ไหน เร็วแค่ไหน และใช้ token เท่าไร'],
   settings: ['ตั้งค่า', 'การจ่ายงาน โควตา การอนุมัติ งบ และการทำงานต่อเนื่อง'],
   job: ['รายละเอียดงาน', 'ติดตามความคืบหน้า ตรวจผล และ merge']
 };
@@ -2263,6 +2265,7 @@ function App() {
           page === 'projects' ? (data ? <ProjectsPage projects={projects} jobs={jobs} createJob={repo => setDialog({ repo })}
             added={addProject} removed={removeProject} select={select} updated={updateProject} /> : null) :
           page === 'quota' ? <>{cards(true)}</> :
+          page === 'stats' ? <StatsPage api={api} providers={providers} ProviderIcon={ProviderIcon} openJob={select} /> :
           <>
             <Kpis jobs={jobs} onFilter={setFilter} onApproval={openApproval} />
             <div className="home-grid">

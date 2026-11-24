@@ -18,6 +18,11 @@ export function openStore(dataDir) {
       input_tokens INTEGER, output_tokens INTEGER, cost_usd REAL, billing TEXT, error TEXT);
     CREATE INDEX IF NOT EXISTS steps_job ON steps (job_id);
   `);
+  // Added later: the model an AI used and the kind of work (plan, subtask, lead check, review fix...). Older rows keep NULL.
+  const stepColumns = new Set(db.prepare('PRAGMA table_info(steps)').all().map(column => column.name));
+  if (!stepColumns.has('model')) db.exec('ALTER TABLE steps ADD COLUMN model TEXT');
+  if (!stepColumns.has('action')) db.exec('ALTER TABLE steps ADD COLUMN action TEXT');
+  db.exec('CREATE INDEX IF NOT EXISTS steps_started ON steps (started_at)');
   const written = new Map();
 
   function load(fallback) {
@@ -90,15 +95,15 @@ export function openStore(dataDir) {
     }
   }
 
-  function startStep({ jobId, role, provider, round }) {
-    return Number(db.prepare('INSERT INTO steps (job_id, role, provider, round, status, started_at) VALUES (?, ?, ?, ?, ?, ?)')
-      .run(jobId, role, provider, round || 0, 'running', Date.now()).lastInsertRowid);
+  function startStep({ jobId, role, provider, round, action }) {
+    return Number(db.prepare('INSERT INTO steps (job_id, role, provider, round, status, started_at, action) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(jobId, role, provider, round || 0, 'running', Date.now(), action || null).lastInsertRowid);
   }
 
   function finishStep(id, { status, usage, error }) {
-    db.prepare('UPDATE steps SET status = ?, ended_at = ?, input_tokens = ?, output_tokens = ?, cost_usd = ?, billing = ?, error = ? WHERE id = ?')
+    db.prepare('UPDATE steps SET status = ?, ended_at = ?, input_tokens = ?, output_tokens = ?, cost_usd = ?, billing = ?, error = ?, model = COALESCE(?, model) WHERE id = ?')
       .run(status, Date.now(), usage?.inputTokens ?? null, usage?.outputTokens ?? null, usage?.costUsd ?? null, usage?.billing ?? null,
-        error ? String(error).slice(0, 1000) : null, id);
+        error ? String(error).slice(0, 1000) : null, usage?.model ? String(usage.model).slice(0, 120) : null, id);
   }
 
   // Steps left "running" by a crash are closed so totals stay honest.
@@ -122,6 +127,13 @@ export function openStore(dataDir) {
     return new Map(rows.map(row => [row.provider + ':' + row.role, { n: row.n, done: row.done, avgMs: row.avg_ms }]));
   }
 
+  // Every AI step in a time window, newest first, for the stats page. Aggregation happens in stats.js.
+  function stepsSince(since, until = Date.now()) {
+    return db.prepare(`SELECT id, job_id AS jobId, role, action, provider, model, round, status, started_at AS startedAt, ended_at AS endedAt,
+        input_tokens AS inputTokens, output_tokens AS outputTokens, cost_usd AS costUsd, billing, error
+      FROM steps WHERE started_at >= ? AND started_at < ? ORDER BY started_at DESC`).all(since, until);
+  }
+
   function steps(jobId) {
     return db.prepare('SELECT * FROM steps WHERE job_id = ? ORDER BY id').all(jobId);
   }
@@ -130,5 +142,5 @@ export function openStore(dataDir) {
     db.close();
   }
 
-  return { load, persist, startStep, finishStep, closeOpenSteps, steps, spendSince, providerStats, close };
+  return { load, persist, startStep, finishStep, closeOpenSteps, steps, stepsSince, spendSince, providerStats, close };
 }
