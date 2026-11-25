@@ -106,6 +106,23 @@ test('per-model stats: percentiles, unknown model, null for unreported values, d
   assert.ok('byProvider' in today && 'day' in today);
 });
 
+test('topModel ranks named models even when unknown calls are more frequent', () => {
+  const stats = buildStats([
+    step({ model: null }), step({ model: null }), step({ model: null }),
+    step({ model: 'claude-y' }),
+    step({ provider: 'codex', model: 'gpt-x' }), step({ provider: 'codex', model: 'gpt-x' })
+  ], { now, days: 30 });
+
+  assert.equal(stats.models[0].model, null);
+  assert.equal(stats.models[0].calls, 3);
+  assert.deepEqual(stats.totals.topModel, { provider: 'codex', model: 'gpt-x', calls: 2 });
+});
+
+test('topModel is null when no call has a named model', () => {
+  const stats = buildStats([step({ model: null })], { now, days: 30 });
+  assert.equal(stats.totals.topModel, null);
+});
+
 test('costPerJob is null when no call reports a cost', () => {
   const stats = buildStats([step({ costUsd: null })], { now, days: 7 });
   assert.equal(stats.totals.costPerJob, null);

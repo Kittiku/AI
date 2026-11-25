@@ -149,7 +149,7 @@ export function buildStats(steps, { jobs = new Map(), now = Date.now(), days = 3
     return { type, provider, model: model || null, count };
   }).sort((a, b) => b.count - a.count || a.type.localeCompare(b.type));
 
-  const top = byModel[0];
+  const top = byModel.find(row => row.model != null);
   const costed = inRange.filter(step => Number.isFinite(step.costUsd));
   const costJobs = new Set(costed.map(step => step.jobId)).size;
   const costPerJob = costJobs ? costed.reduce((sum, step) => sum + step.costUsd, 0) / costJobs : null;
