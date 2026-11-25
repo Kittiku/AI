@@ -110,12 +110,13 @@ export function createMonitor(state, activeIds, getRestartState, getWait = () =>
     let lastFinishedJob = null;
     const ids = new Set(activeIds());
     for (const job of state.jobs) {
-      if (job.status === 'queued') {
+      const wait = getWait(job);
+      if (job.status === 'queued' || wait.waitReason === 'merge_lock') {
         queuedCount++;
-        queuedJobs.push({ id: job.id, title: job.title, status: job.status, ...getWait(job) });
+        queuedJobs.push({ id: job.id, title: job.title, status: job.status, ...wait });
       }
       if (ids.has(job.id) && activeStatus(job.status)) {
-        activeJobs.push({ ...projectJob(job, state.projects), ...getWait(job) });
+        activeJobs.push({ ...projectJob(job, state.projects), ...wait });
       }
       if (!activeStatus(job.status) && job.status !== 'queued' && Number.isFinite(job.finishedAt) &&
           (!lastFinishedJob || job.finishedAt >= lastFinishedJob.finishedAt)) {

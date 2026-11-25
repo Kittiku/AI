@@ -396,6 +396,7 @@ test('the restart API reports boot and queue state and restores HTTP, SSE and SQ
     export class DatabaseSync extends SQLite { constructor() { super(':memory:'); } }
   `);
   const storeFixtureUrl = inlineModule(`
+    export * from ${JSON.stringify(storeUrl)};
     import { openStore as open } from ${JSON.stringify(storeUrl)};
     export const opened = [];
     export function openStore(dataDir) {

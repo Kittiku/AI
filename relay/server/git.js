@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { chmod, lstat, mkdir, readFile, readlink, realpath, rm, rmdir, symlink, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, rmdir, symlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 const execute = promisify(execFile);
@@ -37,6 +37,46 @@ export async function mergeWorktree(cwd, tip) {
     const unmerged = await git(cwd, 'ls-files', '-u').finally(() => git(cwd, 'merge', '--abort'));
     if (!unmerged) throw error;
     return { conflict: true };
+  }
+}
+
+// Probe Git's integration tree without opening a merge in the project's checkout.
+export async function previewMerge(cwd, head, tip) {
+  const args = ['merge-tree', '--write-tree', '--name-only', '--no-messages', '-z', head, tip];
+  try {
+    const [tree] = (await git(cwd, ...args)).split('\0');
+    return { tree, conflicts: null };
+  } catch (error) {
+    if (error.code !== 1) throw error;
+    const [, ...files] = String(error.stdout || '').split('\0');
+    return { tree: null, conflicts: files.filter(Boolean) };
+  }
+}
+
+// Keep the reviewed branch and its worktree intact. Merge commits can contain conflict resolutions
+// that replaying their individual commits would lose, so keep their original history.
+export async function rebaseForMerge(repo, workRoot, head, tip, tree) {
+  if (await git(repo, 'rev-list', '--merges', '--max-count=1', head + '..' + tip)) return { tip };
+  const base = await git(repo, 'merge-base', head, tip);
+  await mkdir(workRoot, { recursive: true });
+  const scratch = await mkdtemp(path.join(workRoot, 'merge-'));
+  try {
+    await git(repo, 'worktree', 'add', '--detach', scratch, tip);
+    try {
+      await git(scratch, '-c', 'user.name=Relay', '-c', 'user.email=relay@localhost', '-c', 'rerere.enabled=false',
+        'rebase', '--merge', '--no-rebase-merges', '--no-autostash', '--no-autosquash', '--no-update-refs',
+        '--onto', head, base);
+    } catch (error) {
+      const conflicts = (await git(scratch, 'diff', '--name-only', '--diff-filter=U', '-z')).split('\0').filter(Boolean);
+      if (!conflicts.length) throw error;
+      return { conflicts };
+    }
+    // Patch replay can produce a different tree from a three-way integration, for example after a rename.
+    // In that case use the previewed three-way merge.
+    if (await git(scratch, 'rev-parse', 'HEAD^{tree}') !== tree) return { tip };
+    return { tip: await git(scratch, 'rev-parse', 'HEAD') };
+  } finally {
+    await removeWorktreeFolder(repo, scratch);
   }
 }
 

@@ -8,7 +8,7 @@ import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync
 import { realpath } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
-import { applyEdits, applyFiles, attemptChanges, attemptState, checkpoint, editContexts, git, isSafePath, mergeWorktree, removeWorktreeFolder, repository, restoreAttempt, snapshot, worktreePaths } from './git.js';
+import { applyEdits, applyFiles, attemptChanges, attemptState, checkpoint, editContexts, git, isSafePath, mergeWorktree, previewMerge, rebaseForMerge, removeWorktreeFolder, repository, restoreAttempt, snapshot, worktreePaths } from './git.js';
 import { editSchema, generate, listModels, names, pacificDay, planSchema, quota, refreshClaudeCode, refreshCodex, reviewSchema, subtaskCheckSchema, USAGE } from './providers.js';
 import { defaultConcurrencySettings, normalizeConcurrencySettings, openStore, readConcurrencySettings } from './store.js';
 import { buildStats } from './stats.js';
@@ -126,6 +126,7 @@ function recoverJobs(jobs) {
 const cooldowns = {};
 const workers = new Map();
 const queueWaits = new Map();
+const jobWrites = new Map();
 const activeJobIds = () => [...workers.values()].filter(worker => !worker.resume).map(worker => worker.job.id);
 let monitor;
 let httpServer;
@@ -231,6 +232,7 @@ const routingStats = () => store.providerStats(Date.now() - 60 * 86_400_000);
 const providerSlots = Object.fromEntries(Object.keys(names).map(id => [id, { running: 0, waiting: new Set() }]));
 
 function jobWait(job) {
+  if (jobWrites.get(job.id) === 'merge_lock') return { waitReason: 'merge_lock' };
   if (job.status === 'queued') return queueWaits.get(job.id) ?? {};
   if (job.status !== 'running') return {};
   for (const [provider, slot] of Object.entries(providerSlots)) {
@@ -1755,7 +1757,7 @@ app.get('/api/jobs/:id/summary', async (req, res) => {
     git(job.repo, 'diff', '--no-ext-diff', job.base, ref, '--').catch(() => '')
   ]) : ['', ''];
   const limit = Math.min(Number(req.query.diffChars) || 20_000, 200_000);
-  res.json({ id: job.id, title: job.title, status: job.status, error: job.error || null, repo: job.repo, branch: job.worktree || job.branchKept ? job.branch : null, merged: job.merged || null,
+  res.json({ id: job.id, title: job.title, status: job.status, error: job.mergeConflict?.error || job.error || null, repo: job.repo, branch: job.worktree || job.branchKept ? job.branch : null, merged: job.merged || null,
     mergeCommand: (job.worktree || job.branchKept) && !job.merged ? `git -C "${job.repo}" merge ${job.branch}` : null,
     type: job.type || 'feature', approval: job.approval || null, plan: job.plan || null, scope: job.scope || null, budgetUsd: job.budgetUsd ?? null,
     ...jobWait(job),
@@ -1810,6 +1812,7 @@ app.post('/api/jobs/:id/fix', async (req, res) => {
   if (!job) return res.status(404).json({ error: 'ไม่พบงานนี้' });
   if (!['complete', 'needs_review'].includes(job.status)) return res.status(409).json({ error: 'แก้ต่อได้เฉพาะงานที่ทำเสร็จแล้ว' });
   if (job.merged) return res.status(409).json({ error: 'งานนี้ merge แล้ว สั่งงานใหม่แทน' });
+  if (busy(job)) return res.status(409).json({ error: 'งานกำลังดำเนินการอยู่' });
   if (!hasIntegratedBuild(job)) return res.status(409).json({ error: 'งานนี้ยังไม่มีผล Backend และ Frontend ให้แก้ต่อ' });
   const branchExists = await git(job.repo, 'rev-parse', '--verify', 'refs/heads/' + job.branch).then(() => true, () => false);
   if (!branchExists) return res.status(409).json({ error: 'ไม่พบ branch ' + job.branch + ' แล้ว (อาจถูกลบไป) สั่งงานใหม่แทน' });
@@ -1819,9 +1822,10 @@ app.post('/api/jobs/:id/fix', async (req, res) => {
   const findings = (job.review?.findings || []).slice(0, 30);
   if (!findings.length && !text) throw Error('งานนี้ไม่มีปัญหาค้าง บอกด้วยว่าต้องการให้แก้อะไร');
   requireJobIntake();
-  if (findJob(job.id) !== job || !['complete', 'needs_review'].includes(job.status) || job.merged) {
+  if (findJob(job.id) !== job || !['complete', 'needs_review'].includes(job.status) || job.merged || busy(job)) {
     return res.status(409).json({ error: 'สถานะงานเปลี่ยนไป กรุณาตรวจงานล่าสุดก่อนสั่งแก้ต่อ' });
   }
+  delete job.mergeConflict;
   job.fixRequest = { note: text, provider: provider || null, findings, at: Date.now(), round: (job.round || 0) + 1 };
   job.diffStat = null;
   job.status = 'queued';
@@ -2042,7 +2046,7 @@ function reviewDetails(job) {
 }
 
 function publicJob({ monitor: _monitor, lastReviewedRound: _lastReviewedRound, ...job }) {
-  return { ...job, ...reviewDetails(job), ...jobWait(job), manualChecks: job.manualChecks ?? {} };
+  return { ...job, ...(job.mergeConflict && { error: job.mergeConflict.error }), ...reviewDetails(job), ...jobWait(job), manualChecks: job.manualChecks ?? {} };
 }
 
 const findJob = id => state.jobs.find(item => item.id === id);
@@ -2052,83 +2056,168 @@ const resultRef = job => job.worktree || job.branchKept ? job.branch : job.merge
 // Merging writes to the user's own checkout, so it runs plain git: the user's hooks and identity apply.
 const runGit = promisify(execFile);
 const userGit = async (cwd, ...args) => (await runGit('git', args, { cwd, timeout: 120_000, maxBuffer: 8 * 1024 * 1024, windowsHide: true })).stdout.trim();
-const isAncestor = (cwd, a, b) => git(cwd, 'merge-base', '--is-ancestor', a, b).then(() => true, () => false);
+const isAncestor = (cwd, a, b) => git(cwd, 'merge-base', '--is-ancestor', a, b).then(() => true, error => {
+  if (error.code === 1) return false;
+  throw error;
+});
+
+const conflictMessage = files => files.length
+  ? 'merge แล้วจะชนกันใน ' + files.length + ' ไฟล์ ต้องแก้เองใน Git'
+  : 'merge ชนกัน ต้องแก้เองใน Git';
 
 async function mergeCheck(job) {
   if (!job.worktree && !job.branchKept) throw Error('งานนี้ไม่มี branch ผลลัพธ์ให้ merge');
   const target = await git(job.repo, 'rev-parse', '--abbrev-ref', 'HEAD');
-  // Uncommitted files only matter when the merge writes them too (git refuses the same way); staged changes always block,
-  // because a merge commit would pick them up. Renames list both names.
-  const status = (await git(job.repo, 'status', '--porcelain', '--untracked-files=no')).split('\n').filter(Boolean);
-  const dirty = status.flatMap(line => line.slice(3).split(' -> '));
-  const staged = status.filter(line => line[0] !== ' ' && line[0] !== '?').flatMap(line => line.slice(3).split(' -> '));
-  const incoming = new Set((await git(job.repo, 'diff', '--name-only', '-z', 'HEAD...' + job.branch).catch(() => '')).split('\0').filter(Boolean));
-  const overlap = dirty.filter(name => incoming.has(name));
-  const alreadyMerged = await isAncestor(job.repo, job.branch, 'HEAD');
-  const fastForward = !alreadyMerged && await isAncestor(job.repo, 'HEAD', job.branch);
-  let conflicts = [];
-  if (!alreadyMerged && !fastForward) {
-    // merge-tree simulates the merge without touching the checkout; exit code 1 means conflicts.
-    try { await git(job.repo, 'merge-tree', '--write-tree', '--name-only', '--no-messages', 'HEAD', job.branch); }
-    catch (error) { conflicts = String(error.stdout || '').split('\n').slice(1).map(line => line.trim()).filter(Boolean); }
-  }
-  const stat = await git(job.repo, 'diff', '--shortstat', 'HEAD...' + job.branch).catch(() => '');
+  const [head, tip, status] = await Promise.all([
+    git(job.repo, 'rev-parse', 'HEAD'),
+    git(job.repo, 'rev-parse', job.branch),
+    git(job.repo, 'status', '--porcelain', '--no-renames', '--untracked-files=no', '-z')
+  ]);
+  // With --no-renames a move is reported as a deletion and addition. NUL delimiters preserve filenames as-is.
+  const entries = status.split('\0').filter(Boolean);
+  const dirty = entries.map(line => line.slice(3));
+  const staged = entries.filter(line => line[0] !== ' ').map(line => line.slice(3));
+  const rebased = job.merged?.into === target && job.merged.tip === tip && job.merged.rebasedTip;
+  const recordedRebase = Boolean(rebased && await isAncestor(job.repo, rebased, head));
+  const alreadyMerged = recordedRebase || await isAncestor(job.repo, tip, head);
+  const fastForward = !alreadyMerged && await isAncestor(job.repo, head, tip);
+  const { tree, conflicts } = alreadyMerged || fastForward ? { tree: tip, conflicts: null } : await previewMerge(job.repo, head, tip);
+  const pathKey = name => process.platform === 'win32' ? name.toLowerCase() : name;
+  const incoming = new Set((alreadyMerged ? [] :
+    (await git(job.repo, 'diff', '--name-only', '--no-renames', '-z', ...(tree ? [head, tree] : [head + '...' + tip]), '--'))
+      .split('\0').filter(Boolean)).map(pathKey));
+  const overlaps = name => incoming.has(pathKey(name));
+  const overlap = dirty.filter(overlaps);
+  const stat = await git(job.repo, 'diff', '--shortstat', (recordedRebase ? job.merged.before : head) + '...' + tip, '--').catch(() => '');
   const blockers = [];
   if (target === 'HEAD') blockers.push('repo ไม่ได้อยู่บน branch ใด (detached HEAD) สลับไปที่ branch ที่จะรับงานก่อน');
   if (overlap.length) blockers.push('ไฟล์ที่งานนี้จะ merge ' + overlap.length + ' ไฟล์ถูกแก้ค้างไว้ใน repo และยังไม่ commit ให้ commit หรือ stash ไฟล์เหล่านั้นก่อน');
   if (staged.length && !alreadyMerged) blockers.push('repo มีไฟล์ที่ stage ไว้แล้วยังไม่ commit ' + staged.length + ' ไฟล์ ให้ commit หรือเอาออกจาก stage ก่อน');
-  if (conflicts.length) blockers.push('merge แล้วจะชนกันใน ' + conflicts.length + ' ไฟล์ ต้องแก้เองใน Git');
-  return { target, expected: job.baseBranch || null, otherBranch: Boolean(job.baseBranch && job.baseBranch !== target), dirty: dirty.slice(0, 20),
-    overlap: overlap.slice(0, 20), staged: staged.slice(0, 20), untouched: dirty.filter(name => !incoming.has(name) && !staged.includes(name)).length,
-    alreadyMerged, fastForward, conflicts: conflicts.slice(0, 20), stat, blockers };
+  if (conflicts) blockers.push(conflictMessage(conflicts));
+  const check = { target, expected: job.baseBranch || null, otherBranch: Boolean(job.baseBranch && job.baseBranch !== target), dirty: dirty.slice(0, 20),
+    overlap: overlap.slice(0, 20), staged: staged.slice(0, 20), untouched: dirty.filter(name => !overlaps(name) && !staged.includes(name)).length,
+    alreadyMerged, fastForward, conflicts: conflicts?.slice(0, 20) ?? [], stat, blockers };
+  return { check, head, tip, tree, conflicts, recordedRebase };
+}
+
+function rejectMergeConflict(job, res, check, files, error = conflictMessage(files)) {
+  job.mergeConflict = { target: check.target, files: files.slice(0, 20), error,
+    previousStatus: job.mergeConflict?.previousStatus ?? job.status };
+  job.status = 'needs_review';
+  addEvent(job, 'Merge', error + (files.length ? ' · ' + files.slice(0, 8).join(', ') : ''));
+  check.conflicts = job.mergeConflict.files;
+  if (!check.blockers.includes(error)) check.blockers.push(error);
+  return res.status(409).json({ error: check.blockers.join(' · '), check });
+}
+
+let mergeQueue;
+function queueMerge(job, run) {
+  jobWrites.set(job.id, mergeQueue ? 'merge_lock' : 'merge');
+  const result = (mergeQueue ?? Promise.resolve()).then(async () => {
+    jobWrites.set(job.id, 'merge');
+    monitor.publish();
+    return run();
+  }).finally(() => {
+    jobWrites.delete(job.id);
+    if (mergeQueue === tail) mergeQueue = undefined;
+    monitor.publish();
+  });
+  const tail = mergeQueue = result.catch(() => {});
+  monitor.publish();
+  return result;
 }
 
 app.get('/api/jobs/:id/merge-check', async (req, res) => {
   const job = findJob(req.params.id);
   if (!job) return res.status(404).json({ error: 'ไม่พบงานนี้' });
-  if (busy(job)) return res.status(409).json({ error: 'งานยังทำไม่เสร็จ' });
-  res.json(await mergeCheck(job));
+  if (busy(job)) return res.status(409).json({ error: 'งานกำลังดำเนินการอยู่' });
+  res.json((await mergeCheck(job)).check);
 });
 
-app.post('/api/jobs/:id/merge', finishBeforeRestart(async (req, res) => {
+app.post('/api/jobs/:id/merge', finishBeforeRestart((req, res) => {
   const job = findJob(req.params.id);
   if (!job) return res.status(404).json({ error: 'ไม่พบงานนี้' });
-  if (busy(job)) return res.status(409).json({ error: 'งานยังทำไม่เสร็จ' });
-  const check = await mergeCheck(job);
-  // The client confirms the branch it showed the user; if the checkout changed since, stop.
-  if (req.body?.target !== check.target) return res.status(409).json({ error: 'branch ของ repo เปลี่ยนไปเป็น ' + check.target + ' ตรวจอีกครั้งก่อน merge', check });
+  if (busy(job)) return res.status(409).json({ error: 'งานกำลังดำเนินการอยู่' });
+  return queueMerge(job, () => mergeJob(job, req.body, res));
+}));
+
+async function mergeJob(job, input, res) {
+  const { check, head, tip, tree, conflicts, recordedRebase } = await mergeCheck(job);
+  // Recheck the target after waiting in the queue.
+  if (input?.target !== check.target) return res.status(409).json({ error: 'branch ของ repo เปลี่ยนไปเป็น ' + check.target + ' ตรวจอีกครั้งก่อน merge', check });
+  if (conflicts) return rejectMergeConflict(job, res, check, conflicts);
   if (check.blockers.length) return res.status(409).json({ error: check.blockers.join(' · '), check });
-  const tip = await git(job.repo, 'rev-parse', job.branch);
-  const headBefore = await git(job.repo, 'rev-parse', 'HEAD');
+  if (recordedRebase) {
+    if (input.cleanup) await cleanupMerged(job);
+    return res.json(publicJob(job));
+  }
+
+  let mergeTip = tip;
   if (!check.alreadyMerged) {
+    if (head !== job.base && !check.fastForward) {
+      const prepared = await rebaseForMerge(job.repo, path.join(dataDir, 'worktrees', job.id), head, tip, tree);
+      if (prepared.conflicts) return rejectMergeConflict(job, res, check, prepared.conflicts);
+      mergeTip = prepared.tip;
+    }
+
     const identity = await git(job.repo, 'config', 'user.name').catch(() => '') ? [] : ['-c', 'user.name=Relay', '-c', 'user.email=relay@localhost'];
+    if (await pendingMerge(job.repo)) return res.status(409).json({ error: 'repo มี merge ที่ค้างอยู่ ให้จัดการใน Git ก่อน', check });
+    const current = await git(job.repo, 'rev-parse', '--abbrev-ref', 'HEAD');
+    if (current !== check.target || await git(job.repo, 'rev-parse', 'HEAD') !== head) {
+      return res.status(409).json({ error: 'HEAD ของ repo เปลี่ยนระหว่างเตรียม merge กรุณาตรวจอีกครั้ง', check });
+    }
     try {
-      await userGit(job.repo, ...identity, 'merge', '--no-edit', '-m', 'Merge ' + job.branch + ': ' + job.title, job.branch);
+      await userGit(job.repo, ...identity, 'merge', '--no-autostash', '--no-overwrite-ignore',
+        ...(mergeTip !== tip ? ['--ff-only'] : []), '--no-edit', '-m', 'Merge ' + job.branch + ': ' + job.title, mergeTip);
     } catch (error) {
-      const conflicted = await git(job.repo, 'diff', '--name-only', '--diff-filter=U').catch(() => '');
-      await userGit(job.repo, 'merge', '--abort').catch(() => {});
-      addEvent(job, 'Merge', 'merge ไม่สำเร็จ ยกเลิกแล้ว repo กลับเป็นเหมือนเดิม: ' + (conflicted || error.stderr || error.message).toString().slice(0, 300));
-      return res.status(409).json({ error: 'merge ไม่สำเร็จ Relay ยกเลิกให้แล้ว repo กลับเป็นเหมือนเดิม' + (conflicted ? ' (ไฟล์ที่ชน: ' + conflicted.split('\n').join(', ') + ')' : ''), check });
+      const merging = await pendingMerge(job.repo);
+      const files = merging === mergeTip
+        ? (await git(job.repo, 'diff', '--name-only', '--diff-filter=U', '-z')).split('\0').filter(Boolean) : [];
+      if (merging === mergeTip) {
+        const aborted = await userGit(job.repo, 'merge', '--abort').then(() => true, () => false);
+        if (!aborted) {
+          return rejectMergeConflict(job, res, check, files, 'ยกเลิก merge ไม่สำเร็จ ต้องตรวจสถานะ repo ใน Git');
+        }
+      }
+      if (files.length) return rejectMergeConflict(job, res, check, files);
+      addEvent(job, 'Merge', 'merge ไม่สำเร็จ · ' + (error.stderr || error.message).toString().slice(0, 300));
+      return res.status(409).json({ error: 'merge ไม่สำเร็จ ตรวจสถานะ repo ใน Git แล้วลองอีกครั้ง', check });
     }
   }
-  const commit = await git(job.repo, 'rev-parse', 'HEAD');
-  job.merged = { at: Date.now(), into: check.target, commit, tip, fastForward: check.fastForward, before: check.alreadyMerged ? null : headBefore };
-  addEvent(job, 'Merge', (check.alreadyMerged ? 'branch นี้อยู่ใน ' : 'merge เข้า ') + check.target + ' แล้ว (' + commit.slice(0, 7) + (check.fastForward ? ', fast-forward' : '') + ')');
+  const commit = check.alreadyMerged ? head : await git(job.repo, 'rev-parse', 'HEAD');
+  const rebased = mergeTip !== tip;
+  const fastForward = rebased || check.fastForward;
+  if (job.mergeConflict) {
+    if (job.status === 'needs_review') job.status = job.mergeConflict.previousStatus;
+    delete job.mergeConflict;
+  }
+  job.merged = { at: Date.now(), into: check.target, commit, tip, fastForward, before: check.alreadyMerged ? null : head,
+    ...(rebased && { rebasedTip: mergeTip }) };
+  addEvent(job, 'Merge', (check.alreadyMerged ? 'branch นี้อยู่ใน ' : 'merge เข้า ') + check.target + ' แล้ว (' +
+    commit.slice(0, 7) + (rebased ? ', rebase และ fast-forward' : fastForward ? ', fast-forward' : '') + ')');
   job.selfUpdate = check.alreadyMerged
     ? await rebuildSelf(job, job.base, tip)
-    : await rebuildSelf(job, headBefore, commit);
+    : await rebuildSelf(job, head, commit);
   save();
-  // The tracked merge handler keeps restart waiting until cleanup settles, even if cleanup fails.
   if (shouldAutoRestart(job.selfUpdate, state.settings)) {
     void restartController.requestRestart({ source: 'auto', reason: job.title });
   }
-  if (req.body?.cleanup) {
-    await cleanup(job, false);
-    await git(job.repo, 'branch', '-d', job.branch).then(() => { job.branchKept = false; }).catch(() => {});
-    addEvent(job, 'Merge', 'ล้าง worktree และลบ branch ' + job.branch + ' แล้ว');
-  }
+  if (input.cleanup) await cleanupMerged(job);
   res.json(publicJob(job));
-}));
+}
+
+const pendingMerge = cwd => git(cwd, 'rev-parse', '--verify', '-q', 'MERGE_HEAD').catch(error => {
+  if (error.code === 1) return null;
+  throw error;
+});
+
+async function cleanupMerged(job) {
+  await cleanup(job, false);
+  // Keep the original commits (and job diff) reachable after rebasing an isolated copy of the branch.
+  if (!job.merged.rebasedTip) await git(job.repo, 'branch', '-d', job.branch)
+    .then(() => { job.branchKept = false; }).catch(() => {});
+  addEvent(job, 'Merge', 'ล้าง worktree แล้ว' + (job.branchKept ? ' เก็บ branch ' : ' และลบ branch ') + job.branch);
+}
 // A job that changed Relay itself: after its merge, rebuild the web page Relay serves (dist) when the UI changed,
 // and say when the server or MCP code changed, since those need a restart.
 async function rebuildSelf(job, from, to) {
@@ -2154,7 +2243,7 @@ async function rebuildSelf(job, from, to) {
   if (dependencies) addEvent(job, 'อัปเดต Relay', 'งานนี้แก้ package.json ต้องรัน npm install ใน ' + root + ' ก่อน build หรือรีสตาร์ท');
   return { ...result, at: Date.now() };
 }
-const busy = job => workers.has(job.id) || ['queued', 'running', 'stopping', 'waiting_approval'].includes(job.status);
+const busy = job => jobWrites.has(job.id) || workers.has(job.id) || ['queued', 'running', 'stopping', 'waiting_approval'].includes(job.status);
 async function cleanup(job, deleteBranch) {
   // Remove every folder for this job (including role worktrees left by a failed removal), then let git forget them.
   const jobRoot = path.join(dataDir, 'worktrees', job.id);
@@ -2176,20 +2265,22 @@ app.post('/api/jobs/:id/open', (req, res) => {
   spawn(process.platform === 'win32' ? 'explorer.exe' : 'xdg-open', [job.worktree], { detached: true, stdio: 'ignore' }).unref();
   res.json({ ok: true });
 });
-app.post('/api/jobs/:id/cleanup', finishBeforeRestart(async (req, res) => {
+async function cleanupJob(req, res, remove) {
   const job = findJob(req.params.id);
-  if (!job || busy(job)) return res.status(409).json({ error: 'ล้างงานที่ยังทำงานอยู่ไม่ได้' });
-  await cleanup(job, req.body?.deleteBranch === true);
-  res.json(publicJob(job));
-}));
-app.delete('/api/jobs/:id', finishBeforeRestart(async (req, res) => {
-  const job = findJob(req.params.id);
-  if (!job || busy(job)) return res.status(409).json({ error: 'ลบงานที่ยังทำงานอยู่ไม่ได้' });
-  await cleanup(job, req.body?.deleteBranch === true);
-  state.jobs = state.jobs.filter(item => item !== job);
-  save();
-  res.json({ ok: true });
-}));
+  if (!job || busy(job)) return res.status(409).json({ error: (remove ? 'ลบ' : 'ล้าง') + 'งานที่ยังทำงานอยู่ไม่ได้' });
+  jobWrites.set(job.id, 'cleanup');
+  try {
+    await cleanup(job, req.body?.deleteBranch === true);
+    if (!remove) return res.json(publicJob(job));
+    state.jobs = state.jobs.filter(item => item !== job);
+    save();
+    res.json({ ok: true });
+  } finally {
+    jobWrites.delete(job.id);
+  }
+}
+app.post('/api/jobs/:id/cleanup', finishBeforeRestart((req, res) => cleanupJob(req, res, false)));
+app.delete('/api/jobs/:id', finishBeforeRestart((req, res) => cleanupJob(req, res, true)));
 app.post('/api/jobs/:id/cancel', (req, res) => {
   const job = state.jobs.find(item => item.id === req.params.id);
   if (!job || !['queued', 'running', 'waiting_approval'].includes(job.status)) return res.status(409).json({ error: 'งานนี้หยุดไม่ได้แล้ว' });

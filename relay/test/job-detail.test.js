@@ -47,7 +47,10 @@ export const removeWorktreeFolder = async () => {};
 export const editContexts = async (_cwd, fields) => ({ context: JSON.stringify(fields) });
 export const applyFiles = async () => {}, applyEdits = async () => {};
 export const checkpoint = async (_cwd, _message, paths) => paths.length ? 'tip' : null;
+export const previewMerge = (...args) => fixture.previewMerge(...args);
+export const rebaseForMerge = (...args) => fixture.rebaseForMerge(...args);
 export async function git(_cwd, cmd, ...args) {
+  if (fixture.mergeGit) return fixture.mergeGit(cmd, ...args);
   if (cmd === 'diff') {
     if (args.includes('--numstat')) return fixture.numstat;
     if (args.includes('--name-only')) return 'current.txt\0icon.bin\0';
@@ -57,6 +60,13 @@ export async function git(_cwd, cmd, ...args) {
   if (cmd === 'rev-parse') return args.includes('--abbrev-ref') ? 'main' : 'tip';
   if (cmd === 'check-ignore' || cmd === 'worktree' || cmd === '-c' || cmd === 'reset') return '';
   throw Error('Unexpected git command: ' + cmd);
+}
+`);
+const childProcessUrl = inline(`
+export * from 'node:child_process';
+import { fixture } from ${JSON.stringify(gitMockUrl)};
+export function execFile(_file, args, _options, callback) {
+  Promise.resolve().then(() => fixture.userGit(args)).then(stdout => callback(null, { stdout }), callback);
 }
 `);
 const fsUrl = inline("export * from 'node:fs'; export const mkdirSync = () => {}, existsSync = () => false, readdirSync = () => [];");
@@ -73,7 +83,7 @@ before(async () => {
       const parent = context.parentURL;
       if (specifier === './providers.js' && parent?.startsWith(serverDir.href)) return nextResolve(providersUrl, context);
       if (parent === indexUrl) {
-        const mocks = { express: expressUrl, 'cross-spawn': inline('export default () => {};'), './git.js': gitMockUrl, 'node:fs': fsUrl };
+        const mocks = { express: expressUrl, 'cross-spawn': inline('export default () => {};'), './git.js': gitMockUrl, 'node:fs': fsUrl, 'node:child_process': childProcessUrl };
         if (Object.hasOwn(mocks, specifier)) return nextResolve(mocks[specifier], context);
       }
       if (parent === storeUrl && specifier === 'node:sqlite') return nextResolve(sqliteUrl, context);
@@ -660,3 +670,191 @@ test('startup recovers each persisted running or parked job and keeps an interru
   assert.deepEqual(approved.body, { ok: true, id: pending.id, status: 'running' });
   for (const { id } of savedJobs.slice(0, 3)) await waitForJob(id, 'complete');
 });
+
+const mergePath = '/api/jobs/:id/merge';
+const mergeCheckPath = mergePath + '-check';
+
+function mergeFixture(t) {
+  const base = 'merge-base';
+  let head = base;
+  const parents = new Map();
+  const calls = [];
+  const files = new Set();
+  const repoBranches = new Map();
+  const control = { dirty: '', conflict: [] };
+  const ids = [];
+  const tipOf = id => 'tip-' + id;
+  const seed = (id, file = id + '.txt') => {
+    const job = { id, title: id, repo, branch: 'relay/' + id, base, baseBranch: 'main',
+      status: 'complete', worktree: repo + '/' + id, events: [], createdAt: Date.now() };
+    const tip = tipOf(id);
+    parents.set(tip, base);
+    repoBranches.set(job.branch, { tip, file });
+    server.state.jobs.push(job);
+    ids.push(id);
+    server.save();
+    return job;
+  };
+  function hasAncestor(older, tip) {
+    for (let commit = tip; commit; commit = parents.get(commit)) if (commit === older) return true;
+    return false;
+  }
+  function lookup(tip) {
+    return [...repoBranches.values()].find(branch => branch.tip === tip || 'rebase-' + branch.tip === tip);
+  }
+  function advance(commit, file) {
+    parents.set(commit, head);
+    files.add(file);
+    head = commit;
+    return head;
+  }
+
+  fixture.mergeGit = async (command, ...args) => {
+    switch (command) {
+      case 'rev-parse':
+        if (args.includes('--abbrev-ref')) return 'main';
+        if (args[0] === 'HEAD') return head;
+        if (args.at(-1) === 'MERGE_HEAD') throw Object.assign(Error('No merge in progress'), { code: 1 });
+        return repoBranches.get(args[0]).tip;
+      case 'config': return 'Test user';
+      case 'status': return control.dirty;
+      case 'merge-base':
+        assert.equal(args[0], '--is-ancestor');
+        if (hasAncestor(args[1], args[2])) return '';
+        throw Object.assign(Error('Not an ancestor'), { code: 1 });
+      case 'diff':
+        if (!args.includes('--name-only')) return '1 file changed';
+        return lookup(args.at(-2).split('...').at(-1)).file + '\0';
+      default: throw Error('Unexpected merge fixture command: ' + command);
+    }
+  };
+  fixture.previewMerge = (_repo, target, tip) => {
+    calls.push(['preview', target, tip]);
+    return control.conflict.length ? { tree: null, conflicts: control.conflict } : { tree: tip, conflicts: null };
+  };
+  fixture.rebaseForMerge = (_repo, _scratch, target, tip, tree) => {
+    calls.push(['rebase', target, tip]);
+    assert.equal(tree, tip);
+    if (control.rebaseConflicts) return { conflicts: control.rebaseConflicts };
+    const rebased = 'rebase-' + tip;
+    parents.set(rebased, target);
+    return { tip: rebased };
+  };
+  fixture.userGit = async args => {
+    assert.equal(args[0], 'merge');
+    const tip = args.at(-1);
+    const { file } = lookup(tip);
+    calls.push(['start', head, tip]);
+    await control.beforeMerge?.(tip);
+    if (tip.startsWith('rebase-')) assert.ok(args.includes('--ff-only'));
+    assert.equal(parents.get(tip), head);
+    files.add(file);
+    head = tip;
+    calls.push(['finish', head, tip]);
+    return '';
+  };
+
+  t.after(() => {
+    for (const key of ['mergeGit', 'previewMerge', 'rebaseForMerge', 'userGit']) delete fixture[key];
+    server.state.jobs = server.state.jobs.filter(job => !ids.includes(job.id));
+    server.save();
+  });
+  return { base, calls, files, control, seed, tipOf, advance, get head() { return head; } };
+}
+
+test('simultaneous merges wait in one queue and record only their own results', async t => {
+  const git = mergeFixture(t);
+  const first = git.seed('first');
+  const second = git.seed('second');
+  const started = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  git.control.beforeMerge = tip => {
+    if (tip === git.tipOf(first.id)) {
+      started.resolve();
+      return release.promise;
+    }
+  };
+
+  const one = request('POST', mergePath, { target: 'main' }, first.id);
+  let two;
+  try {
+    await Promise.race([started.promise, one.then(() => assert.fail('first merge failed to enter Git'))]);
+    two = request('POST', mergePath, { target: 'main' }, second.id);
+    const { body: state } = await request('GET', '/api/state');
+    assert.equal(state.jobs.find(job => job.id === second.id).waitReason, 'merge_lock');
+    const { body: snapshot } = await request('GET', '/api/monitor');
+    assert.deepEqual(snapshot.queuedJobs.find(job => job.id === second.id), {
+      id: second.id, title: second.title, status: 'complete', waitReason: 'merge_lock'
+    });
+    assert.deepEqual(git.calls, [['start', git.base, git.tipOf(first.id)]]);
+    assert.equal((await request('POST', '/api/jobs/:id/cleanup', {}, second.id)).statusCode, 409);
+    assert.equal((await request('POST', mergePath, { target: 'main' }, second.id)).statusCode, 409);
+  } finally {
+    release.resolve();
+    await Promise.allSettled([one, two]);
+  }
+
+  const [a, b] = await Promise.all([one, two]);
+  assert.equal(a.statusCode, 200, a.body.error);
+  assert.equal(b.statusCode, 200, b.body.error);
+  assert.deepEqual([a.body.merged.before, a.body.merged.tip, a.body.merged.commit], [git.base, git.tipOf(first.id), git.tipOf(first.id)]);
+  assert.deepEqual([b.body.merged.before, b.body.merged.tip, b.body.merged.commit],
+    [git.tipOf(first.id), git.tipOf(second.id), 'rebase-' + git.tipOf(second.id)]);
+  assert.deepEqual(git.calls.map(([event]) => event), ['start', 'finish', 'preview', 'rebase', 'start', 'finish']);
+  assert.deepEqual([...git.files], ['first.txt', 'second.txt']);
+  assert.equal((await request('GET', mergeCheckPath, undefined, second.id)).body.alreadyMerged, true);
+  assert.equal((await request('POST', mergePath, { target: 'main' }, second.id)).body.merged.at, b.body.merged.at);
+});
+
+test('retrying a stale merge preserves unrelated dirty files and blocks only overlapping unstaged paths', async t => {
+  const git = mergeFixture(t);
+  const job = git.seed('stale', 'ชื่อ งาน.txt');
+  const newer = git.advance('newer-head', 'upstream.txt');
+  git.control.dirty = ' M unrelated.txt\0 M ชื่อ งาน.txt\0';
+  const blocked = await request('POST', mergePath, { target: 'main' }, job.id);
+  assert.equal(blocked.statusCode, 409);
+  assert.deepEqual(blocked.body.check.overlap, ['ชื่อ งาน.txt']);
+  assert.equal(blocked.body.check.untouched, 1);
+  assert.equal(git.head, newer);
+  assert.equal(currentJob(job.id).status, 'complete');
+
+  git.control.dirty = ' M unrelated.txt\0';
+  const merged = await request('POST', mergePath, { target: 'main' }, job.id);
+  assert.equal(merged.statusCode, 200, merged.body.error);
+  assert.equal(merged.body.merged.before, newer);
+  assert.equal(merged.body.merged.rebasedTip, git.head);
+  assert.deepEqual([...git.files], ['upstream.txt', 'ชื่อ งาน.txt']);
+  assert.equal(git.control.dirty, ' M unrelated.txt\0');
+});
+
+for (const phase of ['preview', 'rebase']) {
+  test('a conflict during ' + phase + ' persists needs_review and releases the merge queue', async t => {
+    const git = mergeFixture(t);
+    const job = git.seed('conflicted');
+    const { worktree, branch } = job;
+    const next = git.seed('merge-after-conflict');
+    const newer = git.advance('upstream', 'conflicted.txt');
+    if (phase === 'preview') git.control.conflict = ['conflicted.txt'];
+    else git.control.rebaseConflicts = ['conflicted.txt'];
+
+    const rejected = await request('POST', mergePath, { target: 'main', cleanup: true }, job.id);
+    assert.equal(rejected.statusCode, 409);
+    assert.deepEqual(rejected.body.check.conflicts, ['conflicted.txt']);
+    const saved = server.store.load().jobs.find(item => item.id === job.id);
+    assert.equal(saved.status, 'needs_review');
+    assert.equal(saved.worktree, worktree);
+    assert.equal(saved.branch, branch);
+    assert.equal(saved.merged, undefined);
+    assert.equal(git.head, newer);
+    assert.ok(!git.calls.some(([step]) => step === 'start'));
+    const { body: summary } = await request('GET', '/api/jobs/:id/summary', undefined, job.id);
+    assert.match(summary.error, /ต้องแก้เอง/);
+
+    git.control.conflict = [];
+    delete git.control.rebaseConflicts;
+    const merged = await request('POST', mergePath, { target: 'main' }, next.id);
+    assert.equal(merged.statusCode, 200, merged.body.error);
+    assert.equal(merged.body.merged.before, newer);
+    assert.equal(currentJob(job.id).status, 'needs_review');
+  });
+}
