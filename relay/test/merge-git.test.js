@@ -14,6 +14,7 @@ async function repoWithJob(t) {
   const job = path.join(repo, 'job');
   const scratch = path.join(repo, 'scratch');
   await git(repo, 'init', '--quiet', '-b', 'main');
+  await git(repo, 'config', 'core.autocrlf', 'false');
   const commit = async (cwd, file, text) => {
     await writeFile(path.join(cwd, file), text);
     await git(cwd, 'add', '--', file);
