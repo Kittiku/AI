@@ -302,6 +302,22 @@ input[type="checkbox"] { accent-color: var(--brand); width: 16px; height: 16px; 
 .monitor-activity-list { margin-top: 12px; }
 .monitor-activity-list time { flex: none; color: var(--muted); font-variant-numeric: tabular-nums; }
 .monitor-activity-list .events li { padding: 8px 0; }
+.rounds { display: grid; gap: 6px; padding-bottom: 8px; min-width: 0; }
+.round-section { min-width: 0; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); padding: 0 10px; }
+.round-section > summary { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; padding-block: 7px; min-height: 36px; }
+.round-section > summary strong { font-size: 13px; }
+.round-status, .round-span, .round-count { font-size: 11.5px; padding: 0 7px; border-radius: 9px; background: var(--brand-soft); color: var(--brand-ink); font-weight: 650; }
+.round-span, .round-count { background: #e6e8ef; color: var(--muted); }
+.round-reason { flex-basis: 100%; min-width: 0; color: var(--ink-2); font-size: 12px; font-weight: 450; overflow-wrap: anywhere; }
+.round-lines { list-style: none; padding: 0; }
+.round-line { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 2px 10px; padding: 6px 0; border-top: 1px solid var(--line); font-size: 12.5px; min-width: 0; }
+.round-line time { color: var(--muted); font-variant-numeric: tabular-nums; }
+.round-line-main { display: flex; flex-wrap: wrap; gap: 2px 8px; min-width: 0; overflow-wrap: anywhere; }
+.round-line-result { color: var(--ink-2); }
+.round-line.failed .round-line-result { color: var(--bad); }
+.round-line.completed .round-line-result { color: var(--ok); }
+.round-line-meta { grid-column: 2; display: flex; flex-wrap: wrap; gap: 2px 10px; min-width: 0; color: var(--muted); font-size: 11.5px; overflow-wrap: anywhere; }
+.round-more { min-height: 32px; margin: 2px 0 8px; }
 .monitor-legacy-progress { border-top: 1px solid var(--line); padding-top: 12px; }
 
 /* Legacy stepper (jobs recorded before the live monitor) */
