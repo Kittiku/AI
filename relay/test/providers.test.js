@@ -6,9 +6,10 @@ import { createInterface } from 'node:readline';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
-// Two copies of the module: one where Gemini uses the API, one where it uses Antigravity CLI (agy).
-// Settings are read when the module loads, so the environment is set before each import.
-for (const name of ['GOOGLE_API_KEY', 'RELAY_GEMINI_CLI_MODEL', 'RELAY_GEMINI_MODEL']) delete process.env[name];
+// Each copy freezes the Gemini mode and environment at module load.
+for (const name of ['GOOGLE_API_KEY', 'RELAY_GEMINI_CLI_MODEL', 'RELAY_GEMINI_MODEL', 'RELAY_CLAUDE_CODE_MODEL', 'RELAY_CODEX_MODEL']) {
+  delete process.env[name];
+}
 process.env.RELAY_AGY_BIN = path.join(tmpdir(), 'relay-test-missing-agy.exe');
 process.env.RELAY_GEMINI_BIN = path.join(tmpdir(), 'relay-test-missing-gemini.exe');
 process.env.RELAY_GEMINI_MODE = 'api';
@@ -128,8 +129,8 @@ function fakeProcess() {
     if (!child.closed) { child.closed = true; setImmediate(() => child.emit('close', null)); }
     return true;
   };
-  child.reply = text => {
-    child.stdout.once('end', () => { if (!child.closed) { child.closed = true; child.emit('close', 0); } });
+  child.reply = (text, code = 0) => {
+    child.stdout.once('end', () => { if (!child.closed) { child.closed = true; child.emit('close', code); } });
     child.stdout.end(text);
   };
   return child;
@@ -162,25 +163,45 @@ test('Claude Code gets prompt + CONTEXT + context, byte for byte', async () => {
   assert.ok(fake.calls[0].input.equals(Buffer.from(expected, 'utf8')));
 });
 
-test('Codex gets prompt + CONTEXT + context, byte for byte', async () => {
+function fakeCodex(module, { models = [{ model: 'test-model', isDefault: true }], rejected = new Set() } = {}) {
   const sent = [];
-  api.processes.spawn = () => {
+  const attempted = [];
+  const args = [];
+  module.processes.spawn = (_binary, flags) => {
+    args.push(flags);
     const child = fakeProcess();
     const send = message => child.stdout.write(JSON.stringify(message) + '\n');
+    const threads = new Map();
     createInterface({ input: child.stdin }).on('line', line => {
       const message = JSON.parse(line);
       if (message.method === 'initialize') send({ id: message.id, result: {} });
-      else if (message.method === 'model/list') send({ id: message.id, result: { data: [{ model: 'test-model', isDefault: true }] } });
-      else if (message.method === 'thread/start') send({ id: message.id, result: { thread: { id: 'thread-1' } } });
-      else if (message.method === 'turn/start') {
-        sent.push(message.params.input[0].text);
+      else if (message.method === 'model/list') send({ id: message.id, result: { data: models } });
+      else if (message.method === 'thread/start') {
+        const { model } = message.params;
+        attempted.push(model);
+        const id = 'thread-' + attempted.length;
+        threads.set(id, model);
+        send({ id: message.id, result: { thread: { id } } });
+      } else if (message.method === 'turn/start') {
+        const { threadId, input } = message.params;
+        sent.push(input[0].text);
         send({ id: message.id, result: {} });
-        send({ method: 'item/completed', params: { threadId: 'thread-1', item: { type: 'agentMessage', text: JSON.stringify(answer) } } });
-        send({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { status: 'completed' } } });
+        if (rejected.has(threads.get(threadId))) {
+          send({ method: 'turn/completed', params: { threadId,
+            turn: { status: 'failed', error: { message: 'model_not_found' } } } });
+        } else {
+          send({ method: 'item/completed', params: { threadId, item: { type: 'agentMessage', text: JSON.stringify(answer) } } });
+          send({ method: 'turn/completed', params: { threadId, turn: { status: 'completed' } } });
+        }
       }
     });
     return child;
   };
+  return { sent, attempted, args };
+}
+
+test('Codex gets prompt + CONTEXT + context, byte for byte', async () => {
+  const { sent } = fakeCodex(api);
   const result = await run(api, 'codex', { context: bigContext, geminiCliContext: cliContext });
   assert.deepEqual(plain(result), answer);
   assert.equal(sent.length, 1);
@@ -232,4 +253,157 @@ test('Antigravity CLI is not started when even the required files are too large'
   const huge = contextOf({ files: [file('f0.js', 4_000)], requiredPaths: ['f0.js'] });
   await assert.rejects(run(cli, 'gemini', { context: huge }), error => error.code === 'RELAY_CONTEXT_TOO_LARGE');
   assert.equal(fake.calls.length, 0);
+});
+
+const claudeArgs = [
+  '-p', 'Complete the Relay request provided on stdin. Use the files in the current directory only as read-only reference.',
+  '--output-format', 'json', '--json-schema', JSON.stringify(reviewSchema),
+  '--tools', 'Read,Glob,Grep', '--allowedTools', 'Read,Glob,Grep',
+  '--max-turns', String(Number(process.env.RELAY_CLAUDE_CODE_MAX_TURNS) || 40), '--no-session-persistence'
+];
+const agyArgs = ['--input-format', 'stream-json', '--output-format', 'stream-json',
+  '--json-schema', JSON.stringify(reviewSchema), '--disable-slash-commands'];
+const claudeResult = JSON.stringify({ structured_output: answer, is_error: false, usage: {} });
+const agyResult = JSON.stringify({ event: 'result', result: { status: 'SUCCESS', structured_output: answer } }) + '\n';
+
+test('Claude and Antigravity retain their full argument lists when the call uses automatic model selection', async t => {
+  const claude = withStdin(() => claudeResult);
+  const agy = withStdin(() => agyResult);
+  api.processes.spawn = claude.spawn;
+  cli.processes.spawn = agy.spawn;
+  for (const options of [undefined, { model: '' }]) {
+    await run(api, 'claudecode', options);
+    await run(cli, 'gemini', options);
+  }
+  assert.deepEqual(claude.calls.map(call => call.args), [claudeArgs, claudeArgs]);
+  assert.deepEqual(agy.calls.map(call => call.args), [agyArgs, agyArgs]);
+
+  process.env.RELAY_CLAUDE_CODE_MODEL = 'test-claude-env';
+  process.env.RELAY_GEMINI_CLI_MODEL = 'test-gemini-cli-env';
+  process.env.RELAY_GEMINI_MODEL = 'test-gemini-api-env';
+  t.after(() => {
+    delete process.env.RELAY_CLAUDE_CODE_MODEL;
+    delete process.env.RELAY_GEMINI_CLI_MODEL;
+    delete process.env.RELAY_GEMINI_MODEL;
+  });
+  const fromEnv = await import('../server/providers.js?mode=cli-model-env');
+  await fromEnv.refreshGemini();
+  fromEnv.processes.spawn = agy.spawn;
+  for (const options of [undefined, { model: '' }, { model: 'role-model' }, undefined]) {
+    await run(api, 'claudecode', options);
+    await run(fromEnv, 'gemini', options);
+  }
+  assert.deepEqual(claude.calls.slice(2).map(call => call.args), ['test-claude-env', 'test-claude-env', 'role-model', 'test-claude-env']
+    .map(model => [...claudeArgs, '--model', model]));
+  assert.deepEqual(agy.calls.slice(2).map(call => call.args), ['test-gemini-cli-env', 'test-gemini-cli-env', 'role-model', 'test-gemini-cli-env']
+    .map(model => [...agyArgs, '--model', model]));
+});
+
+test('Claude Code and Antigravity retry rejected models with the default CLI arguments', async () => {
+  const rejected = 'unavailable-pinned-model';
+  for (const { module, provider, baseArgs, failure, success } of [
+    { module: api, provider: 'claudecode', baseArgs: claudeArgs, success: claudeResult,
+      failure: JSON.stringify({ is_error: true, result: 'There is an issue with the selected model. It may not exist.' }) },
+    { module: cli, provider: 'gemini', baseArgs: agyArgs, success: agyResult,
+      failure: JSON.stringify({ event: 'result', result: { status: 'ERROR', error: 'ModelNotFoundError' } }) + '\n' }
+  ]) {
+    const warnings = [];
+    let tries = 0;
+    let counted = 0;
+    const fake = withStdin(() => ++tries === 1 ? failure : success);
+    module.processes.spawn = fake.spawn;
+    const result = await module.generate(provider, tmpdir(), prompt, reviewSchema, new AbortController().signal, () => { counted++; }, {
+      model: rejected, beforeModelRetry: model => { warnings.push(model); assert.equal(counted, 0); }
+    });
+    assert.deepEqual(plain(result), answer);
+    assert.deepEqual(warnings, [rejected]);
+    assert.deepEqual(fake.calls.map(call => call.args), [[...baseArgs, '--model', rejected], baseArgs]);
+    assert.notEqual(result[module.USAGE].model, rejected);
+    assert.equal(counted, provider === 'gemini' ? 1 : 0);
+  }
+});
+
+test('Codex keeps its automatic model order and an override only affects that call', async t => {
+  const preferred = { model: 'preferred', isDefault: true };
+  const alternate = { id: 'alternate' };
+  const rejected = new Set(['preferred']);
+  const { attempted, args } = fakeCodex(api, { models: [preferred, alternate], rejected });
+  const automatic = await run(api, 'codex');
+  assert.deepEqual(attempted.splice(0), ['preferred', 'alternate']);
+  assert.equal(automatic[api.USAGE].model, 'alternate');
+  rejected.clear();
+
+  const pinned = await run(api, 'codex', { model: 'role-model' });
+  assert.equal(pinned[api.USAGE].model, 'role-model');
+  await run(api, 'codex', { model: '' });
+  assert.deepEqual(attempted.splice(0), ['role-model', 'alternate']);
+
+  process.env.RELAY_CODEX_MODEL = 'env-model';
+  t.after(() => { delete process.env.RELAY_CODEX_MODEL; });
+  const warnings = [];
+  rejected.add('env-model');
+  await run(api, 'codex', { model: 'another-role-model' });
+  const fallback = await run(api, 'codex', { beforeModelRetry: model => warnings.push(model) });
+  assert.equal(fallback[api.USAGE].model, 'alternate');
+  assert.deepEqual(warnings, ['env-model']);
+  assert.deepEqual(attempted.splice(0), ['another-role-model', 'env-model', 'alternate']);
+
+  rejected.add('alternate');
+  const afterRejection = await run(api, 'codex', { model: 'alternate', beforeModelRetry: model => warnings.push(model) });
+  assert.equal(afterRejection[api.USAGE].model, 'preferred');
+  assert.deepEqual(attempted, ['alternate', 'preferred']);
+  assert.deepEqual(warnings, ['env-model', 'alternate']);
+  assert.ok(args.every(flags => flags.length === 1 && flags[0] === 'app-server'));
+});
+
+test('Gemini API uses the override and falls back to the legacy API environment model', async t => {
+  process.env.RELAY_GEMINI_MODE = 'api';
+  process.env.GEMINI_API_KEY = 'test-key';
+  process.env.RELAY_GEMINI_MODEL = 'test-gemini-env';
+  t.after(() => {
+    delete process.env.GEMINI_API_KEY;
+    delete process.env.RELAY_GEMINI_MODEL;
+    process.env.RELAY_GEMINI_MODE = 'agy';
+  });
+  const fromEnv = await import('../server/providers.js?mode=api-model-env');
+  const models = [];
+  const warnings = [];
+  const original = globalThis.fetch;
+  t.after(() => { globalThis.fetch = original; });
+  globalThis.fetch = async url => {
+    const model = new URL(url).pathname.split('/').at(-1).replace(':generateContent', '');
+    models.push(model);
+    const ok = model !== 'rejected';
+    return { ok, status: ok ? 200 : 404, headers: new Headers(),
+      json: async () => ok ? { modelVersion: model + '-actual', candidates: [{ content: { parts: [{ text: JSON.stringify(answer) }] } }] }
+        : { error: { status: 'NOT_FOUND', message: 'Unknown model' } } };
+  };
+  await run(fromEnv, 'gemini', { model: 'role-model' });
+  const result = await run(fromEnv, 'gemini', { model: 'rejected', beforeModelRetry: model => warnings.push(model) });
+  await run(fromEnv, 'gemini', { model: '' });
+  assert.deepEqual(models, ['role-model', 'rejected', 'test-gemini-env', 'test-gemini-env']);
+  assert.deepEqual(warnings, ['rejected']);
+  assert.equal(result[fromEnv.USAGE].model, 'test-gemini-env-actual');
+});
+
+test('standalone Gemini CLI adds a model argument only when configured for the call', async () => {
+  const standalone = await import('../server/providers.js?mode=standalone');
+  await standalone.refreshGemini();
+  const cliCalls = withStdin(() => JSON.stringify({ response: JSON.stringify(answer) }));
+  standalone.processes.spawn = (binary, args) => {
+    if (args[0] !== '--version') return cliCalls.spawn(binary, args);
+    const child = fakeProcess();
+    child.stdin.on('data', () => {});
+    child.stdin.on('end', () => child.reply('test-version', binary === process.env.RELAY_GEMINI_BIN ? 0 : 1));
+    return child;
+  };
+  await standalone.refreshGemini();
+  const legacyArgs = ['-p',
+    'Complete the Relay request below using only the supplied CONTEXT. Do not call tools, read or modify files, or run shell commands. ' +
+    'Return ONLY a single valid JSON object conforming to this exact JSON Schema (no markdown code fences, no explanation): ' +
+    JSON.stringify(reviewSchema), '--output-format', 'json'];
+  for (const options of [undefined, { model: 'gemini-role' }, { model: '' }]) {
+    await run(standalone, 'gemini', options);
+  }
+  assert.deepEqual(cliCalls.calls.map(call => call.args), [legacyArgs, [...legacyArgs, '--model', 'gemini-role'], legacyArgs]);
 });

@@ -75,7 +75,7 @@ const { call, defaults, state, store, publicQuotas, serverReady } = await import
   else process.env.RELAY_RETRY_DELAY_MS = priorDelay;
 });
 await serverReady;
-const { fake, pacificDay } = await import(providersUrl);
+const { fake, pacificDay, USAGE } = await import(providersUrl);
 const { resetDatabase } = await import(sqliteUrl);
 
 const role = 'backend';
@@ -192,4 +192,42 @@ test('cancellation takes precedence over a context error', async () => {
   assert.deepEqual(Array.from(store.steps(job.id), step => step.status), ['cancelled']);
   assert.equal(state.usage[pacificDay()], 4);
   assert.ok(!activities(job).includes('failed'));
+});
+
+test('execution passes the model for each role and logs rejected models before saving the actual model', async () => {
+  const { job, controller } = prepare({ mode: 'fixed', retries: 0 });
+  for (const key of ['plan', 'backend', 'frontend', 'review']) job.settings.routes[key] = ['claudecode', ''];
+  delete job.pinned;
+  job.settings.agentEdits = false;
+  job.settings.models = { claudecode: { default: 'ai-default', plan: 'planner-model', implement: 'implementer-model', check: 'checker-model' } };
+
+  const calls = [];
+  fake.generate = async (provider, _cwd, _prompt, _schema, _signal, _onUsage, options) => {
+    assert.equal(provider, 'claudecode');
+    calls.push(options.model);
+    if (options.model === 'checker-model') await options.beforeModelRetry(options.model, true);
+    return { summary: 'finished', [USAGE]: { model: options.model === 'checker-model' ? 'actual-fallback' : options.model } };
+  };
+  for (const [role, options] of [
+    ['plan', {}],
+    ['backend', { edit: true, action: 'subtask' }],
+    ['frontend', { edit: true, action: 'fix_review' }],
+    ['review', { quiet: true, action: 'check_subtask' }],
+    ['review', {}]
+  ]) {
+    await call(job, role, '.', 'ทำงาน', '{}', {}, controller.signal, null, options);
+  }
+
+  assert.deepEqual(calls, ['planner-model', 'implementer-model', 'implementer-model', 'checker-model', 'ai-default']);
+  const warnings = store.load().jobs.find(item => item.id === job.id).events.filter(event => event.title === 'เตือนเรื่องโมเดล');
+  assert.equal(warnings.length, 1);
+  assert.equal(warnings[0].provider, 'claudecode');
+  assert.match(warnings[0].detail, /Claude Code.*check.*checker-model.*อัตโนมัติ/);
+  assert.deepEqual(Array.from(store.steps(job.id), ({ role, action, model, status }) => [role, action, model, status]), [
+    ['plan', 'plan', 'planner-model', 'done'],
+    ['backend', 'subtask', 'implementer-model', 'done'],
+    ['frontend', 'fix_review', 'implementer-model', 'done'],
+    ['review', 'check_subtask', 'actual-fallback', 'done'],
+    ['review', 'review', 'ai-default', 'done']
+  ]);
 });

@@ -27,7 +27,9 @@ const serverBoot = { bootId: randomUUID(), startedAt: Date.now(), supervised: pr
 const restartHandoff = process.env.RELAY_RESTART_HANDOFF === '1' && typeof process.send === 'function';
 if (restartHandoff) delete process.env.RELAY_RESTART_HANDOFF;
 const roles = { plan: 'วางแผน', backend: 'Backend', frontend: 'Frontend', review: 'รีวิว' };
+const modelRoles = ['default', 'plan', 'implement', 'review', 'check'];
 const defaults = {
+  models: {},
   routes: { plan: ['claudecode', 'gemini'], backend: ['claudecode', 'codex'], frontend: ['gemini', 'claudecode'], review: ['codex', 'gemini'] },
   reserve: { claudecode: 10, gemini: 10, codex: 20 }, geminiDailyLimit: 0, maxRounds: 2,
   // Autonomous mode: try every connected AI, wait for quota instead of failing, retry failed steps, cap the total time.
@@ -67,8 +69,10 @@ function initializeState() {
   store = openStore(dataDir);
   state = store.load({ settings: structuredClone(defaults), jobs: [], usage: {}, projects: [] });
   migrateSettings(state.settings);
+  state.settings.models ??= {};
   state.projects ??= [];
   for (const job of state.jobs) {
+    if (job.settings) job.settings.models ??= {};
     const update = job.selfUpdate;
     if (update?.restart && !update.restarted && Number.isFinite(update.at) && update.at < serverBoot.startedAt) {
       update.restarted = true;
@@ -290,6 +294,7 @@ async function call(job, role, cwd, task, context, schema, signal, accept, optio
 async function callCore(job, role, cwd, task, context, schema, signal, accept, options = {}) {
   const routeKey = options.routeKey ?? role;
   const action = options.action ?? role;
+  const modelRole = action === 'check_subtask' ? 'check' : options.edit ? 'implement' : role;
   const round = job.round || 0;
   // options.quiet: a side call (a lead's check) that must not change the role's stage or provider in the monitor.
   const quiet = Boolean(options.quiet);
@@ -368,6 +373,8 @@ async function callCore(job, role, cwd, task, context, schema, signal, accept, o
     if (options.routeKey && candidate.row) inflight.get(job.id)?.set(routeKey, provider);
     const write = Boolean(options.edit && job.settings.agentEdits !== false && (provider === 'claudecode' || provider === 'codex'));
     const before = write ? await attemptState(cwd) : null;
+    const models = job.settings.models?.[provider];
+    const model = models?.[modelRole] || models?.default;
     signal.throwIfAborted();
     entry.attempts.push(provider);
     entry.chosen = provider;
@@ -393,7 +400,17 @@ async function callCore(job, role, cwd, task, context, schema, signal, accept, o
       }
       const text = typeof task === 'function' ? task({ write }) : task;
       const response = await generate(provider, cwd, toolInstructions + '\n' + text +
-        '\nUSER TASK\n' + job.prompt, schema, signal, () => { day = null; }, { write, context, geminiCliContext: options.geminiCliContext });
+        '\nUSER TASK\n' + job.prompt, schema, signal, () => { day = null; }, {
+          write, context, geminiCliContext: options.geminiCliContext, model,
+          async beforeModelRetry(rejectedModel, canRetry = true) {
+            signal.throwIfAborted();
+            if (rejectedModel) {
+              const detail = names[provider] + ' · ' + modelRole + ' · โมเดล ' + rejectedModel + ' ใช้ไม่ได้';
+              addEvent(job, 'เตือนเรื่องโมเดล', detail + (canRetry ? ' กลับไปเลือกโมเดลอัตโนมัติ' : ''), provider);
+            }
+            if (write && canRetry) await restoreWorktree();
+          }
+        });
       addUsage(job, response[USAGE]);
       signal.throwIfAborted();
       const after = write ? await attemptState(cwd, before) : null;
@@ -413,14 +430,7 @@ async function callCore(job, role, cwd, task, context, schema, signal, accept, o
         status: signal.aborted ? 'cancelled' : contextLimited ? 'skipped' : 'failed', error: error.message
       });
       // Verify the rollback before the next attempt can use this worktree.
-      if (write) {
-        try {
-          await restoreAttempt(cwd, before);
-        } catch (rollbackError) {
-          signal.throwIfAborted();
-          throw Error('ย้อนการแก้ไฟล์ของ ' + names[provider] + ' ไม่สำเร็จ: ' + rollbackError.message);
-        }
-      }
+      if (write) await restoreWorktree();
       signal.throwIfAborted();
       if (contextLimited) {
         contextError = error;
@@ -441,6 +451,15 @@ async function callCore(job, role, cwd, task, context, schema, signal, accept, o
       addEvent(job, label, error.message.slice(0, 800), provider);
       stageFail();
       return null;
+    }
+
+    async function restoreWorktree() {
+      try {
+        await restoreAttempt(cwd, before);
+      } catch (error) {
+        signal.throwIfAborted();
+        throw Error('ย้อนการแก้ไฟล์ของ ' + names[provider] + ' ไม่สำเร็จ: ' + error.message);
+      }
     }
   }
 }
@@ -1382,6 +1401,27 @@ function readRoutes(routes) {
   return Object.fromEntries(Object.keys(roles).map(role => [role, [routes[role][0], routes[role][1] || '']]));
 }
 
+function readModels(models) {
+  const isObject = value => Boolean(value && typeof value === 'object' && !Array.isArray(value));
+  if (!isObject(models)) throw Error('settings.models ต้องเป็นออบเจ็กต์');
+  const result = {};
+  for (const [provider, roles] of Object.entries(models)) {
+    const field = 'settings.models.' + provider;
+    if (!Object.hasOwn(names, provider)) throw Error('ไม่รู้จัก AI ใน ' + field);
+    if (!isObject(roles)) throw Error(field + ' ต้องเป็นออบเจ็กต์');
+    const selected = result[provider] = {};
+    for (const [role, model] of Object.entries(roles)) {
+      const slot = field + '.' + role;
+      if (!modelRoles.includes(role)) throw Error('ไม่รู้จักบทบาทใน ' + slot);
+      if (typeof model !== 'string' || model.trim().length > 120) {
+        throw Error(slot + ' ต้องเป็นข้อความที่ยาวไม่เกิน 120 ตัวอักษร');
+      }
+      selected[role] = model.trim();
+    }
+  }
+  return result;
+}
+
 function readSettings(input) {
   const limit = Number(input.geminiDailyLimit);
   const rounds = Number(input.maxRounds);
@@ -1412,6 +1452,7 @@ function readSettings(input) {
     agentEdits: input.agentEdits ?? true, approvals: { afterPlan: approvals.afterPlan },
     routing: { mode: routing.mode, profile: routing.profile, minSamples: routing.minSamples },
     team, selfUpdate: normalizeSelfUpdateSettings(input.selfUpdate ?? state.settings.selfUpdate),
+    models: Object.hasOwn(input, 'models') ? readModels(input.models) : state.settings.models,
     budget: { perJobUsd: budget.perJobUsd, dailyUsd: budget.dailyUsd, countSubscription: budget.countSubscription } };
 }
 

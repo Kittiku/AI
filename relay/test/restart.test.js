@@ -384,7 +384,7 @@ test('the restart API reports boot and queue state and restores HTTP, SSE and SQ
       opened.push(store);
       if (opened.length !== 1) return store;
       return { ...store, load(fallback) {
-        const { selfUpdate, ...settings } = fallback.settings;
+        const { selfUpdate, models, ...settings } = fallback.settings;
         const common = { repo: ${JSON.stringify(repo)}, status: 'complete', events: [], branchKept: true, base: 'base' };
         store.persist({ ...fallback, settings, jobs: [
           { ...common, id: 'merged', title: 'Relay server change', branch: 'relay/merged', selfUpdate: { at: 1, restart: true },
@@ -497,6 +497,8 @@ test('the restart API reports boot and queue state and restores HTTP, SSE and SQ
   assert.equal(server.supervised, true);
   assert.deepEqual(state.restart, idle);
   assert.deepEqual(state.settings.selfUpdate, { autoRestart: false });
+  assert.deepEqual(state.settings.models, {});
+  assert.deepEqual(opened[0].load().settings.models, {});
   assert.deepEqual(state.jobs.find(item => item.id === 'merged').selfUpdate,
     { at: 1, restart: true, restarted: true, restartedAt: server.startedAt });
   assert.equal(state.jobs.find(item => item.id === 'ui').selfUpdate.restarted, undefined);
@@ -507,9 +509,33 @@ test('the restart API reports boot and queue state and restores HTTP, SSE and SQ
   const enabled = await request('/api/settings', 'PUT', { ...state.settings, selfUpdate: { autoRestart: true } });
   assert.equal(enabled.status, 200);
   assert.deepEqual(enabled.body.selfUpdate, { autoRestart: true });
-  const { selfUpdate: _omitted, ...oldClientSettings } = enabled.body;
+  const { selfUpdate: _omitted, models: _models, ...oldClientSettings } = enabled.body;
   assert.deepEqual((await request('/api/settings', 'PUT', oldClientSettings)).body.selfUpdate, { autoRestart: true });
   assert.deepEqual(opened[0].load().settings.selfUpdate, { autoRestart: true });
+
+  const modelSettings = { claudecode: { plan: '  custom-claude  ' }, codex: { review: '' }, gemini: { default: 'test-gemini' } };
+  const savedModels = { ...modelSettings, claudecode: { plan: 'custom-claude' } };
+  const updateModels = models => request('/api/settings', 'PUT', { ...oldClientSettings, models });
+  const saved = await updateModels(modelSettings);
+  assert.equal(saved.status, 200);
+  assert.deepEqual(saved.body.models, savedModels);
+  assert.deepEqual((await request('/api/state')).body.settings.models, savedModels);
+  assert.deepEqual((await request('/api/settings', 'PUT', oldClientSettings)).body.models, savedModels);
+  assert.deepEqual(opened[0].load().settings.models, savedModels);
+
+  for (const models of [null, [], { claude: {} }, { codex: null }, { gemini: ['custom'] },
+    { codex: { backend: 'invalid-role' } }, { claudecode: { plan: 1 } }, { gemini: { check: 'x'.repeat(121) } }]) {
+    const invalid = await updateModels(models);
+    assert.equal(invalid.status, 400);
+    assert.match(invalid.body.error, /settings\.models/);
+    assert.deepEqual(opened[0].load().settings.models, savedModels);
+  }
+  const replacement = await updateModels({ codex: { check: 'custom-checker' } });
+  assert.deepEqual(replacement.body.models, { codex: { check: 'custom-checker' } });
+  const cleared = await updateModels({});
+  assert.equal(cleared.status, 200);
+  assert.deepEqual(cleared.body.models, {});
+  assert.deepEqual(opened[0].load().settings.models, {});
 
   // HEAD also contains another job's server change. Recording the docs merge should use the docs tip.
   const docs = await request('/api/jobs/docs/merge', 'POST', { target: 'main' });

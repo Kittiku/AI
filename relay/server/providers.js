@@ -34,7 +34,8 @@ const geminiBinary = process.env.RELAY_GEMINI_BIN || [
 
 const geminiMode = (process.env.RELAY_GEMINI_MODE || 'auto').toLowerCase();
 const geminiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
-const geminiApiModel = process.env.RELAY_GEMINI_MODEL || 'gemini-3.8-flash';
+const defaultGeminiApiModel = 'gemini-3.8-flash';
+const geminiApiModel = process.env.RELAY_GEMINI_MODEL || defaultGeminiApiModel;
 const geminiCliModel = process.env.RELAY_GEMINI_CLI_MODEL ||
   (process.env.RELAY_GEMINI_MODEL && !/flash-lite/i.test(process.env.RELAY_GEMINI_MODEL) ? process.env.RELAY_GEMINI_MODEL : '');
 const geminiDefaultDailyLimit = Number(process.env.RELAY_GEMINI_DAILY_LIMIT) || 1500;
@@ -154,23 +155,75 @@ async function withCodex(cwd, signal, task) {
   } finally { rpc.close(); }
 }
 
+const modelRejectionPatterns = [
+  /\b(?:model_not_found|unsupported_model|invalid_model|modelNotFoundError|unsupportedModelError)\b/i,
+  /\b(?:unknown model|invalid model|unsupported model|no such model|issue with the selected model)\b/i,
+  /(?:no|not have|denied) access to (?:the |this |that )?model\b/i,
+  /\bmodels?\b[^\r\n]*(?:not[ -](?:found|supported|available|accessible|allowed|recognized|exist|enabled)|no longer supported|unavailable)/i,
+  /\bmodel\b[^\r\n]*(?:doesn't exist|may not exist|cannot be used|you may not have access|access denied)/i
+];
+const rejectsModel = message => modelRejectionPatterns.some(pattern => pattern.test(message));
+
+const isModelUnavailable = error => error.code === 'RELAY_MODEL_UNAVAILABLE' || rejectsModel(error.message);
+
+function addModelArgument(args, model, configured) {
+  if (!model) return;
+  if (configured && (/^-/.test(model) || model.includes('\0'))) {
+    throw Object.assign(Error('Model ID cannot be passed to the CLI'), { code: 'RELAY_MODEL_UNAVAILABLE' });
+  }
+  args.push('--model', model);
+}
+
+// With no override, the legacy environment and default path run exactly as before.
+async function runWithModel(model, legacyModel, defaultModel, run, signal, beforeModelRetry) {
+  if (!model) return run(legacyModel);
+  const candidates = [...new Set([model, legacyModel, defaultModel])];
+  for (const [index, candidate] of candidates.entries()) {
+    signal.throwIfAborted();
+    try {
+      return await run(candidate, true);
+    } catch (error) {
+      signal.throwIfAborted();
+      if (!candidate || !isModelUnavailable(error)) throw error;
+      const canRetry = index < candidates.length - 1;
+      if (canRetry || index === 0) await beforeModelRetry?.(candidate, canRetry);
+      if (!canRetry) throw error;
+    }
+  }
+}
+
 let lastCodexModel;
-async function codexTurn(cwd, prompt, schema, signal, write = false) {
+async function codexTurn(cwd, prompt, schema, signal, write, model, beforeModelRetry) {
   return withCodex(cwd, signal, async rpc => {
+    if (model) {
+      signal.throwIfAborted();
+      try {
+        return await runCodexModel(rpc, cwd, model, prompt, schema, write);
+      } catch (error) {
+        signal.throwIfAborted();
+        if (!isModelUnavailable(error)) throw error;
+        await beforeModelRetry?.(model, true);
+      }
+    }
+    signal.throwIfAborted();
     const { data: models } = await rpc.request('model/list', { includeHidden: false, limit: 50 });
     const modelIds = models.map(model => model.model ?? model.id);
     const recommended = models.find(model => model.isDefault);
     const candidates = new Set([
       modelIds.includes(lastCodexModel) && lastCodexModel, recommended?.model ?? recommended?.id, ...modelIds
     ].filter(Boolean));
-    for (const model of candidates) {
+    candidates.delete(model);
+    for (const candidate of candidates) {
       signal.throwIfAborted();
       try {
-        const output = await runCodexModel(rpc, cwd, model, prompt, schema, write);
-        lastCodexModel = model;
-        return output;
+        const result = await runCodexModel(rpc, cwd, candidate, prompt, schema, write);
+        lastCodexModel = candidate;
+        return result;
       } catch (error) {
         if (!/model_not_found|model.+not supported when using Codex with a ChatGPT account/i.test(error.message)) throw error;
+        signal.throwIfAborted();
+        candidates.delete(candidate);
+        if (model && candidates.size) await beforeModelRetry?.();
       }
     }
     throw Error('Codex ไม่พบโมเดลที่บัญชีนี้อนุญาตให้ใช้ ตรวจว่า Codex CLI เป็นเวอร์ชันล่าสุดแล้วลองอีกครั้ง');
@@ -179,7 +232,7 @@ async function codexTurn(cwd, prompt, schema, signal, write = false) {
 
 // write: Codex may change files inside cwd (its workspace-write sandbox); otherwise it can only read.
 async function runCodexModel(rpc, cwd, model, prompt, schema, write = false) {
-  const { thread } = await rpc.request('thread/start', {
+  const { thread, model: threadModel } = await rpc.request('thread/start', {
     cwd, model, sandbox: write ? 'workspace-write' : 'read-only', approvalPolicy: 'never', ephemeral: true
   });
   let output = '';
@@ -195,7 +248,7 @@ async function runCodexModel(rpc, cwd, model, prompt, schema, write = false) {
   });
   completion.catch(() => {});
   await rpc.request('turn/start', { threadId: thread.id, input: [{ type: 'text', text: prompt }], outputSchema: schema });
-  return completion;
+  return { output: await completion, model: threadModel || model };
 }
 
 function runClaudeCode(args, { cwd, input = '', signal }) {
@@ -213,18 +266,20 @@ function runClaudeCode(args, { cwd, input = '', signal }) {
 }
 
 // write: Claude Code may also use Edit and Write on files in cwd; it still has no shell.
-async function claudeCodeTurn(cwd, prompt, schema, signal, write = false) {
+async function claudeCodeTurn(cwd, prompt, schema, signal, write, model, configured) {
   const tools = write ? claudeCodeTools + ',Edit,Write' : claudeCodeTools;
   const args = ['-p', write ? 'Complete the Relay request provided on stdin. Edit files only inside the current directory.' :
     'Complete the Relay request provided on stdin. Use the files in the current directory only as read-only reference.',
     '--output-format', 'json', '--json-schema', JSON.stringify(schema),
     '--tools', tools, '--allowedTools', tools, ...(write ? ['--permission-mode', 'acceptEdits'] : []),
     '--max-turns', String(Number(process.env.RELAY_CLAUDE_CODE_MAX_TURNS) || 40), '--no-session-persistence'];
-  if (process.env.RELAY_CLAUDE_CODE_MODEL) args.push('--model', process.env.RELAY_CLAUDE_CODE_MODEL);
+  addModelArgument(args, model, configured);
   const { code, stdout, stderr } = await runClaudeCode(args, { cwd, input: prompt, signal });
   let data;
   try { data = JSON.parse(stdout.trim().split('\n').at(-1)); } catch {
-    throw Error(`Claude Code ไม่ได้ส่งผล JSON (exit ${code}) ${(stderr || stdout).trim().slice(0, 600)}`);
+    const error = Error(`Claude Code ไม่ได้ส่งผล JSON (exit ${code}) ${(stderr || stdout).trim().slice(0, 600)}`);
+    if (configured && model && rejectsModel(stderr || stdout)) error.code = 'RELAY_MODEL_UNAVAILABLE';
+    throw error;
   }
   if (data.structured_output && !data.is_error) {
     const tokens = data.usage || {};
@@ -233,12 +288,13 @@ async function claudeCodeTurn(cwd, prompt, schema, signal, write = false) {
       outputTokens: tokens.output_tokens || 0,
       costUsd: Number.isFinite(data.total_cost_usd) ? data.total_cost_usd : null,
       billing: claudeCodeBilling,
-      model: mainModel(data.modelUsage) || process.env.RELAY_CLAUDE_CODE_MODEL || null
+      model: mainModel(data.modelUsage) || model || null
     };
     return data.structured_output;
   }
   const message = String(data.result || data.subtype || stderr || 'ไม่มีผลลัพธ์ตาม schema').trim();
   const error = Error('Claude Code: ' + message.slice(0, 700));
+  if (configured && model && (rejectsModel(message) || rejectsModel(stderr))) error.code = 'RELAY_MODEL_UNAVAILABLE';
   if (/usage limit|rate limit|limit reached|overloaded|429/i.test(message)) error.cooldown = 15 * 60_000;
   throw error;
 }
@@ -416,7 +472,7 @@ export function geminiCliEncoder(prompt, schema, stream) {
     : withContext(prompt, packed);
 }
 
-async function geminiCliTurn(cwd, prompt, context, schema, signal, onUsage) {
+async function geminiCliTurn(cwd, prompt, context, schema, signal, onUsage, model, configured) {
   const backend = geminiCli.backend || 'agy';
   const binary = backend === 'agy' ? agyBinary : geminiBinary;
   const label = backend === 'agy' ? 'Antigravity CLI (agy)' : 'Gemini CLI';
@@ -425,7 +481,7 @@ async function geminiCliTurn(cwd, prompt, context, schema, signal, onUsage) {
     ? ['--input-format', 'stream-json', '--output-format', 'stream-json', '--json-schema', JSON.stringify(schema), '--disable-slash-commands']
     : ['-p', geminiCliInstruction(schema), '--output-format', 'json'];
   const input = fitGeminiCliInput(context, geminiCliEncoder(prompt, schema, useStream));
-  if (geminiCliModel) args.push('--model', geminiCliModel);
+  addModelArgument(args, model, configured);
   const { code, stdout, stderr } = await runCliBinary(binary, args, {
     cwd,
     env: backend === 'agy' ? agyCliEnv : process.env,
@@ -434,18 +490,25 @@ async function geminiCliTurn(cwd, prompt, context, schema, signal, onUsage) {
     stopOnResult: useStream,
     notFoundMessage: `ไม่พบคำสั่ง ${backend} ติดตั้ง Antigravity CLI (irm https://antigravity.google/cli/install.ps1 | iex) หรือตั้งค่า GEMINI_API_KEY`
   });
-  if (code === 0) onUsage?.();
+  if (code === 0 && !configured) onUsage?.();
   try {
     if (code !== 0) throw Error(stderr.trim() || `exit ${code}`);
     const meta = {};
     const result = useStream ? parseAgyOutput(stdout, meta) : parseCliJsonOutput(stdout, meta);
+    if (configured) onUsage?.();
     if (result && typeof result === 'object') {
       result[USAGE] = { inputTokens: meta.inputTokens ?? null, outputTokens: meta.outputTokens ?? null, costUsd: null, billing: 'subscription',
-        model: meta.model || geminiCliModel || (backend === 'agy' ? 'agy (ค่าเริ่มต้น)' : 'gemini-cli (ค่าเริ่มต้น)') };
+        model: meta.model || model || (backend === 'agy' ? 'agy (ค่าเริ่มต้น)' : 'gemini-cli (ค่าเริ่มต้น)') };
     }
     return result;
   } catch (parseError) {
     const detail = String(stderr || stdout || parseError.message || `exit ${code}`).trim();
+    const error = Error(`${label} (exit ${code}): ${detail.slice(0, 700)}`);
+    if (configured && model && [detail, parseError.message, stdout].some(text => rejectsModel(text))) {
+      error.code = 'RELAY_MODEL_UNAVAILABLE';
+      throw error;
+    }
+    if (code === 0 && configured) onUsage?.();
     if (/auth|login|credential|unauthenticated|sign in|no longer supported/i.test(detail)) {
       geminiCli = {
         ready: false,
@@ -454,7 +517,6 @@ async function geminiCliTurn(cwd, prompt, context, schema, signal, onUsage) {
         note: 'ต้องลงชื่อเข้าใช้ด้วยคำสั่ง agy ใน PowerShell (หรือตั้งค่า GEMINI_API_KEY ใน .env)'
       };
     }
-    const error = Error(`${label} (exit ${code}): ${detail.slice(0, 700)}`);
     if (/usage limit|rate limit|quota|resource_exhausted|overloaded|429/i.test(detail)) error.cooldown = 15 * 60_000;
     throw error;
   }
@@ -619,54 +681,64 @@ export function quota(settings, usage, now = Date.now()) {
   };
 }
 
-// `geminiCliContext` (optional) replaces `context` only on the Gemini / Antigravity CLI path, for example a snapshot
-// built for its size limit. Claude Code, Codex and the Gemini API always get prompt + '\nCONTEXT\n' + context.
-export async function generate(provider, cwd, prompt, schema, jobSignal, onUsage, { write = false, context, geminiCliContext } = {}) {
+async function geminiApiTurn(prompt, schema, signal, onUsage, model) {
+  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+    method: 'POST', signal,
+    headers: { 'content-type': 'application/json', 'x-goog-api-key': geminiKey },
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { responseMimeType: 'application/json', responseJsonSchema: schema, maxOutputTokens: 20000 }
+    })
+  });
+  if (response.ok) onUsage?.();
+  const data = await response.json();
+  if (!response.ok) {
+    const error = Error(`Gemini HTTP ${response.status}: ${data.error?.message || 'request failed'}`);
+    if (response.status === 404) error.code = 'RELAY_MODEL_UNAVAILABLE';
+    error.cooldown = response.status === 429 ? (Number(response.headers.get('retry-after')) || 60) * 1000 : 0;
+    throw error;
+  }
+  return {
+    output: data.candidates?.[0]?.content?.parts?.filter(x => !x.thought).map(x => x.text || '').join(''),
+    usage: { inputTokens: data.usageMetadata?.promptTokenCount || 0,
+      outputTokens: (data.usageMetadata?.candidatesTokenCount || 0) + (data.usageMetadata?.thoughtsTokenCount || 0), costUsd: null, billing: 'api',
+      model: data.modelVersion || model }
+  };
+}
+
+// geminiCliContext replaces context on the Gemini / Antigravity CLI path, for example a snapshot built for its size limit.
+export async function generate(provider, cwd, prompt, schema, jobSignal, onUsage, {
+  write = false, context, geminiCliContext, model, beforeModelRetry
+} = {}) {
   if (provider === 'gemini' && !geminiCli.updatedAt) await refreshGemini(cwd);
   const useCli = provider === 'gemini' && shouldUseCli();
   // Agents that read the repo themselves (Claude Code, Codex, Gemini CLI) get 15 minutes; one-shot API calls get 4.
   const timeoutMs = (provider === 'claudecode' || provider === 'codex' || useCli) ? 900_000 : 240_000;
   const signal = AbortSignal.any([jobSignal, AbortSignal.timeout(timeoutMs)]);
-  let output;
-  let usage = null;
-  if (provider === 'claudecode') {
-    const result = await claudeCodeTurn(cwd, withContext(prompt, context), schema, signal, write);
-    if (!validate(result, schema)) throw Error(names[provider] + ' ส่งข้อมูลไม่ตรงกับรูปแบบที่กำหนด');
-    return result;
-  }
-  if (provider === 'gemini' && useCli) {
-    const result = await geminiCliTurn(cwd, prompt, geminiCliContext ?? context, schema, signal, onUsage);
-    if (!validate(result, schema)) throw Error(names[provider] + ' ส่งข้อมูลไม่ตรงกับรูปแบบที่กำหนด');
-    return result;
-  }
-  if (provider === 'codex') {
-    output = await codexTurn(cwd, withContext(prompt, context), schema === planSchema ? codexPlanSchema : schema, signal, write);
-  } else {
-    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(geminiApiModel)}:generateContent`, {
-      method: 'POST', signal,
-      headers: { 'content-type': 'application/json', 'x-goog-api-key': geminiKey },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: withContext(prompt, context) }] }],
-        generationConfig: { responseMimeType: 'application/json', responseJsonSchema: schema, maxOutputTokens: 20000 }
-      })
-    });
-    if (response.ok) onUsage();
-    const data = await response.json();
-    if (!response.ok) {
-      const error = Error(`${names[provider]} HTTP ${response.status}: ${data.error?.message || 'request failed'}`);
-      error.cooldown = response.status === 429 ? (Number(response.headers.get('retry-after')) || 60) * 1000 : 0;
-      throw error;
-    }
-    output = data.candidates?.[0]?.content?.parts?.filter(x => !x.thought).map(x => x.text || '').join('');
-    usage = { inputTokens: data.usageMetadata?.promptTokenCount || 0,
-      outputTokens: (data.usageMetadata?.candidatesTokenCount || 0) + (data.usageMetadata?.thoughtsTokenCount || 0), costUsd: null, billing: 'api',
-      model: data.modelVersion || geminiApiModel };
-  }
+  const fullPrompt = withContext(prompt, context);
+  const tryModel = (legacyModel, defaultModel, run) => runWithModel(model, legacyModel, defaultModel, run, signal, beforeModelRetry);
+
   let result;
-  try { result = JSON.parse(output); } catch { throw Error(names[provider] + ' ส่ง JSON ไม่สมบูรณ์'); }
+  if (provider === 'claudecode') {
+    result = await tryModel(process.env.RELAY_CLAUDE_CODE_MODEL || '', '', (selected, configured) =>
+      claudeCodeTurn(cwd, fullPrompt, schema, signal, write, selected, configured));
+  } else if (useCli) {
+    result = await tryModel(geminiCliModel, '', (selected, configured) =>
+      geminiCliTurn(cwd, prompt, geminiCliContext ?? context, schema, signal, onUsage, selected, configured));
+  } else {
+    let output, usage;
+    if (provider === 'codex') {
+      const turn = await codexTurn(cwd, fullPrompt, schema === planSchema ? codexPlanSchema : schema, signal, write,
+        model || process.env.RELAY_CODEX_MODEL, beforeModelRetry);
+      output = turn.output;
+      usage = { inputTokens: null, outputTokens: null, costUsd: null, billing: 'subscription', model: turn.model };
+    } else {
+      ({ output, usage } = await tryModel(geminiApiModel, defaultGeminiApiModel, selected =>
+        geminiApiTurn(fullPrompt, schema, signal, onUsage, selected)));
+    }
+    try { result = JSON.parse(output); } catch { throw Error(names[provider] + ' ส่ง JSON ไม่สมบูรณ์'); }
+    if (result && typeof result === 'object') result[USAGE] = usage;
+  }
   if (!validate(result, schema)) throw Error(names[provider] + ' ส่งข้อมูลไม่ตรงกับรูปแบบที่กำหนด');
-  // Codex does not report tokens to Relay; the model is the one codexTurn picked for this call.
-  result[USAGE] = usage || { inputTokens: null, outputTokens: null, costUsd: null, billing: provider === 'codex' || useCli ? 'subscription' : 'api',
-    model: provider === 'codex' ? lastCodexModel || null : null };
   return result;
 }
