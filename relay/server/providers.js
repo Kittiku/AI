@@ -155,6 +155,44 @@ async function withCodex(cwd, signal, task) {
   } finally { rpc.close(); }
 }
 
+const codexModelId = model => model?.model ?? model?.id;
+const requestCodexModels = (rpc, cursor) => rpc.request('model/list', {
+  includeHidden: false, limit: 50, ...(cursor ? { cursor } : {})
+});
+
+let modelListInFlight;
+function listCodexModels(cwd) {
+  modelListInFlight ??= withCodex(cwd, AbortSignal.timeout(12_000), async rpc => {
+    const { account } = await rpc.request('account/read', { refreshToken: false });
+    if (!account) return [];
+
+    const models = new Set();
+    const seenCursors = new Set();
+    let cursor;
+    do {
+      const { data, nextCursor } = await requestCodexModels(rpc, cursor);
+      if (!Array.isArray(data)) throw Error('Codex returned an invalid model list');
+      for (const entry of data) {
+        const id = codexModelId(entry);
+        if (!entry?.hidden && typeof id === 'string' && id.trim()) models.add(id);
+      }
+      cursor = nextCursor;
+      if (cursor && seenCursors.has(cursor)) throw Error('Codex returned a repeated model list cursor');
+      seenCursors.add(cursor);
+    } while (cursor);
+    return [...models];
+  }).catch(() => []).finally(() => { modelListInFlight = null; });
+  return modelListInFlight;
+}
+
+export async function listModels(cwd) {
+  return {
+    claudecode: ['opus', 'sonnet', 'haiku'],
+    codex: await listCodexModels(cwd),
+    gemini: [defaultGeminiApiModel, 'gemini-3.1-pro-preview', 'gemini-3.5-flash-lite']
+  };
+}
+
 const modelRejectionPatterns = [
   /\b(?:model_not_found|unsupported_model|invalid_model|modelNotFoundError|unsupportedModelError)\b/i,
   /\b(?:unknown model|invalid model|unsupported model|no such model|issue with the selected model)\b/i,
@@ -206,11 +244,11 @@ async function codexTurn(cwd, prompt, schema, signal, write, model, beforeModelR
       }
     }
     signal.throwIfAborted();
-    const { data: models } = await rpc.request('model/list', { includeHidden: false, limit: 50 });
-    const modelIds = models.map(model => model.model ?? model.id);
+    const { data: models } = await requestCodexModels(rpc);
+    const modelIds = models.map(codexModelId);
     const recommended = models.find(model => model.isDefault);
     const candidates = new Set([
-      modelIds.includes(lastCodexModel) && lastCodexModel, recommended?.model ?? recommended?.id, ...modelIds
+      modelIds.includes(lastCodexModel) && lastCodexModel, codexModelId(recommended), ...modelIds
     ].filter(Boolean));
     candidates.delete(model);
     for (const candidate of candidates) {

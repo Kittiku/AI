@@ -364,6 +364,12 @@ test('the restart API reports boot and queue state and restores HTTP, SSE and SQ
     export const USAGE = Symbol('usage');
     export const editSchema = {}, planSchema = {}, reviewSchema = {}, subtaskCheckSchema = {};
     export const refreshClaudeCode = async () => {}, refreshCodex = async () => {};
+    export const modelFixture = { codex: [] };
+    export const listModels = async () => ({
+      claudecode: ['opus', 'sonnet', 'haiku'],
+      codex: modelFixture.codex,
+      gemini: ['gemini-suggestion']
+    });
     export const pacificDay = () => 'test-day', quota = () => ({});
     export const generate = () => { throw Error('Unexpected AI call'); };
   `);
@@ -499,6 +505,18 @@ test('the restart API reports boot and queue state and restores HTTP, SSE and SQ
   assert.deepEqual(state.settings.selfUpdate, { autoRestart: false });
   assert.deepEqual(state.settings.models, {});
   assert.deepEqual(opened[0].load().settings.models, {});
+
+  const { modelFixture } = await import(providersUrl);
+  const suggestions = { claudecode: ['opus', 'sonnet', 'haiku'], gemini: ['gemini-suggestion'] };
+  modelFixture.codex = ['account-model'];
+  assert.deepEqual(await request('/api/models'), {
+    status: 200, cache: 'no-store', body: { ...suggestions, codex: ['account-model'] }
+  });
+  modelFixture.codex = [];
+  assert.deepEqual(await request('/api/models'), {
+    status: 200, cache: 'no-store', body: { ...suggestions, codex: [] }
+  });
+
   assert.deepEqual(state.jobs.find(item => item.id === 'merged').selfUpdate,
     { at: 1, restart: true, restarted: true, restartedAt: server.startedAt });
   assert.equal(state.jobs.find(item => item.id === 'ui').selfUpdate.restarted, undefined);

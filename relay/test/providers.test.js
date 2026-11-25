@@ -163,7 +163,11 @@ test('Claude Code gets prompt + CONTEXT + context, byte for byte', async () => {
   assert.ok(fake.calls[0].input.equals(Buffer.from(expected, 'utf8')));
 });
 
-function fakeCodex(module, { models = [{ model: 'test-model', isDefault: true }], rejected = new Set() } = {}) {
+function fakeCodex(module, {
+  models = [{ model: 'test-model', isDefault: true }], rejected = new Set(),
+  account = { type: 'chatgpt' }, list = () => ({ data: models })
+} = {}) {
+  const requests = [];
   const sent = [];
   const attempted = [];
   const args = [];
@@ -174,9 +178,15 @@ function fakeCodex(module, { models = [{ model: 'test-model', isDefault: true }]
     const threads = new Map();
     createInterface({ input: child.stdin }).on('line', line => {
       const message = JSON.parse(line);
-      if (message.method === 'initialize') send({ id: message.id, result: {} });
-      else if (message.method === 'model/list') send({ id: message.id, result: { data: models } });
-      else if (message.method === 'thread/start') {
+      const { method, id, params } = message;
+      requests.push({ method, params });
+      if (method === 'initialize') send({ id, result: {} });
+      else if (method === 'account/read') send({ id, result: { account } });
+      else if (method === 'model/list') {
+        const result = list(params);
+        if (result instanceof Error) send({ id, error: { message: result.message } });
+        else send({ id, result });
+      } else if (message.method === 'thread/start') {
         const { model } = message.params;
         attempted.push(model);
         const id = 'thread-' + attempted.length;
@@ -197,8 +207,55 @@ function fakeCodex(module, { models = [{ model: 'test-model', isDefault: true }]
     });
     return child;
   };
-  return { sent, attempted, args };
+  return { sent, attempted, args, requests };
 }
+
+test('model suggestions list selectable Codex IDs across pages without starting a turn', async () => {
+  const { requests, args } = fakeCodex(api, {
+    list: ({ cursor }) => cursor === 'more'
+      ? { data: [{ model: 'account-first' }, { model: 'account-third' }], nextCursor: null }
+      : { data: [{ id: 'entry-id', model: 'account-first' }, { id: 'account-second' },
+        { model: 'hidden', hidden: true }, { model: '' }, { model: 42 }, null], nextCursor: 'more' }
+  });
+  const [models, concurrent] = await Promise.all([api.listModels(tmpdir()), api.listModels(tmpdir())]);
+  assert.deepEqual(models, {
+    claudecode: ['opus', 'sonnet', 'haiku'],
+    codex: ['account-first', 'account-second', 'account-third'],
+    gemini: ['gemini-3.8-flash', 'gemini-3.1-pro-preview', 'gemini-3.5-flash-lite']
+  });
+  assert.deepEqual(concurrent, models);
+  assert.deepEqual(args, [['app-server']]);
+  assert.deepEqual(requests.map(({ method }) => method), ['initialize', 'initialized', 'account/read', 'model/list', 'model/list']);
+  assert.deepEqual(requests.slice(2).map(({ params }) => params), [
+    { refreshToken: false },
+    { includeHidden: false, limit: 50 },
+    { includeHidden: false, limit: 50, cursor: 'more' }
+  ]);
+});
+
+test('model suggestions survive missing Codex, a signed-out account and a failed model list', async () => {
+  const unavailable = {
+    claudecode: ['opus', 'sonnet', 'haiku'],
+    codex: [],
+    gemini: ['gemini-3.8-flash', 'gemini-3.1-pro-preview', 'gemini-3.5-flash-lite']
+  };
+  api.processes.spawn = () => {
+    const child = fakeProcess();
+    queueMicrotask(() => child.emit('error', Object.assign(Error('Missing Codex binary'), { code: 'ENOENT' })));
+    return child;
+  };
+  assert.deepEqual(await api.listModels(tmpdir()), unavailable);
+
+  const signedOut = fakeCodex(api, { account: null });
+  assert.deepEqual(await api.listModels(tmpdir()), unavailable);
+  assert.ok(!signedOut.requests.some(({ method }) => method === 'model/list'));
+
+  fakeCodex(api, { list: () => Error('Catalog unavailable') });
+  assert.deepEqual(await api.listModels(tmpdir()), unavailable);
+
+  fakeCodex(api, { models: [{ id: 'available-again' }] });
+  assert.deepEqual(await api.listModels(tmpdir()), { ...unavailable, codex: ['available-again'] });
+});
 
 test('Codex gets prompt + CONTEXT + context, byte for byte', async () => {
   const { sent } = fakeCodex(api);

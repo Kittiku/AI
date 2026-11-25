@@ -9,7 +9,7 @@ import { realpath } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { applyEdits, applyFiles, attemptChanges, attemptState, checkpoint, editContexts, git, isSafePath, mergeWorktree, removeWorktreeFolder, repository, restoreAttempt, snapshot, worktreePaths } from './git.js';
-import { editSchema, generate, names, pacificDay, planSchema, quota, refreshClaudeCode, refreshCodex, reviewSchema, subtaskCheckSchema, USAGE } from './providers.js';
+import { editSchema, generate, listModels, names, pacificDay, planSchema, quota, refreshClaudeCode, refreshCodex, reviewSchema, subtaskCheckSchema, USAGE } from './providers.js';
 import { openStore } from './store.js';
 import { buildStats } from './stats.js';
 import { createRestartController, defaultSelfUpdateSettings, normalizeSelfUpdateSettings, restartMessages, shouldAutoRestart } from './restart.js';
@@ -1512,6 +1512,7 @@ app.post(restartPath + '/cancel', (_req, res) => {
 app.get('/api/state', (_req, res) => res.json({
   ...state, jobs: state.jobs.map(publicJob), usage: undefined, quotas: publicQuotas(), ...restartPayload()
 }));
+app.get('/api/models', async (_req, res) => res.set('Cache-Control', 'no-store').json(await listModels(root)));
 app.post('/api/quota/refresh', async (_req, res) => { await Promise.all([refreshCodex(root), refreshClaudeCode(root)]); res.json(publicQuotas()); });
 app.put('/api/settings', (req, res) => { state.settings = readSettings(req.body); save(); res.json(state.settings); });
 app.post('/api/jobs', async (req, res) => {

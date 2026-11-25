@@ -16,6 +16,7 @@ export const USAGE = Symbol('usage');
 export const editSchema = 'edit', planSchema = 'plan', reviewSchema = 'review', subtaskCheckSchema = 'check';
 export const pacificDay = () => 'test-day';
 export const refreshClaudeCode = async () => {}, refreshCodex = async () => {};
+export const listModels = () => { throw Error('Unexpected model listing'); };
 export const quota = () => Object.fromEntries(Object.keys(names).map(id => [id, { ready: true, windows: [] }]));
 export const mock = {};
 export async function generate(provider, _cwd, prompt, kind, _signal, onUsage, { context }) {

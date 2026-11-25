@@ -11,6 +11,7 @@ const providersUrl = moduleUrl(`
   export const USAGE = Symbol('usage');
   export const editSchema = {}, planSchema = {}, reviewSchema = {}, subtaskCheckSchema = {};
   export const refreshClaudeCode = async () => {}, refreshCodex = async () => {};
+  export const listModels = () => { throw Error('Unexpected model listing'); };
   export const pacificDay = () => 'test-day';
   export const fake = {};
   export const generate = (...args) => fake.generate(...args);
