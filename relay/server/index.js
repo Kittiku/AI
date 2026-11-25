@@ -128,6 +128,7 @@ const workers = new Map();
 const queueWaits = new Map();
 const jobWrites = new Map();
 const activeJobIds = () => [...workers.values()].filter(worker => !worker.resume).map(worker => worker.job.id);
+const slotsUsed = () => [...workers.values()].filter(worker => !worker.resume && !worker.planningAhead).length;
 let monitor;
 let httpServer;
 let acceptingRequests = false;
@@ -1493,12 +1494,14 @@ async function reserveFiles(job, signal, priorFiles) {
   worker.unknownFiles = worker.files.size === 0;
   for (const file of priorFiles) worker.files.add(fileKey(file));
   const conflict = fileConflict(job, worker.files, worker.unknownFiles);
-  if (!conflict) {
+  const atCapacity = worker.planningAhead && slotsUsed() >= state.settings.concurrency.maxJobs;
+  if (!conflict && !atCapacity) {
+    worker.planningAhead = false;
     worker.reserved = true;
     return;
   }
 
-  // Keep the prepared worktree and approved plan. A parked job releases its execution slot.
+  // Keep the prepared worktree and approved plan until the files and an execution slot are available.
   const since = Date.now();
   await new Promise((resolve, reject) => {
     const abort = () => reject(signal.reason);
@@ -1510,7 +1513,7 @@ async function reserveFiles(job, signal, priorFiles) {
     signal.addEventListener('abort', abort, { once: true });
     job.resuming = true;
     job.status = 'queued';
-    queueWaits.set(job.id, conflict);
+    queueWaits.set(job.id, conflict ?? { waitReason: 'max_concurrency' });
     save();
     setImmediate(drain);
   });
@@ -1525,8 +1528,8 @@ function stopJob(job, reason) {
   save();
 }
 
-async function runJob(job) {
-  const worker = { job, controller: new AbortController() };
+async function runJob(job, planningAhead) {
+  const worker = { job, planningAhead, controller: new AbortController() };
   workers.set(job.id, worker);
   job.status = 'running';
   job.startedAt = Date.now();
@@ -1550,8 +1553,7 @@ async function runJob(job) {
 async function drain() {
   if (isRestarting()) return;
   const { maxJobs, planAhead } = state.settings.concurrency;
-  let running = activeJobIds().length;
-  const checking = [...workers.values()].some(worker => worker.checking && worker.job.status !== 'stopping');
+  let running = slotsUsed();
   const started = [];
   for (const job of state.jobs) {
     if (job.status !== 'queued') continue;
@@ -1562,20 +1564,29 @@ async function drain() {
       queueWaits.set(job.id, conflict);
       continue;
     }
-    if (running >= maxJobs || (!job.plan && running && !(planAhead && checking))) {
-      queueWaits.set(job.id, { waitReason: 'max_concurrency' });
-      continue;
+    // In parallel mode one extra job can plan during checks or review while all execution slots are occupied.
+    let planningAhead = false;
+    if (running >= maxJobs) {
+      const currentWorkers = [...workers.values()];
+      planningAhead = running === maxJobs && maxJobs > 1 && planAhead && !worker && !job.plan &&
+        !currentWorkers.some(worker => worker.planningAhead) &&
+        currentWorkers.some(worker => worker.checking && worker.job.status !== 'stopping');
+      if (!planningAhead) {
+        queueWaits.set(job.id, { waitReason: 'max_concurrency' });
+        continue;
+      }
     }
     queueWaits.delete(job.id);
-    running++;
+    if (!planningAhead) running++;
     if (worker) {
       const resume = worker.resume;
       worker.resume = null;
+      worker.planningAhead = false;
       worker.reserved = true;
       job.status = 'running';
       resume();
       save();
-    } else started.push(runJob(job));
+    } else started.push(runJob(job, planningAhead));
   }
   monitor.publish();
   await Promise.all(started);

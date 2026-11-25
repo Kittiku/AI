@@ -142,14 +142,18 @@ const approve = { summary: 'Integrated review passed', findings: [] };
 const stepLog = job => server.store.steps(job.id).map(({ role, round, status }) => [role, round, status]);
 const snapshotFile = (context, name) => context.repo.files.find(file => file.path === name)?.content;
 
-async function runJob({ plan, card, contents, respond, parallel = 2, check = 'always', mode = 'auto', routing = 'fixed', status = 'complete' }) {
+async function makeRepo(contents) {
   const repo = await mkdtemp(path.join(root, 'repo-'));
   await git(repo, 'init', '--quiet', '--initial-branch=main');
   await git(repo, 'config', 'core.autocrlf', 'false');
   for (const [name, content] of Object.entries(contents)) await writeFile(path.join(repo, name), content);
   await git(repo, 'add', '--force', '--', ...Object.keys(contents));
   const base = await checkpoint(repo, 'Initial files');
+  return { repo, base };
+}
 
+async function runJob({ plan, card, contents, respond, parallel = 2, check = 'always', mode = 'auto', routing = 'fixed', status = 'complete' }) {
+  const { repo, base } = await makeRepo(contents);
   const settings = structuredClone(server.defaults);
   Object.assign(settings, { agentEdits: false, maxRounds: 1 });
   Object.assign(settings.auto, { allProviders: false, retries: 0, waitMinutes: 0 });
@@ -202,13 +206,65 @@ async function assertCleanWorktrees(job) {
   assert.equal(await git(job.repo, 'rev-parse', 'HEAD'), job.base);
 }
 
-function waitFor(promise) {
+function waitFor(promise, message = 'The second subtask did not reach its check while the first was running') {
   let timer;
   const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(Error('The second subtask did not reach its check while the first was running')), 20_000);
+    timer = setTimeout(() => reject(Error(message)), 20_000);
   });
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
+
+test('two new jobs with disjoint files reach implementation concurrently with planAhead off', async () => {
+  const files = ['one.txt', 'two.txt'];
+  const { repo } = await makeRepo(Object.fromEntries(files.map(file => [file, 'base\n'])));
+  const settings = structuredClone(server.defaults);
+  settings.concurrency = { maxJobs: 2, planAhead: false, perProvider: {} };
+  settings.routing.mode = 'fixed';
+  settings.agentEdits = false;
+  Object.assign(settings.auto, { allProviders: false, retries: 0, waitMinutes: 0 });
+  server.state.settings = settings;
+  fake.ready = ['claudecode', 'codex', 'gemini'];
+
+  const editing = new Map(files.map(file => [file, Promise.withResolvers()]));
+  const releaseEdits = Promise.withResolvers();
+  fake.respond = async ({ kind, prompt, context }) => {
+    if (kind === 'review') return approve;
+    if (kind === 'plan') {
+      const file = files.find(name => prompt.endsWith(name));
+      assert.ok(file);
+      return planFor([subtask(file)], 'simple');
+    }
+    assert.equal(kind, 'edit');
+    const [file] = context.plan.backendFiles;
+    editing.get(file).resolve();
+    await releaseEdits.promise;
+    return change(file, 'updated ' + file + '\n');
+  };
+
+  const jobs = [];
+  const runs = [];
+  try {
+    for (const file of files) {
+      const job = await server.createJob({ title: file, prompt: 'Update ' + file, repo, type: 'bugfix' });
+      assert.equal(job.plan, undefined);
+      jobs.push(job);
+      runs.push(server.drain());
+      await waitFor(editing.get(file).promise, file + ' did not reach implementation with a slot available');
+    }
+    const { body } = await requestRoute('GET', '/api/state');
+    assert.deepEqual(body.activeJobs.map(({ id, status, stages }) => [id, status, stages.backend.status]),
+      jobs.map(({ id }) => [id, 'running', 'running']));
+  } finally {
+    releaseEdits.resolve();
+    await Promise.all(runs);
+    await server.drain();
+  }
+
+  for (const [index, job] of jobs.entries()) {
+    assert.equal(job.status, 'complete', job.error);
+    assert.deepEqual(job.changedFiles, [files[index]]);
+  }
+});
 
 test('independent subtasks use detached worktrees and merge in plan order before releasing a dependent', async () => {
   const plan = planFor([subtask('one.txt'), subtask('two.txt'), subtask('three.txt', [1, 2])]);
