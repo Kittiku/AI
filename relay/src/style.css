@@ -801,7 +801,7 @@ details.fact summary::marker { color: var(--muted); }
 .model-table input::placeholder { color: var(--muted); opacity: 1; }
 .model-role-label { display: none; }
 
-@container model-settings (max-width: 39rem) {
+@container model-settings (max-width: 52rem) {
   .model-table, .model-table tbody { display: grid; gap: 10px; }
   .model-table thead { display: none; }
   .model-table tr {
