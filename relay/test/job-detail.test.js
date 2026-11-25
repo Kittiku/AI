@@ -23,7 +23,9 @@ export const mock = {};
 export async function generate(provider, _cwd, prompt, kind, signal, onUsage, { context }) {
   const result = await mock.respond({ provider, prompt, kind, signal, context: JSON.parse(context) });
   onUsage();
-  return structuredClone(result);
+  const response = structuredClone(result);
+  if (result[USAGE]) response[USAGE] = structuredClone(result[USAGE]);
+  return response;
 }
 `);
 const expressUrl = inline(String.raw`
@@ -70,7 +72,22 @@ export function execFile(_file, args, _options, callback) {
 }
 `);
 const fsUrl = inline("export * from 'node:fs'; export const mkdirSync = () => {}, existsSync = () => false, readdirSync = () => [];");
-const sqliteUrl = inline("import { DatabaseSync as SQLite } from 'node:sqlite'; let db; export function DatabaseSync() { return db ??= new SQLite(':memory:'); }");
+const sqliteUrl = inline(`
+import { DatabaseSync as SQLite } from 'node:sqlite';
+let db;
+export function DatabaseSync() {
+  if (db) return db;
+  db = new SQLite(':memory:');
+  db.exec(\`
+    CREATE TABLE steps (id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, role TEXT NOT NULL,
+      provider TEXT NOT NULL, status TEXT NOT NULL, started_at INTEGER NOT NULL, ended_at INTEGER,
+      input_tokens INTEGER, output_tokens INTEGER, cost_usd REAL, billing TEXT, error TEXT, model TEXT, action TEXT);
+    INSERT INTO steps (job_id, role, provider, status, started_at, ended_at, model)
+      VALUES ('legacy-timeline', 'backend', 'codex', 'done', 1, 2, 'legacy-model');
+  \`);
+  return db;
+}
+`);
 
 let server;
 let routes;
@@ -132,6 +149,7 @@ const change = { status: 'done', summary: 'Updated text', files: [{ path: 'curre
 const pass = { summary: 'Passed', findings: [] };
 const backendFinding = { owner: 'backend', detail: 'Update current.txt' };
 const frontendFinding = { owner: 'frontend', detail: 'Update copy in the interface' };
+const monitorPath = '/api/jobs/:id/monitor';
 const withoutTime = history => history.map(({ at, ...round }) => {
   assert.ok(Number.isInteger(at) && at > 0);
   return round;
@@ -169,7 +187,8 @@ test('records all integrated reviews and attributes automated fixes to the round
   fixture.numstat = ['3\t1\t', 'old.txt', 'current.txt', '-\t-\ticon.bin', ''].join('\0');
   mock.respond = ({ kind }) => kind === 'plan' ? plan : kind === 'review' ? reviews.shift() : change;
 
-  const summary = await assertSavedDetails(await startJob());
+  const id = await startJob();
+  const summary = await assertSavedDetails(id);
   assert.equal(summary.status, 'complete', summary.error);
   assert.deepEqual(reviews, []);
   assert.deepEqual(withoutTime(summary.reviewHistory), [
@@ -184,6 +203,88 @@ test('records all integrated reviews and attributes automated fixes to the round
   assert.deepEqual(summary.review, { ...pass, ok: true });
   assert.deepEqual(summary.diffStat, { files: 2, additions: 3, deletions: 1 });
   assert.equal(summary.diff, 'the patch');
+  const { body: monitor } = await request('GET', monitorPath, undefined, id);
+  assert.deepEqual(monitor.roundHistory.map(({ round, status, reason, findings }) => [round, status, reason, findings]), [
+    [1, 'needs_review', null, [backendFinding, frontendFinding]],
+    [2, 'needs_review', 'Two issues', [backendFinding]],
+    [3, 'complete', 'One issue remains', []]
+  ]);
+});
+
+test('the monitor retains previous rounds and more than 20 activities when a fix repeats stages', async () => {
+  fixture.numstat = '';
+  const { USAGE } = await import(providersUrl);
+  mock.respond = ({ kind }) => kind === 'plan' ? plan : kind === 'review' ? pass : {
+    ...change, [USAGE]: { model: 'initial-model' }
+  };
+  const id = await startJob('bugfix');
+  const { body: initial } = await request('GET', monitorPath, undefined, id);
+  assert.ok(initial.activities.length > 0);
+  assert.ok(initial.activities.every(activity => activity.round === 1));
+  const backend = initial.roundHistory[0].steps.find(step => step.key === 'backend');
+  assert.deepEqual(backend, {
+    key: 'backend', role: 'backend', provider: 'claudecode', model: 'initial-model',
+    status: 'done', startedAt: backend.startedAt, endedAt: backend.endedAt
+  });
+  assert.ok(backend.endedAt >= backend.startedAt);
+  assert.ok(initial.activities.some(activity => activity.stageKey === 'backend' && activity.model === 'initial-model'));
+
+  const editing = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const note = 'แก้ข้อความอธิบาย';
+  mock.respond = async ({ kind }) => {
+    if (kind === 'review') return pass;
+    editing.resolve();
+    await release.promise;
+    return { ...change, [USAGE]: { model: 'fix-model' } };
+  };
+  assert.equal((await request('POST', '/api/jobs/:id/fix', { note }, id)).statusCode, 200);
+  const running = server.drain();
+  try {
+    await Promise.race([editing.promise, running.then(() => assert.fail('Fix did not reach implementation'))]);
+    const { body: snapshot } = await request('GET', '/api/monitor');
+    const live = snapshot.activeJobs.find(job => job.id === id);
+    assert.deepEqual(live.roundHistory[0], initial.roundHistory[0]);
+    assert.equal(live.roundHistory[1].reason, note);
+    assert.equal(live.roundHistory[1].endedAt, null);
+    assert.equal(live.roundHistory[1].steps.find(step => step.key === 'backend').status, 'running');
+  } finally {
+    release.resolve();
+    await running;
+  }
+
+  const { body: saved } = await request('GET', monitorPath, undefined, id);
+  const { body: alias } = await request('GET', '/api/monitor/jobs/:id', undefined, id);
+  assert.deepEqual(alias, saved);
+  assert.ok(saved.activities.length > 20);
+  assert.deepEqual(saved.activities.filter(activity => activity.round === 1), initial.activities);
+  assert.ok(saved.activities.some(activity => activity.round === 2 && activity.stageKey === 'prepare'));
+  assert.ok(saved.activities.every(activity => activity.round === 1 || activity.round === 2));
+  assert.deepEqual(saved.roundHistory[0], initial.roundHistory[0]);
+  assert.equal(saved.roundHistory[1].reason, note);
+  assert.equal(saved.roundHistory[1].steps.find(step => step.key === 'backend').model, 'fix-model');
+  const persisted = server.store.load().jobs.find(job => job.id === id);
+  assert.deepEqual(persisted.monitor.activities, saved.activities);
+});
+
+test('legacy monitor activities and SQLite steps without a round belong to round one', async () => {
+  const id = 'legacy-timeline';
+  const startedAt = 1;
+  const activity = { id: 'old-activity', at: startedAt, stageKey: 'backend', code: 'started', provider: 'codex' };
+  const job = { id, repo, title: id, status: 'complete', createdAt: startedAt, events: [],
+    monitor: { stages: {}, activities: [activity] } };
+  server.state.jobs.push(job);
+  server.save();
+
+  const { body: monitor } = await request('GET', monitorPath, undefined, id);
+  assert.deepEqual(monitor.activities, [{ ...activity, round: 1 }]);
+  assert.deepEqual(monitor.roundHistory.map(({ round }) => round), [1]);
+  const [backend] = monitor.roundHistory[0].steps;
+  assert.equal(backend.startedAt, startedAt);
+  assert.equal(backend.endedAt, 2);
+  assert.equal(backend.model, 'legacy-model');
+  assert.equal(backend.status, 'done');
+  assert.equal(Object.hasOwn(activity, 'round'), false);
 });
 
 test('a manual fix keeps the note and successful fallback provider and reviews exactly once', async () => {
@@ -216,6 +317,9 @@ test('a manual fix keeps the note and successful fallback provider and reviews e
     summary: 'Still needs review', findings: [backendFinding], fixedBy: [{ role: 'single', provider: 'claudecode' }]
   });
   assert.deepEqual(summary.diffStat, { files: 1, additions: 5, deletions: 2 });
+  const { body: monitor } = await request('GET', monitorPath, undefined, id);
+  assert.deepEqual(monitor.roundHistory[1].steps.filter(step => step.key === 'backend').map(step => [step.provider, step.status]),
+    [['gemini', 'failed'], ['claudecode', 'done']]);
 });
 
 test('a legacy job exposes its existing review and can record a new manual review', async () => {
@@ -254,6 +358,11 @@ test('a legacy job exposes its existing review and can record a new manual revie
   assert.deepEqual(withoutTime(updated.reviewHistory), [
     { round: 1, trigger: 'manual_fix', userNote: null, provider: 'codex', ok: true,
       summary: 'Passed', findings: [], fixedBy: [{ role: 'single', provider: 'claudecode' }] }
+  ]);
+  const { body: monitor } = await request('GET', monitorPath, undefined, legacy.id);
+  assert.deepEqual(monitor.roundHistory.map(({ round, status, reason, findings }) => [round, status, reason, findings]), [
+    [1, 'needs_review', null, legacyReview.findings],
+    [2, 'complete', 'Legacy review', []]
   ]);
 });
 
@@ -534,11 +643,20 @@ test('two jobs with disjoint approved plans can both implement up to maxJobs', a
   };
   const a = await queueJob('writer-a');
   currentJob(a).plan = distinctPlan('writer-a.txt');
+  currentJob(a).settings.models = { claudecode: { implement: 'model-a' } };
   const b = await queueJob('writer-b');
   currentJob(b).plan = distinctPlan('writer-b.txt');
+  currentJob(b).settings.models = { claudecode: { implement: 'model-b' } };
   await until(() => editing.size === 2, 'both jobs did not reach implementation');
   assert.equal(currentJob(a).stages.backend.status, 'running');
   assert.equal(currentJob(b).stages.backend.status, 'running');
+  const { body: snapshot } = await request('GET', '/api/monitor');
+  for (const [id, model] of [[a, 'model-a'], [b, 'model-b']]) {
+    const job = snapshot.activeJobs.find(job => job.id === id);
+    const steps = job.roundHistory[0].steps.filter(step => step.key === 'backend');
+    assert.deepEqual(steps.map(step => [step.status, step.model]), [['running', model]]);
+    assert.ok(job.activities.every(activity => activity.round === 1));
+  }
   edit.release();
   await Promise.all([waitForJob(a, 'complete'), waitForJob(b, 'complete')]);
 });

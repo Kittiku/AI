@@ -93,7 +93,7 @@ function initializeState() {
   // After three restarts in a row it stops, so a job that crashes the app cannot loop forever.
   store.closeOpenSteps();
   recoverJobs(state.jobs);
-  monitor = createMonitor(state, activeJobIds, restartController.getState, jobWait);
+  monitor = createMonitor(state, activeJobIds, restartController.getState, jobWait, id => store.monitorSteps(id));
   save();
 }
 
@@ -169,7 +169,7 @@ function track(job, key, patch, code) {
 
 function beginStage(job, key, action, branch, round) {
   track(job, key, {
-    status: 'running', action, branch, round, provider: null,
+    status: 'running', action, branch, round, provider: null, model: null,
     startedAt: Date.now(), endedAt: null, waitUntil: null, changedFiles: null, note: null
   }, 'started');
 }
@@ -205,7 +205,7 @@ function finishRole(job, role, patch, monitorPatch) {
 
 function skipRole(job, role, note) {
   const skipped = { status: 'skipped', note, provider: null, startedAt: null, endedAt: Date.now(), waitUntil: null };
-  recordMonitor(job, role, { ...skipped, action: null, branch: null, round: job.round || 0, changedFiles: null }, 'completed');
+  recordMonitor(job, role, { ...skipped, action: null, branch: null, round: job.round || 0, changedFiles: null, model: null }, 'completed');
   setStage(job, role, skipped);
 }
 
@@ -463,9 +463,10 @@ async function callCore(job, role, cwd, task, context, schema, signal, accept, o
     } else addEvent(job, label, (extra ? 'ตัวที่กำหนดไว้ใช้ไม่ได้ ลองใช้ ' : 'มอบหมายให้ ') + names[provider], provider);
     const startedAt = Date.now();
     stageSet({ status: 'running', provider, startedAt, endedAt: null, waitUntil: null, round });
-    stageTrack({ status: 'running', action, provider, startedAt, endedAt: null, waitUntil: null, changedFiles: null },
+    const step = store.startStep({ jobId: job.id, role, provider, round, action, startedAt });
+    stageTrack({ status: 'running', action, provider, model: model || null, startedAt, endedAt: null, waitUntil: null, changedFiles: null, round },
       (candidate.row ? candidate.row.rank === 1 : provider === (options.subtask?.prefer ?? job.settings.routes[role][0])) ? 'started' : 'provider_fallback');
-    const step = store.startStep({ jobId: job.id, role, provider, round, action });
+    if (quiet) monitor.publish();
     let day;
     try {
       if (provider === 'gemini') {
@@ -479,6 +480,7 @@ async function callCore(job, role, cwd, task, context, schema, signal, accept, o
           write, context, geminiCliContext: options.geminiCliContext, model,
           async beforeModelRetry(rejectedModel, canRetry = true) {
             signal.throwIfAborted();
+            if (canRetry) stageTrack({ model: null });
             if (rejectedModel) {
               const detail = names[provider] + ' · ' + modelRole + ' · โมเดล ' + rejectedModel + ' ใช้ไม่ได้';
               addEvent(job, 'เตือนเรื่องโมเดล', detail + (canRetry ? ' กลับไปเลือกโมเดลอัตโนมัติ' : ''), provider);
@@ -495,8 +497,8 @@ async function callCore(job, role, cwd, task, context, schema, signal, accept, o
       response[CHANGED] = changed.filter(name => after.files.has(name));
       response[PROVIDER] = provider;
       store.finishStep(step, { status: 'done', usage: response[USAGE] });
+      stageTrack({ model: response[USAGE]?.model ?? null, ...(options.edit && { action: 'apply_result' }) });
       addEvent(job, label, response.summary || 'สร้างแผนและ API contract แล้ว', provider);
-      if (options.edit) stageTrack({ action: 'apply_result' });
       return response;
     } catch (error) {
       if (day) { state.usage[day]--; save(); }
@@ -605,7 +607,8 @@ async function requestApproval(job, kind, message, signal, stages) {
     previousStages.set(key, job.monitor.stages[key] ?? {});
     recordMonitor(job, key, {
       status: 'waiting', action: 'wait_approval', waitUntil: null, endedAt: null,
-      ...(kind === 'plan' ? {} : { provider: null })
+      round: job.fixRequest?.round ?? job.round ?? 0,
+      ...(kind === 'plan' ? {} : { provider: null, model: null })
     }, 'approval_requested');
   }
   let abort;
@@ -736,7 +739,7 @@ async function npm(cwd, args, signal) {
 
 async function verify(job, cwd, signal) {
   if (!job.runChecks) {
-    finishStage(job, 'checks', 'skipped', { round: job.round || 0 });
+    finishStage(job, 'checks', 'skipped', { round: job.round || 0, startedAt: null });
     return [];
   }
   beginStage(job, 'checks', 'run_check', job.branch, job.round || 0);
@@ -855,7 +858,7 @@ function guessOwner(job, text) {
 
 async function work(job, signal) {
   const built = hasIntegratedBuild(job);
-  beginStage(job, 'prepare', 'prepare_worktree', job.branch, job.round ?? null);
+  beginStage(job, 'prepare', 'prepare_worktree', job.branch, job.fixRequest?.round ?? job.round ?? 0);
   const workRoot = path.join(dataDir, 'worktrees', job.id);
   mkdirSync(workRoot, { recursive: true });
   const integrated = path.join(workRoot, 'combined');
@@ -887,7 +890,7 @@ async function work(job, signal) {
     if (job.stages?.plan?.status !== 'done') setStage(job, 'plan', { status: 'done', provider: 'reused', startedAt: Date.now(), endedAt: Date.now() });
     if (job.monitor?.stages.plan?.status !== 'done') {
       const { provider, round, startedAt, endedAt } = job.stages.plan;
-      finishStage(job, 'plan', 'done', { branch: job.branch, provider, round, startedAt, endedAt });
+      finishStage(job, 'plan', 'done', { branch: job.branch, provider, round: round ?? 0, startedAt, endedAt });
     }
   } else await makePlan(job, integrated, original, signal, typeOf(job).plan);
   const tracked = JSON.parse(original).trackedPaths;
@@ -1837,6 +1840,9 @@ app.post('/api/jobs/:id/fix', async (req, res) => {
     return res.status(409).json({ error: 'สถานะงานเปลี่ยนไป กรุณาตรวจงานล่าสุดก่อนสั่งแก้ต่อ' });
   }
   delete job.mergeConflict;
+  if (!job.reviewHistory?.length && job.review) {
+    job.monitorLegacyReview ??= { ...job.review, round: (job.round || 0) + 1, startedAt: job.startedAt, at: job.finishedAt };
+  }
   job.fixRequest = { note: text, provider: provider || null, findings, at: Date.now(), round: (job.round || 0) + 1 };
   job.diffStat = null;
   job.status = 'queued';
@@ -2056,7 +2062,7 @@ function reviewDetails(job) {
   return { reviewHistory: job.reviewHistory ?? [], diffStat: job.diffStat ?? null };
 }
 
-function publicJob({ monitor: _monitor, lastReviewedRound: _lastReviewedRound, ...job }) {
+function publicJob({ monitor: _monitor, monitorLegacyReview: _legacyReview, lastReviewedRound: _lastReviewedRound, ...job }) {
   return { ...job, ...(job.mergeConflict && { error: job.mergeConflict.error }), ...reviewDetails(job), ...jobWait(job), manualChecks: job.manualChecks ?? {} };
 }
 

@@ -54,7 +54,10 @@ export function openStore(dataDir) {
   const stepColumns = new Set(db.prepare('PRAGMA table_info(steps)').all().map(column => column.name));
   if (!stepColumns.has('model')) db.exec('ALTER TABLE steps ADD COLUMN model TEXT');
   if (!stepColumns.has('action')) db.exec('ALTER TABLE steps ADD COLUMN action TEXT');
+  if (!stepColumns.has('round')) db.exec('ALTER TABLE steps ADD COLUMN round INTEGER NOT NULL DEFAULT 0');
   db.exec('CREATE INDEX IF NOT EXISTS steps_started ON steps (started_at)');
+  const selectMonitorSteps = db.prepare(`SELECT role, action, provider, model, round, status,
+      started_at AS startedAt, ended_at AS endedAt FROM steps WHERE job_id = ? ORDER BY id`);
   const written = new Map();
 
   function load(fallback) {
@@ -127,9 +130,9 @@ export function openStore(dataDir) {
     }
   }
 
-  function startStep({ jobId, role, provider, round, action }) {
+  function startStep({ jobId, role, provider, round, action, startedAt = Date.now() }) {
     return Number(db.prepare('INSERT INTO steps (job_id, role, provider, round, status, started_at, action) VALUES (?, ?, ?, ?, ?, ?, ?)')
-      .run(jobId, role, provider, round || 0, 'running', Date.now(), action || null).lastInsertRowid);
+      .run(jobId, role, provider, round || 0, 'running', startedAt, action || null).lastInsertRowid);
   }
 
   function finishStep(id, { status, usage, error }) {
@@ -170,9 +173,13 @@ export function openStore(dataDir) {
     return db.prepare('SELECT * FROM steps WHERE job_id = ? ORDER BY id').all(jobId);
   }
 
+  function monitorSteps(jobId) {
+    return selectMonitorSteps.all(jobId);
+  }
+
   function close() {
     db.close();
   }
 
-  return { load, persist, startStep, finishStep, closeOpenSteps, steps, stepsSince, spendSince, providerStats, close };
+  return { load, persist, startStep, finishStep, closeOpenSteps, steps, monitorSteps, stepsSince, spendSince, providerStats, close };
 }
