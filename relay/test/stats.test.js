@@ -66,6 +66,51 @@ test('daily series covers every day in the window, in Bangkok time, zero-filled'
   assert.equal(stats.daily.filter(row => row.calls === 0).length, 5);
 });
 
+test('per-model stats: percentiles, unknown model, null for unreported values, daily and matrix, old fields kept', () => {
+  const timed = (seconds, over = {}) => step({ startedAt: now - 100_000, endedAt: now - 100_000 + seconds * 1000, ...over });
+  const stats = buildStats([
+    ...[10, 20, 30, 40, 50, 60, 70, 80, 90, 100].map(seconds => timed(seconds)),
+    timed(5, { status: 'failed' }),
+    timed(30, { provider: 'codex', model: null, inputTokens: 0, outputTokens: 0, costUsd: null, role: 'plan', action: null }),
+    timed(60, { provider: 'codex', model: null, inputTokens: null, outputTokens: null, costUsd: null, jobId: 'j2' }),
+    timed(20, { startedAt: now - 2 * DAY, endedAt: now - 2 * DAY + 20_000, provider: 'codex', model: 'gpt-x', inputTokens: 10, outputTokens: 5, costUsd: 0.2, jobId: 'j2' })
+  ], { now, days: 7 });
+  const claude = stats.models.find(row => row.provider === 'claudecode' && row.model === 'claude-x');
+  assert.equal(claude.calls, 11);
+  assert.equal(claude.ok, 10);
+  assert.equal(claude.failed, 1);
+  assert.equal(claude.p50Ms, 50_000);
+  assert.equal(claude.p90Ms, 90_000);
+  assert.equal(claude.avgMs, 55_000);
+  assert.equal(claude.inputTokens, 11_000);
+  assert.equal(claude.costUsd, 5.5);
+  const unknown = stats.models.find(row => row.provider === 'codex' && row.model === null);
+  assert.equal(unknown.calls, 2);
+  assert.equal(unknown.p50Ms, 30_000);
+  assert.equal(unknown.inputTokens, null);
+  assert.equal(unknown.outputTokens, null);
+  assert.equal(unknown.costUsd, null);
+  const today = stats.daily.at(-1);
+  assert.equal(today.byModel['claudecode:claude-x'].calls, 11);
+  assert.equal(today.byModel['codex:unknown'].tokens, null);
+  const quiet = stats.daily[0];
+  assert.deepEqual(quiet.byModel['claudecode:claude-x'], { calls: 0, tokens: null, costUsd: null, avgMs: null });
+  const earlier = stats.daily.find(row => row.day === bangkokDay(now - 2 * DAY));
+  assert.deepEqual(earlier.byModel['codex:gpt-x'], { calls: 1, tokens: 15, costUsd: 0.2, avgMs: 20_000 });
+  assert.ok(stats.matrix.some(row => row.type === 'plan' && row.provider === 'codex' && row.model === null && row.count === 1));
+  assert.ok(stats.matrix.some(row => row.type === 'backend.implement' && row.provider === 'claudecode' && row.model === 'claude-x' && row.count === 11));
+  assert.deepEqual(stats.totals.topModel, { provider: 'claudecode', model: 'claude-x', calls: 11 });
+  assert.equal(stats.totals.costPerJob, (5.5 + 0.2) / 2);
+  for (const key of ['range', 'providers', 'tasks', 'failures', 'recent']) assert.ok(stats[key]);
+  assert.equal(stats.totals.calls, 14);
+  assert.ok('byProvider' in today && 'day' in today);
+});
+
+test('costPerJob is null when no call reports a cost', () => {
+  const stats = buildStats([step({ costUsd: null })], { now, days: 7 });
+  assert.equal(stats.totals.costPerJob, null);
+});
+
 test('calls outside the window are left out; failures and recent calls carry job titles', () => {
   const stats = buildStats([
     step({ startedAt: now - 10 * DAY }), step({ status: 'failed', error: 'boom', jobId: 'j2' }), step()
