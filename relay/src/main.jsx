@@ -849,7 +849,7 @@ function queueWait(job) {
     code, label,
     conflictingJobId: reason?.conflictingJobId ?? reason?.metadata?.conflictingJobId ?? job.conflictingJobId,
     conflictingFiles: reason?.conflictingFiles ?? reason?.metadata?.conflictingFiles ?? job.conflictingFiles,
-    provider: reason?.provider ?? reason?.metadata?.provider ?? job.waitProvider
+    provider: reason?.provider ?? reason?.metadata?.provider ?? job.waitingProvider ?? job.waitProvider
   };
 }
 
