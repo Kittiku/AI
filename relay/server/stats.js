@@ -96,7 +96,7 @@ export function buildStats(steps, { jobs = new Map(), now = Date.now(), days = 3
     const detail = modelDetail(rows);
     return { provider, model: model || null, ...rest, ok: rest.done, ...detail };
   });
-  const modelKey = step => step.provider + ':' + (step.model ?? 'unknown');
+  const modelKey = step => step.provider + ':' + (step.model || 'unknown');
   const modelKeys = [...new Set(inRange.map(modelKey))];
 
   const byTask = group(inRange, step => taskOf(step)).map(({ key, ...rest }) => ({
