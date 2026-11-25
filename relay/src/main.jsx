@@ -24,7 +24,7 @@ const pageInfo = {
   projects: ['โปรเจกต์', 'โฟลเดอร์งานที่บันทึกไว้ คำสั่งทดสอบ และบันทึกที่ AI อ่านทุกงาน'],
   quota: ['โควตา AI', 'โควตาคงเหลือ เวลารีเซ็ต และระดับที่กันไว้ของแต่ละ AI'],
   stats: ['สถิติ AI', 'เรียก AI ตัวไหน โมเดลอะไร ทำงานอะไร บ่อยแค่ไหน เร็วแค่ไหน และใช้ token เท่าไร'],
-  settings: ['ตั้งค่า', 'การจ่ายงาน โมเดล โควตา การอนุมัติ งบ และการทำงานต่อเนื่อง'],
+  settings: ['ตั้งค่า', 'การจ่ายงาน โมเดล การทำงานพร้อมกัน โควตา การอนุมัติ และงบ'],
   job: ['รายละเอียดงาน', 'ติดตามความคืบหน้า ตรวจผล และ merge']
 };
 const statusLabels = {
@@ -36,7 +36,8 @@ const stageName = (job, key) => job.single && key === 'backend' ? 'ลงมื�
 const roleNames = { plan: 'วางแผน', backend: 'Backend', frontend: 'Frontend', review: 'รีวิว' };
 const stageNames = { plan: 'วางแผน', backend: 'Backend', frontend: 'Frontend', checks: 'ทดสอบ', review: 'รีวิว' };
 const stageStatus = { pending: 'รอ', running: 'กำลังทำ', done: 'เสร็จ', warning: 'ตรวจเพิ่ม', failed: 'ล้มเหลว', cancelled: 'หยุด', waiting: 'รอโควตา', retrying: 'กำลังลองใหม่' };
-const busyStatuses = new Set(['queued', 'running', 'stopping', 'waiting_approval']);
+const activeStatuses = new Set(['running', 'stopping', 'waiting_approval']);
+const busyStatuses = new Set(['queued', ...activeStatuses]);
 const doneStatuses = new Set(['complete', 'needs_review']);
 const stuckStatuses = new Set(['failed', 'cancelled', 'interrupted']);
 const clock = new Intl.DateTimeFormat('th-TH', { timeZone: 'Asia/Bangkok', hour: '2-digit', minute: '2-digit' });
@@ -159,7 +160,7 @@ function Stepper({ job, inactive }) {
 }
 
 const monitorStageNames = {
-  ...stageNames, prepare: 'เตรียมงาน', integrate: 'รวมงาน', delivery: 'ส่งมอบ'
+  ...stageNames, prepare: 'เตรียมงาน', integrate: 'รวมงาน', delivery: 'ส่งมอบ', merge: 'Merge', rebase: 'รีเบส'
 };
 const monitorStageIcons = {
   prepare: FolderGit2, plan: ClipboardList, work: CodeXml, integrate: GitBranch,
@@ -193,10 +194,19 @@ function isMonitorJob(value) {
   return Boolean(value?.id && Array.isArray(value.stages) && Array.isArray(value.activities));
 }
 
+const activeJobId = entry => typeof entry === 'string' ? entry : entry?.id ?? entry?.jobId;
+
+function activeMonitorJobs(snapshot) {
+  if (!Array.isArray(snapshot?.activeJobs)) return isMonitorJob(snapshot?.activeJob) ? [snapshot.activeJob] : [];
+  const legacy = snapshot.activeJob;
+  return snapshot.activeJobs.map(entry => isMonitorJob(entry) ? entry :
+    activeJobId(entry) === legacy?.id ? legacy : null).filter(isMonitorJob);
+}
+
 function isMonitorSnapshot(value) {
   return Number.isFinite(value?.updatedAt) && Number.isInteger(value.queuedCount) &&
-    (value.lastFinishedJob === null || Boolean(value.lastFinishedJob?.id)) &&
-    (value.activeJob === null || isMonitorJob(value.activeJob));
+    (value.lastFinishedJob == null || Boolean(value.lastFinishedJob.id)) &&
+    (Array.isArray(value.activeJobs) || value.activeJob === null || isMonitorJob(value.activeJob));
 }
 
 function useSavedJobMonitor(id, isLive, status, isStale) {
@@ -347,10 +357,8 @@ function useRelayConnection() {
   const session = useRef(null);
   const onSnapshot = useCallback((snapshot, epoch) => session.current?.receiveSnapshot(snapshot, epoch), []);
   const monitor = useMonitor(phase === 'reconnecting' || phase === 'timeout', monitorEpoch, onSnapshot);
-  const approval = monitor.snapshot?.activeJob?.approval;
-  const approvalJobId = approval ? monitor.snapshot.activeJob.id : null;
-  const approvalKind = approval?.kind;
-  const approvalRequestedAt = approval?.requestedAt;
+  const approvalKey = JSON.stringify(activeMonitorJobs(monitor.snapshot).filter(job => job.approval)
+    .map(({ id, approval }) => [id, approval.kind, approval.requestedAt]).sort());
 
   useEffect(() => {
     const checkInterval = 800;
@@ -558,8 +566,13 @@ function useRelayConnection() {
       void pollState();
     }
 
+    function updateSettings(settings) {
+      setData(previous => previous && { ...previous, settings });
+      void pollState();
+    }
+
     session.current = {
-      pollState, receiveSnapshot, changeRestart, updateManualChecks,
+      pollState, receiveSnapshot, changeRestart, updateManualChecks, updateSettings,
       retry: () => { setRequestError(''); startRecovery(true); }
     };
     return () => {
@@ -570,9 +583,10 @@ function useRelayConnection() {
     };
   }, []);
 
-  useEffect(() => { void session.current?.pollState(); }, [approvalJobId, approvalKind, approvalRequestedAt]);
+  useEffect(() => { void session.current?.pollState(); }, [approvalKey]);
   return {
     data, setData, networkError, setNetworkError, monitor,
+    onSettingsUpdated: settings => session.current?.updateSettings(settings),
     onAcceptanceUpdated: result => session.current?.updateManualChecks(result),
     relayRestart: {
       restart, phase, pending, requestError, restartUnconfirmed,
@@ -819,12 +833,35 @@ function LiveMonitor({ monitor, job, fallbackJob, saved, onDetails, onApproval, 
   </section>;
 }
 
+const queueWaitLabels = {
+  max_concurrency: 'รอเพดานงานพร้อมกัน',
+  file_conflict: 'รอไฟล์ซ้อนกับงานอื่น',
+  provider_limit: 'รอเพดานการเรียก AI',
+  merge_lock: 'รอคิว merge'
+};
+
+function queueWait(job) {
+  const reason = job.waitReason;
+  const code = typeof reason === 'string' ? reason : reason?.code ?? reason?.reason;
+  const label = Object.hasOwn(queueWaitLabels, code) ? queueWaitLabels[code] : null;
+  if (job.merged || !label) return null;
+  return {
+    code, label,
+    conflictingJobId: reason?.conflictingJobId ?? reason?.metadata?.conflictingJobId ?? job.conflictingJobId,
+    conflictingFiles: reason?.conflictingFiles ?? reason?.metadata?.conflictingFiles ?? job.conflictingFiles,
+    provider: reason?.provider ?? reason?.metadata?.provider ?? job.waitProvider
+  };
+}
+
+const isQueueWaiting = job => job.status === 'queued' || Boolean(queueWait(job));
+const isQueueActive = job => activeStatuses.has(job.status) && !isQueueWaiting(job);
+
 // Four numbers that answer "what needs me now?"; each tile jumps to the matching list.
 function Kpis({ jobs, onFilter, onApproval }) {
-  const running = jobs.filter(job => ['running', 'stopping'].includes(job.status)).length;
+  const running = jobs.filter(job => isQueueActive(job) && job.status !== 'waiting_approval').length;
   const waiting = jobs.filter(job => job.status === 'waiting_approval');
-  const queued = jobs.filter(job => job.status === 'queued').length;
-  const review = jobs.filter(job => doneStatuses.has(job.status) && !job.merged).length;
+  const queued = jobs.filter(isQueueWaiting).length;
+  const review = jobs.filter(job => doneStatuses.has(job.status) && !job.merged && !isQueueWaiting(job)).length;
   const tiles = [
     { key: 'running', label: 'กำลังทำ', value: running, icon: Layers, tone: running ? 'brand' : '', action: () => onFilter('running') },
     { key: 'waiting', label: 'รอคุณอนุมัติ', value: waiting.length, icon: TriangleExclamationPoint, tone: waiting.length ? 'warn' : '',
@@ -866,11 +903,40 @@ function jobProviders(job) {
   return [...new Set(Object.values(job.stages || {}).map(stage => stage.provider).filter(id => providers[id]))];
 }
 
-function Queue({ jobs, projects = [], filter, setFilter, select, create, hasProjects, addProject }) {
-  const filters = [['all', 'ทั้งหมด'], ['running', 'กำลังทำ'], ['queued', 'รอเริ่ม'], ['done', 'เสร็จแล้ว'], ['stuck', 'ติดขัด']];
-  const matches = (job, id) => id === 'all' || (id === 'running' && ['running', 'stopping', 'waiting_approval'].includes(job.status)) ||
-    job.status === id || (id === 'done' && doneStatuses.has(job.status)) || (id === 'stuck' && stuckStatuses.has(job.status));
-  const items = [...jobs].reverse().filter(job => matches(job, filter));
+function queueStage(job, active) {
+  const name = key => stageName(job, key) || monitorStageNames[key];
+  const current = name(active?.stage ?? active?.currentStage);
+  if (current) return current;
+  const entries = active?.stages ?? job.stages ?? {};
+  const stages = Array.isArray(entries) ? entries : Object.entries(entries).map(([key, stage]) => ({ key, ...stage }));
+  const labels = stages.filter(stage => ['running', 'waiting', 'retrying'].includes(stage.status) && name(stage.key))
+    .map(stage => name(stage.key) + (stage.status === 'running' ? '' : ' · ' + monitorStageStatus(stage)));
+  return labels.join(' / ') || name(job.stage);
+}
+
+function QueueWait({ wait, jobsById }) {
+  const { code, label, conflictingJobId, conflictingFiles, provider } = wait;
+  const blocker = jobsById.get(conflictingJobId)?.title || conflictingJobId;
+  return <span className="queue-wait">
+    <span><Clock size={14} aria-hidden="true" />{label}{code === 'provider_limit' && provider ? ' · ' + providerName(provider) : ''}</span>
+    {code === 'file_conflict' && blocker ? <span>งานที่ใช้ไฟล์อยู่ · {blocker}</span> : null}
+    {code === 'file_conflict' && Array.isArray(conflictingFiles) && conflictingFiles.length ?
+      <span>ไฟล์ที่ซ้อนกัน · {conflictingFiles.map((file, index) => <React.Fragment key={file}>{index ? ', ' : ''}<code>{file}</code></React.Fragment>)}</span> : null}
+  </span>;
+}
+
+function Queue({ jobs, activeById, projects = [], filter, setFilter, select, create, hasProjects, addProject }) {
+  const filters = [['all', 'ทั้งหมด'], ['running', 'กำลังทำ'], ['queued', 'รอคิว'], ['done', 'เสร็จแล้ว'], ['stuck', 'ติดขัด']];
+  const matches = (job, id) => {
+    if (id === 'all') return true;
+    if (id === 'queued') return isQueueWaiting(job);
+    if (id === 'running') return isQueueActive(job);
+    if (id === 'done') return !isQueueWaiting(job) && doneStatuses.has(job.status);
+    return stuckStatuses.has(job.status);
+  };
+  const priority = job => isQueueActive(job) ? 0 : isQueueWaiting(job) ? 1 : 2;
+  const items = [...jobs].reverse().filter(job => matches(job, filter)).sort((a, b) => priority(a) - priority(b));
+  const jobsById = new Map(jobs.map(job => [job.id, job]));
   const projectOf = job => projects.find(project => samePath(project.path, job.repo))?.name || repoName(job.repo);
   return <section className="card queue">
     <header className="card-head"><h2>งานทั้งหมด</h2></header>
@@ -878,17 +944,26 @@ function Queue({ jobs, projects = [], filter, setFilter, select, create, hasProj
       const count = jobs.filter(job => matches(job, id)).length;
       return <button key={id} type="button" aria-pressed={filter === id} onClick={() => setFilter(id)}>{label}{count ? <span className="count">{count}</span> : null}</button>;
     })}</div>
-    {items.length ? <ul className="jobs">{items.map(job => <li key={job.id}>
-      <button className={'job-row is-' + job.status} onClick={() => select(job.id)}>
-        <span className="job-main">
-          <strong>{job.title}</strong>
-          <small>{projectOf(job)} · {dateTime(job.createdAt)}{job.startedAt ? ' · ' + jobDuration(job) : ''}</small>
-        </span>
-        <span className="job-ais">{jobProviders(job).map(id => <span key={id} title={providers[id].name}><ProviderIcon id={id} size={13} /></span>)}</span>
-        <span className="job-tags">{job.merged ? <span className="tag merged">merge แล้ว</span> : null}<span className={'status ' + job.status}>{statusLabels[job.status]}</span></span>
-        <ArrowRight className="job-arrow" size={16} aria-hidden="true" />
-      </button>
-    </li>)}</ul> : <div className="empty">
+    {items.length ? <ul className="jobs">{items.map(job => {
+      const wait = queueWait(job);
+      const active = activeById.get(job.id);
+      const stage = isQueueActive(job) || activeById.has(job.id) ? queueStage(job, active) : null;
+      const status = wait ? 'queued' : job.status;
+      return <li key={job.id}>
+        <button type="button" className={'job-row is-' + status} onClick={() => select(job.id)}>
+          <span className="job-main">
+            <strong>{job.title}</strong>
+            <small>{projectOf(job)} · {dateTime(job.createdAt)}{job.startedAt ? ' · ' + jobDuration(job) : ''}</small>
+          </span>
+          <span className="job-ais">{jobProviders(job).map(id => <span key={id} title={providers[id].name}><ProviderIcon id={id} size={13} /></span>)}</span>
+          <span className="job-tags">{job.merged ? <span className="tag merged">merge แล้ว</span> : null}
+            <span className={'status ' + status}>{wait ? 'รอคิว' : statusLabels[status] || status}</span></span>
+          <ArrowRight className="job-arrow" size={16} aria-hidden="true" />
+          {stage ? <span className="queue-stage">ขั้นตอน · {stage}</span> : null}
+          {wait ? <QueueWait wait={wait} jobsById={jobsById} /> : null}
+        </button>
+      </li>;
+    })}</ul> : <div className="empty">
       <span className="terminal"><Terminal size={48} strokeWidth={1.75} aria-hidden="true" /></span>
       <h3>{filter === 'all' ? 'ยังไม่มีงานในคิว' : 'ไม่มีงานในสถานะนี้'}</h3>
       {filter === 'all' ? <><p>{hasProjects ? 'สร้างงานใหม่เพื่อเริ่มให้ AI ดำเนินการ' : 'เริ่มจากเพิ่มโฟลเดอร์งานที่มีอยู่ หรือสร้างงานด้วยพาธของ repo'}</p>
@@ -1146,11 +1221,46 @@ function ModelSettings({ models, onChange, saving }) {
   </section>;
 }
 
+function ConcurrencySettings({ concurrency, setConcurrency, setProviderLimit, saving }) {
+  return <section className="concurrency-settings" aria-labelledby="concurrency-title">
+    <h2 id="concurrency-title">การทำงานพร้อมกัน</h2>
+    <label className="settings-field concurrency-max">จำนวนงานสูงสุดที่ทำพร้อมกัน
+      <select value={concurrency.maxJobs} disabled={saving}
+        onChange={event => setConcurrency('maxJobs', Number(event.target.value))}>
+        <option value={1}>1 งาน (ทำทีละงาน)</option>
+        {[2, 3, 4].map(count => <option key={count} value={count}>{count} งาน</option>)}
+      </select>
+    </label>
+    <label className="checkbox concurrency-plan">
+      <input type="checkbox" role="switch" className="settings-switch" checked={concurrency.planAhead} disabled={saving}
+        aria-describedby="plan-ahead-help" onChange={event => setConcurrency('planAhead', event.target.checked)} />
+      วางแผนงานถัดไปล่วงหน้า
+    </label>
+    <p id="plan-ahead-help" className="muted">ให้ Relay เริ่มวางแผนงานถัดไประหว่างที่งานก่อนหน้ากำลังทดสอบหรือรีวิว</p>
+    <fieldset className="provider-limits">
+      <legend>เพดานการเรียกพร้อมกันต่อ AI</legend>
+      <p id="provider-limit-help" className="muted">เว้นว่างหากไม่ต้องการตั้งเพดานให้ AI ตัวนั้น</p>
+      <div className="settings-grid">
+        {Object.entries(providers).map(([id, provider]) => <label key={id}>{provider.name}
+          <input type="number" min={1} step={1} value={concurrency.perProvider[id] ?? ''} disabled={saving}
+            aria-describedby="provider-limit-help" placeholder="ไม่ระบุ"
+            onChange={event => setProviderLimit(id, event.target.value)} />
+        </label>)}
+      </div>
+    </fieldset>
+  </section>;
+}
+
 function withSettingsDefaults(settings) {
   const team = settings.team;
   return {
     ...settings,
     models: settings.models ?? {},
+    concurrency: {
+      maxJobs: settings.concurrency?.maxJobs ?? 1,
+      planAhead: settings.concurrency?.planAhead ?? true,
+      perProvider: settings.concurrency?.perProvider ?? {}
+    },
     selfUpdate: {
       ...settings.selfUpdate,
       autoRestart: settings.selfUpdate?.autoRestart === true
@@ -1187,16 +1297,42 @@ function SettingsForm({ initial: storedSettings, changed, quotas, onDirty }) {
       return { ...current, models };
     });
   }
-  const { team } = draft;
+  const { team, concurrency } = draft;
+  function setConcurrency(key, value) {
+    setNotice(null);
+    setDraft(current => ({ ...current, concurrency: { ...current.concurrency, [key]: value } }));
+  }
+  function setProviderLimit(id, value) {
+    setNotice(null);
+    setDraft(current => {
+      const perProvider = { ...current.concurrency.perProvider };
+      if (value === '') delete perProvider[id];
+      else perProvider[id] = Number(value);
+      return { ...current, concurrency: { ...current.concurrency, perProvider } };
+    });
+  }
   const setTeam = (key, value) => setDraft(current => ({ ...current, team: { ...current.team, [key]: value } }));
   useEffect(() => { onDirty(dirty); }, [dirty, onDirty]);
   useEffect(() => () => onDirty(false), [onDirty]);
   async function submit(event) {
-    event.preventDefault(); setNotice(null); setSaving(true);
+    event.preventDefault();
+    if (saving || !dirty || duplicate) return;
+    if (Object.values(concurrency.perProvider).some(value => !Number.isSafeInteger(value) || value < 1)) {
+      setSection('concurrency');
+      setNotice({ text: 'เพดานต่อ AI ต้องเป็นจำนวนเต็มตั้งแต่ 1 ขึ้นไป หรือเว้นว่าง', error: true });
+      return;
+    }
+    setNotice(null); setSaving(true);
     try {
       const saved = await api('/settings', 'PUT', draft);
       changed(saved);
-      setDraft(withSettingsDefaults(saved));
+      const next = withSettingsDefaults(saved);
+      if (!saved.concurrency && JSON.stringify(concurrency) !== JSON.stringify(initial.concurrency)) {
+        setDraft({ ...next, concurrency });
+        setNotice({ text: 'เซิร์ฟเวอร์ยังไม่ยืนยันการบันทึกค่าการทำงานพร้อมกัน', error: true });
+        return;
+      }
+      setDraft(next);
       setNotice({ text: 'บันทึกการตั้งค่าแล้ว' });
     } catch (error) { setNotice({ text: error.message, error: true }); }
     finally { setSaving(false); }
@@ -1205,6 +1341,7 @@ function SettingsForm({ initial: storedSettings, changed, quotas, onDirty }) {
   const setRouting = (key, value) => setDraft(current => ({ ...current, routing: { ...routing, [key]: value } }));
   const table = <RouteTable routes={draft.routes} quotas={quotas} label="การมอบหมายงาน" onChange={(role, index, value) => setDraft(current => ({ ...current, routes: updateRoutes(current.routes, role, index, value) }))} />;
   const sections = [['routing', 'การจ่ายงาน', 'Relay เลือก AI ให้แต่ละขั้นอย่างไร'], ['models', 'โมเดล', 'เลือกโมเดลแยกตาม AI และบทบาท'],
+    ['concurrency', 'การทำงานพร้อมกัน', 'จำนวนงาน วางแผนล่วงหน้า และเพดานต่อ AI'],
     ['quota', 'โควตาและรอบแก้', 'กันโควตาไว้ใช้รีวิว และจำนวนรอบแก้'],
     ['edit', 'การแก้โค้ดและอนุมัติ', 'ให้ AI แก้ไฟล์เอง และจุดหยุดรออนุมัติ'], ['budget', 'งบ', 'หยุดรออนุมัติเมื่อถึงงบ'],
     ['auto', 'ทำงานต่อเนื่อง', 'ลองซ้ำ รอโควตา และเวลาสูงสุด'], ['self-update', 'อัปเดต Relay', 'ตั้งค่าการรีสตาร์ทหลัง merge']];
@@ -1235,6 +1372,8 @@ function SettingsForm({ initial: storedSettings, changed, quotas, onDirty }) {
     </>}
     </> : null}
     {show('models') ? <ModelSettings models={draft.models} onChange={setModel} saving={saving} /> : null}
+    {show('concurrency') ? <ConcurrencySettings concurrency={concurrency} setConcurrency={setConcurrency}
+      setProviderLimit={setProviderLimit} saving={saving} /> : null}
     {show('quota') ? <>
     <h2>โควตาและรอบแก้</h2>
     <p className="muted">ในขั้นวางแผน Backend และ Frontend Relay จะข้าม AI ที่โควตาคงเหลือต่ำกว่าค่านี้ เพื่อเก็บโควตาไว้ใช้ในขั้นรีวิว หลอดโควตาจะมีเส้นบอกระดับนี้</p>
@@ -1316,7 +1455,7 @@ function SettingsForm({ initial: storedSettings, changed, quotas, onDirty }) {
       {notice ? <span role="status" className={notice.error ? 'error' : 'success'}>{notice.text}</span> :
         dirty ? <span role="status" className="warn-text">มีการแก้ที่ยังไม่บันทึก</span> : <span className="muted">บันทึกแล้ว</span>}
       <span className="spacer" />
-      {dirty ? <Button onClick={() => { setDraft(initial); setNotice(null); }}>ยกเลิกการแก้</Button> : null}
+      {dirty ? <Button disabled={saving} onClick={() => { setDraft(initial); setNotice(null); }}>ยกเลิกการแก้</Button> : null}
       <button className="button primary" type="submit" disabled={saving || !dirty || duplicate}>บันทึกการตั้งค่า</button></div>
     </div>
   </form>;
@@ -1885,7 +2024,7 @@ function JobDetail({ job, projectName, monitor, relayRestart, approvalRequested,
   const detailRef = useRef(null);
   const mergeAction = useJobMerge(job, updated);
   const { snapshot } = monitor;
-  const active = snapshot?.activeJob;
+  const active = monitor.connection === 'stale' ? null : activeMonitorJobs(snapshot).find(item => item.id === job.id);
   const latest = snapshot?.lastFinishedJob;
   // A manual fix reuses the job ID. Ignore snapshots from the previous round.
   const liveJob = active?.id === job.id && (active.startedAt ?? 0) >= (job.fixRequest?.at ?? 0) &&
@@ -1898,9 +2037,8 @@ function JobDetail({ job, projectName, monitor, relayRestart, approvalRequested,
   const busy = busyStatuses.has(status);
   const canAct = !busy && !busyStatuses.has(job.status);
   // Approval is also checked against fresh state before a decision is sent.
-  const liveUnreliable = !snapshot || monitor.connection === 'stale';
   const showApproval = job.status === 'waiting_approval' && Number.isFinite(job.approval?.requestedAt) &&
-    (job.approval.kind !== 'plan' || Boolean(job.plan)) && (liveUnreliable || sameApproval(job.approval, liveJob?.approval));
+    (job.approval.kind !== 'plan' || Boolean(job.plan)) && (!liveJob || sameApproval(job.approval, liveJob.approval));
   const hasBranch = Boolean(job.worktree || job.branchKept);
   const hasResult = hasBranch || Boolean(job.merged);
   const canMerge = canAct && hasBranch && !job.merged;
@@ -2389,7 +2527,7 @@ function isEditableTarget(node) {
 }
 
 function App() {
-  const { data, setData, monitor, networkError, setNetworkError, relayRestart, onAcceptanceUpdated } = useRelayConnection();
+  const { data, setData, monitor, networkError, setNetworkError, relayRestart, onAcceptanceUpdated, onSettingsUpdated } = useRelayConnection();
   const [page, setPage] = useState('queue');
   const [selection, setSelection] = useState(null);
   const [approvalTarget, setApprovalTarget] = useState(null);
@@ -2448,16 +2586,18 @@ function App() {
   const job = jobs.find(item => item.id === selection);
   const projectName = job && (projects.find(project => samePath(project.path, job.repo))?.name || repoName(job.repo));
   const currentSnapshot = connection === 'stale' ? null : snapshot;
-  const runningCount = currentSnapshot ? Number(Boolean(currentSnapshot.activeJob)) :
-    jobs.filter(item => ['running', 'stopping', 'waiting_approval'].includes(item.status)).length;
-  const waitingCount = currentSnapshot ? Number(Boolean(currentSnapshot.activeJob?.approval)) :
-    jobs.filter(item => item.status === 'waiting_approval').length;
-  const queuedCount = currentSnapshot?.queuedCount ?? jobs.filter(item => item.status === 'queued').length;
+  const liveJobs = activeMonitorJobs(currentSnapshot);
+  const activeEntries = currentSnapshot?.activeJobs ?? data?.activeJobs ?? [...jobs.filter(isQueueActive), ...liveJobs];
+  const activeById = new Map(activeEntries.map(entry => [activeJobId(entry), entry]).filter(([id]) => id));
+  for (const entry of liveJobs) if (activeById.has(entry.id)) activeById.set(entry.id, entry);
+  const runningCount = activeById.size;
+  const waitingCount = data ? jobs.filter(item => item.status === 'waiting_approval').length :
+    liveJobs.filter(item => item.approval).length;
+  const queuedCount = data ? jobs.filter(isQueueWaiting).length : currentSnapshot?.queuedCount ?? 0;
+  const monitorFallback = !liveJobs.length ? jobs.find(item => isQueueActive(item) && activeById.has(item.id)) : null;
   const reserve = data?.settings.reserve ?? {};
   const pageKey = job ? 'job' : page;
-  const waitingJobs = jobs.filter(item => item.status === 'waiting_approval').length;
-  const activeJobs = jobs.filter(item => ['running', 'stopping', 'waiting_approval'].includes(item.status)).length;
-  const badges = { queue: waitingJobs ? { value: waitingJobs, tone: 'warn' } : activeJobs ? { value: activeJobs, tone: 'brand' } : null,
+  const badges = { queue: waitingCount ? { value: waitingCount, tone: 'warn' } : runningCount ? { value: runningCount, tone: 'brand' } : null,
     projects: projects.length ? { value: projects.length, tone: '' } : null };
   const cards = detailed => <div className="providers">{Object.keys(providers).map(id => <ProviderCard id={id} key={id} info={data?.quotas[id]} detailed={detailed} reserve={reserve[id] ?? 0} />)}</div>;
   return <div className="shell">
@@ -2485,7 +2625,7 @@ function App() {
           onApproval={openApproval} onApprovalFocused={() => setApprovalTarget(null)} back={() => open('queue')}
           retry={setDialog} updated={updateJob} removed={removeJob} onAcceptanceUpdated={onAcceptanceUpdated} /> :
           page === 'settings' ? <>
-            {data ? <SettingsForm initial={data.settings} quotas={data.quotas} onDirty={setSettingsDirty} changed={settings => setData(previous => ({ ...previous, settings }))} /> : null}</> :
+            {data ? <SettingsForm initial={data.settings} quotas={data.quotas} onDirty={setSettingsDirty} changed={onSettingsUpdated} /> : null}</> :
           page === 'projects' ? (data ? <ProjectsPage projects={projects} jobs={jobs} createJob={repo => setDialog({ repo })}
             added={addProject} removed={removeProject} select={select} updated={updateProject} /> : null) :
           page === 'quota' ? <>{cards(true)}</> :
@@ -2494,8 +2634,9 @@ function App() {
             <Kpis jobs={jobs} onFilter={setFilter} onApproval={openApproval} />
             <div className="home-grid">
               <div className="home-main">
-                <LiveMonitor monitor={monitor} job={snapshot?.activeJob} onDetails={select} onApproval={openApproval} showTeam />
-                <Queue jobs={jobs} projects={projects} filter={filter} setFilter={setFilter} select={select} create={() => setDialog({})} hasProjects={projects.length > 0} addProject={() => open('projects')} />
+                <LiveMonitor monitor={monitor} job={liveJobs[0]} fallbackJob={monitorFallback} onDetails={select} onApproval={openApproval} showTeam />
+                <Queue jobs={jobs} activeById={activeById} projects={projects} filter={filter} setFilter={setFilter} select={select}
+                  create={() => setDialog({})} hasProjects={projects.length > 0} addProject={() => open('projects')} />
               </div>
               <AiStatus quotas={data?.quotas} reserve={reserve} onMore={() => open('quota')} />
             </div>
