@@ -24,7 +24,7 @@ const pageInfo = {
   projects: ['โปรเจกต์', 'โฟลเดอร์งานที่บันทึกไว้ คำสั่งทดสอบ และบันทึกที่ AI อ่านทุกงาน'],
   quota: ['โควตา AI', 'โควตาคงเหลือ เวลารีเซ็ต และระดับที่กันไว้ของแต่ละ AI'],
   stats: ['สถิติ AI', 'เรียก AI ตัวไหน โมเดลอะไร ทำงานอะไร บ่อยแค่ไหน เร็วแค่ไหน และใช้ token เท่าไร'],
-  settings: ['ตั้งค่า', 'การจ่ายงาน โควตา การอนุมัติ งบ และการทำงานต่อเนื่อง'],
+  settings: ['ตั้งค่า', 'การจ่ายงาน โมเดล โควตา การอนุมัติ งบ และการทำงานต่อเนื่อง'],
   job: ['รายละเอียดงาน', 'ติดตามความคืบหน้า ตรวจผล และ merge']
 };
 const statusLabels = {
@@ -1084,10 +1084,73 @@ function RoutingPreview({ refreshKey }) {
   </div>;
 }
 
+const modelRoles = [
+  ['default', 'ค่าเริ่มต้นของ AI'],
+  ['plan', roleNames.plan],
+  ['implement', 'ลงมือทำ'],
+  ['review', roleNames.review],
+  ['check', 'ตรวจงานย่อย']
+];
+const modelProviderIds = ['claudecode', 'codex', 'gemini'];
+const modelIdLimit = 120;
+
+function ModelSettings({ models, onChange, saving }) {
+  const [suggestions, setSuggestions] = useState(null);
+  useEffect(() => {
+    const controller = new AbortController();
+    const { signal } = controller;
+    api('/models', 'GET', undefined, { signal, cache: 'no-store' }).then(
+      result => { if (!signal.aborted) setSuggestions(result ?? {}); },
+      () => { if (!signal.aborted) setSuggestions({}); }
+    );
+    return () => controller.abort();
+  }, []);
+
+  const suggestionsByProvider = Object.fromEntries(modelProviderIds.map(id => {
+    const list = Array.isArray(suggestions?.[id]) ? suggestions[id] : [];
+    const validIds = list.filter(model => typeof model === 'string' && model.length > 0 && model.length <= modelIdLimit);
+    return [id, [...new Set(validIds)]];
+  }));
+  return <section className="model-settings" aria-labelledby="model-settings-title">
+    <h2 id="model-settings-title">โมเดล</h2>
+    <p className="muted" id="model-settings-help">เลือกจากรายการแนะนำหรือพิมพ์ชื่อโมเดลเอง ล้างช่องเพื่อกลับเป็นอัตโนมัติ
+      บทบาทที่ตั้งเป็นอัตโนมัติจะใช้ค่าเริ่มต้นของ AI ถ้าตั้งไว้</p>
+    <div className="model-list-status muted" role="status">
+      {suggestions === null ? 'กำลังโหลดรายชื่อโมเดลแนะนำ…' :
+        Object.values(suggestionsByProvider).every(list => list.length === 0) ? 'ยังไม่มีรายการแนะนำ พิมพ์ชื่อโมเดลเองได้' : null}
+    </div>
+    <table className="model-table" role="table" aria-labelledby="model-settings-title" aria-describedby="model-settings-help">
+      <thead role="rowgroup"><tr role="row">
+        <th role="columnheader" scope="col">AI</th>
+        {modelRoles.map(([role, label]) => <th key={role} role="columnheader" scope="col">{label}</th>)}
+      </tr></thead>
+      <tbody role="rowgroup">{modelProviderIds.map(id => {
+        const name = providerName(id);
+        const list = suggestionsByProvider[id];
+        const listId = 'model-list-' + id;
+        return <tr role="row" key={id}>
+          <th role="rowheader" scope="row"><span className="model-provider"><ProviderIcon id={id} size={15} />{name}</span></th>
+          {modelRoles.map(([role, label]) => <td key={role} role="cell">
+            <span className="model-role-label" aria-hidden="true">{label}</span>
+            <input type="text" aria-label={name + ' · ' + label} placeholder="อัตโนมัติ"
+              list={list.length ? listId : undefined} value={models?.[id]?.[role] ?? ''}
+              maxLength={modelIdLimit} autoComplete="off" autoCapitalize="none" spellCheck={false}
+              readOnly={saving} onChange={event => onChange(id, role, event.target.value)} />
+          </td>)}
+        </tr>;
+      })}</tbody>
+    </table>
+    {modelProviderIds.map(id => <datalist key={id} id={'model-list-' + id}>
+      {suggestionsByProvider[id].map(model => <option key={model} value={model} />)}
+    </datalist>)}
+  </section>;
+}
+
 function withSettingsDefaults(settings) {
   const team = settings.team;
   return {
     ...settings,
+    models: settings.models ?? {},
     selfUpdate: {
       ...settings.selfUpdate,
       autoRestart: settings.selfUpdate?.autoRestart === true
@@ -1112,6 +1175,18 @@ function SettingsForm({ initial: storedSettings, changed, quotas, onDirty }) {
   const duplicate = hasDuplicate(draft.routes);
   const setAuto = (key, value) => setDraft(current => ({ ...current, auto: { ...current.auto, [key]: value } }));
   const setBudget = (key, value) => setDraft(current => ({ ...current, budget: { ...current.budget, [key]: value } }));
+  function setModel(provider, role, value) {
+    setNotice(null);
+    setDraft(current => {
+      const models = { ...current.models };
+      const roles = { ...models[provider] };
+      if (value === '') delete roles[role];
+      else roles[role] = value;
+      if (Object.keys(roles).length) models[provider] = roles;
+      else delete models[provider];
+      return { ...current, models };
+    });
+  }
   const { team } = draft;
   const setTeam = (key, value) => setDraft(current => ({ ...current, team: { ...current.team, [key]: value } }));
   useEffect(() => { onDirty(dirty); }, [dirty, onDirty]);
@@ -1129,11 +1204,12 @@ function SettingsForm({ initial: storedSettings, changed, quotas, onDirty }) {
   const routing = draft.routing || { mode: 'auto', profile: 'balanced', minSamples: 5 };
   const setRouting = (key, value) => setDraft(current => ({ ...current, routing: { ...routing, [key]: value } }));
   const table = <RouteTable routes={draft.routes} quotas={quotas} label="การมอบหมายงาน" onChange={(role, index, value) => setDraft(current => ({ ...current, routes: updateRoutes(current.routes, role, index, value) }))} />;
-  const sections = [['routing', 'การจ่ายงาน', 'Relay เลือก AI ให้แต่ละขั้นอย่างไร'], ['quota', 'โควตาและรอบแก้', 'กันโควตาไว้ใช้รีวิว และจำนวนรอบแก้'],
+  const sections = [['routing', 'การจ่ายงาน', 'Relay เลือก AI ให้แต่ละขั้นอย่างไร'], ['models', 'โมเดล', 'เลือกโมเดลแยกตาม AI และบทบาท'],
+    ['quota', 'โควตาและรอบแก้', 'กันโควตาไว้ใช้รีวิว และจำนวนรอบแก้'],
     ['edit', 'การแก้โค้ดและอนุมัติ', 'ให้ AI แก้ไฟล์เอง และจุดหยุดรออนุมัติ'], ['budget', 'งบ', 'หยุดรออนุมัติเมื่อถึงงบ'],
     ['auto', 'ทำงานต่อเนื่อง', 'ลองซ้ำ รอโควตา และเวลาสูงสุด'], ['self-update', 'อัปเดต Relay', 'ตั้งค่าการรีสตาร์ทหลัง merge']];
   const show = key => section === key;
-  return <form className="settings-layout" onSubmit={submit}>
+  return <form className={'settings-layout' + (show('models') ? ' show-models' : '')} onSubmit={submit}>
     <nav className="card settings-nav" aria-label="หมวดการตั้งค่า">{sections.map(([key, label, hint]) =>
       <button key={key} type="button" aria-current={section === key ? 'page' : undefined} onClick={() => setSection(key)}><strong>{label}</strong><small>{hint}</small></button>)}</nav>
     <div className="card settings">
@@ -1158,6 +1234,7 @@ function SettingsForm({ initial: storedSettings, changed, quotas, onDirty }) {
       {table}
     </>}
     </> : null}
+    {show('models') ? <ModelSettings models={draft.models} onChange={setModel} saving={saving} /> : null}
     {show('quota') ? <>
     <h2>โควตาและรอบแก้</h2>
     <p className="muted">ในขั้นวางแผน Backend และ Frontend Relay จะข้าม AI ที่โควตาคงเหลือต่ำกว่าค่านี้ เพื่อเก็บโควตาไว้ใช้ในขั้นรีวิว หลอดโควตาจะมีเส้นบอกระดับนี้</p>
