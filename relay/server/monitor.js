@@ -90,7 +90,7 @@ function projectJob(job, projects) {
 }
 
 // The live snapshot and job history share a projection. Unrelated writes do not publish new snapshots.
-export function createMonitor(state, activeId, getRestartState) {
+export function createMonitor(state, activeIds, getRestartState, getWait = () => ({})) {
   const clients = new Map();
   let previous;
   let snapshot;
@@ -105,18 +105,24 @@ export function createMonitor(state, activeId, getRestartState) {
 
   function publish() {
     let queuedCount = 0;
-    let activeJob = null;
+    const activeJobs = [];
+    const queuedJobs = [];
     let lastFinishedJob = null;
-    const id = activeId();
+    const ids = new Set(activeIds());
     for (const job of state.jobs) {
-      if (job.status === 'queued') queuedCount++;
-      if (job.id === id && activeStatus(job.status)) activeJob = projectJob(job, state.projects);
+      if (job.status === 'queued') {
+        queuedCount++;
+        queuedJobs.push({ id: job.id, title: job.title, status: job.status, ...getWait(job) });
+      }
+      if (ids.has(job.id) && activeStatus(job.status)) {
+        activeJobs.push({ ...projectJob(job, state.projects), ...getWait(job) });
+      }
       if (!activeStatus(job.status) && job.status !== 'queued' && Number.isFinite(job.finishedAt) &&
           (!lastFinishedJob || job.finishedAt >= lastFinishedJob.finishedAt)) {
         lastFinishedJob = { id: job.id, title: job.title, status: job.status, finishedAt: job.finishedAt };
       }
     }
-    const data = { queuedCount, activeJob, lastFinishedJob, restart: getRestartState?.() };
+    const data = { queuedCount, queuedJobs, activeJob: activeJobs[0] ?? null, activeJobs, lastFinishedJob, restart: getRestartState?.() };
     const serialized = JSON.stringify(data);
     if (serialized === previous) return;
     previous = serialized;
@@ -134,7 +140,7 @@ export function createMonitor(state, activeId, getRestartState) {
     res.set('Cache-Control', 'no-store');
     const job = state.jobs.find(item => item.id === req.params.id);
     if (!job) return res.status(404).json({ error: 'ไม่พบงานนี้' });
-    return res.json({ ...projectJob(job, state.projects), finishedAt: job.finishedAt ?? null });
+    return res.json({ ...projectJob(job, state.projects), ...getWait(job), finishedAt: job.finishedAt ?? null });
   }
 
   function events(_req, res) {

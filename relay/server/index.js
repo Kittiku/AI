@@ -10,7 +10,7 @@ import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { applyEdits, applyFiles, attemptChanges, attemptState, checkpoint, editContexts, git, isSafePath, mergeWorktree, removeWorktreeFolder, repository, restoreAttempt, snapshot, worktreePaths } from './git.js';
 import { editSchema, generate, listModels, names, pacificDay, planSchema, quota, refreshClaudeCode, refreshCodex, reviewSchema, subtaskCheckSchema, USAGE } from './providers.js';
-import { openStore } from './store.js';
+import { defaultConcurrencySettings, normalizeConcurrencySettings, openStore, readConcurrencySettings } from './store.js';
 import { buildStats } from './stats.js';
 import { createRestartController, defaultSelfUpdateSettings, normalizeSelfUpdateSettings, restartMessages, shouldAutoRestart } from './restart.js';
 import { PROFILES, rank } from './router.js';
@@ -40,6 +40,7 @@ const defaults = {
   routing: { mode: 'auto', profile: 'balanced', minSamples: 5 },
   approvals: { afterPlan: false },
   selfUpdate: defaultSelfUpdateSettings,
+  concurrency: defaultConcurrencySettings,
   // Team mode: split medium and hard tasks and schedule ready pieces within each role.
   team: normalizeTeamSettings({ mode: 'auto', maxSubtasks: 4 }),
   // Budgets in USD; 0 = no limit. countSubscription also counts the API-equivalent value of subscription runs.
@@ -61,6 +62,7 @@ function migrateSettings(settings) {
   settings.routing = { ...defaults.routing, ...settings.routing };
   settings.approvals = { ...defaults.approvals, ...settings.approvals };
   settings.selfUpdate = normalizeSelfUpdateSettings(settings.selfUpdate);
+  settings.concurrency = normalizeConcurrencySettings(settings.concurrency);
   settings.budget = { ...defaults.budget, ...settings.budget };
   settings.team = normalizeTeamSettings({ ...defaults.team, ...settings.team });
 }
@@ -78,14 +80,25 @@ function initializeState() {
       update.restarted = true;
       update.restartedAt = serverBoot.startedAt;
     }
-    if (['queued', 'running', 'waiting_approval'].includes(job.status)) migrateSettings(job.settings);
-    else if (job.settings) job.settings.team = normalizeTeamSettings({ ...defaults.team, ...job.settings.team });
+    if (['queued', 'running', 'waiting_approval'].includes(job.status)) {
+      job.settings ??= structuredClone(state.settings);
+      migrateSettings(job.settings);
+    } else if (job.settings) {
+      job.settings.team = normalizeTeamSettings({ ...defaults.team, ...job.settings.team });
+      job.settings.concurrency = normalizeConcurrencySettings(job.settings.concurrency);
+    }
   }
   for (const project of state.projects) project.checks ??= [];
   // A job that was running when the app closed goes back to the queue and continues from its last finished step.
   // After three restarts in a row it stops, so a job that crashes the app cannot loop forever.
   store.closeOpenSteps();
-  for (const job of state.jobs) {
+  recoverJobs(state.jobs);
+  monitor = createMonitor(state, activeJobIds, restartController.getState, jobWait);
+  save();
+}
+
+function recoverJobs(jobs) {
+  for (const job of jobs) {
     if (job.status === 'stopping') {
       job.status = 'cancelled';
       job.finishedAt ??= Date.now();
@@ -108,17 +121,18 @@ function initializeState() {
     closeJobStages(job, 'pending');
     job.events.push({ title: 'ทำต่อ', detail: 'แอปปิดระหว่างทำงาน เมื่อเปิดใหม่จะทำต่อจากขั้นที่ค้าง', at: Date.now() });
   }
-  monitor = createMonitor(state, () => active?.id, restartController.getState);
-  save();
 }
 
 const cooldowns = {};
-let active;
+const workers = new Map();
+const queueWaits = new Map();
+const activeJobIds = () => [...workers.values()].filter(worker => !worker.resume).map(worker => worker.job.id);
 let monitor;
 let httpServer;
 let acceptingRequests = false;
 const restartController = createRestartController({
   getJobs: () => state.jobs,
+  getWorkers: () => workers,
   closeServer,
   reopenServer,
   supervised: serverBoot.supervised,
@@ -214,6 +228,55 @@ function providerStatus(provider, role, settings, values, now) {
 }
 
 const routingStats = () => store.providerStats(Date.now() - 60 * 86_400_000);
+const providerSlots = Object.fromEntries(Object.keys(names).map(id => [id, { running: 0, waiting: new Set() }]));
+
+function jobWait(job) {
+  if (job.status === 'queued') return queueWaits.get(job.id) ?? {};
+  if (job.status !== 'running') return {};
+  for (const [provider, slot] of Object.entries(providerSlots)) {
+    if ([...slot.waiting].some(waiter => waiter.job.id === job.id)) return { waitReason: 'provider_limit', waitingProvider: provider };
+  }
+  return {};
+}
+
+const providerLimit = provider => state.settings.concurrency.perProvider[provider] ?? Infinity;
+
+function takeProvider(provider) {
+  providerSlots[provider].running++;
+  return () => {
+    providerSlots[provider].running--;
+    dispatchProvider(provider);
+  };
+}
+
+function dispatchProvider(provider) {
+  const slot = providerSlots[provider];
+  for (const waiter of slot.waiting) {
+    if (slot.running >= providerLimit(provider)) break;
+    slot.waiting.delete(waiter);
+    waiter.start(takeProvider(provider));
+  }
+}
+
+function acquireProvider(job, provider, signal) {
+  signal.throwIfAborted();
+  const slot = providerSlots[provider];
+  if (!slot.waiting.size && slot.running < providerLimit(provider)) return takeProvider(provider);
+  let waiter;
+  const stop = () => {
+    slot.waiting.delete(waiter);
+    waiter.reject(signal.reason);
+  };
+  return new Promise((start, reject) => {
+    waiter = { job, start, reject };
+    slot.waiting.add(waiter);
+    signal.addEventListener('abort', stop, { once: true });
+    monitor.publish();
+  }).finally(() => {
+    signal.removeEventListener('abort', stop);
+    monitor.publish();
+  });
+}
 // Providers already assigned within this job. Parallel subtask calls have individual keys.
 const inflight = new Map();
 
@@ -338,7 +401,16 @@ async function callCore(job, role, cwd, task, context, schema, signal, accept, o
         if (!extra || until) addEvent(job, label, 'ข้าม ' + names[provider] + ' · ' + blocked, provider);
         continue;
       }
-      const response = await attempt(provider, extra, candidate, entry);
+      const slot = acquireProvider(job, provider, signal);
+      const release = typeof slot === 'function' ? slot : await slot;
+      let response;
+      try {
+        signal.throwIfAborted();
+        checkDeadline(job);
+        response = await attempt(provider, extra, candidate, entry);
+      } finally {
+        release();
+      }
       if (response) return response;
       if (options.routeKey) inflight.get(job.id)?.delete(routeKey);
       if (!contextSkips.has(provider)) failed = true;
@@ -632,6 +704,14 @@ async function checkEdits(job, cwd, response, { write, changed } = {}) {
   }
   if (response.files.some(file => Buffer.byteLength(file.content) > 100_000)) return 'AI ส่งไฟล์ทั้งไฟล์ที่ใหญ่เกิน 100 KB ต้องใช้ edits แทน';
   try { await applyEdits(cwd, response.edits, { dryRun: true }); } catch (error) { return 'ผลการแก้ใช้ไม่ได้: ' + error.message; }
+  const worker = workers.get(job.id);
+  if (worker?.reserved && touched.length) {
+    const files = touched.map(fileKey);
+    const conflict = fileConflict(job, new Set(files), false);
+    if (conflict) return 'ผลการแก้ใช้ไฟล์ซ้อนกับงานที่กำลังทำ: ' +
+      (conflict.conflictingFiles.length ? conflict.conflictingFiles.join(', ') : conflict.conflictingJobId);
+    for (const file of files) worker.files.add(file);
+  }
   return '';
 }
 
@@ -825,7 +905,11 @@ async function work(job, signal) {
     }
   }
 
-  if (resumeTip && !resuming) {
+  const priorFiles = (resumeTip || (resuming && built))
+    ? await changedFileNames(integrated, job.base, 'HEAD', { includeRenameSources: true }) : null;
+  await reserveFiles(job, signal, priorFiles ?? []);
+
+  if (resumeTip && !built) {
     addEvent(job, 'ทำต่อ', 'ใช้ผล Backend และ Frontend จาก branch ' + job.resumeBranch + ' แล้วไปขั้นทดสอบและรีวิวต่อ');
     for (const role of job.single ? ['backend'] : ['backend', 'frontend']) {
       if (isNoWorkRole(job.plan, role)) skipRole(job, role, NO_WORK_NOTE);
@@ -892,6 +976,7 @@ async function work(job, signal) {
 }
 
 async function fixReviewFindings(job, cwd, tracked, signal, request) {
+  workers.get(job.id).checking = false;
   const open = request ? request.findings : job.review.findings;
   const note = request?.note || '';
   const findings = open.length ? open.map(item => typeof item === 'string'
@@ -920,6 +1005,8 @@ async function fixReviewFindings(job, cwd, tracked, signal, request) {
 }
 
 async function reviewIntegrated(job, cwd, signal, request) {
+  workers.get(job.id).checking = true;
+  setImmediate(drain);
   job.checks = await verify(job, cwd, signal);
   const diff = await git(cwd, 'diff', '--no-ext-diff', job.base, 'HEAD', '--');
   const review = await call(job, 'review', cwd,
@@ -1362,33 +1449,134 @@ async function build(job, signal, workRoot, integrated, tracked) {
   finishStage(job, 'integrate', 'done', { changedFiles });
 }
 
+const fileKey = name => name.replaceAll('\\', '/').replace(/^\.\//, '').replace(/\/$/, '').toLowerCase();
+const pathsOverlap = (a, b) => a === b || a.startsWith(b + '/') || b.startsWith(a + '/');
+
+function plannedFiles(job) {
+  const files = new Set();
+  for (const role of ['backend', 'frontend']) {
+    const listed = job.plan?.[role + 'Files'];
+    const subtasks = job.plan?.[role + 'Tasks'];
+    const names = [
+      ...(Array.isArray(listed) ? listed : []),
+      ...(Array.isArray(subtasks) ? subtasks.flatMap(task => Array.isArray(task?.files) ? task.files : []) : [])
+    ];
+    for (const file of names) {
+      if (typeof file !== 'string') continue;
+      const key = fileKey(file);
+      if (isSafePath(key)) files.add(key);
+    }
+  }
+  for (const file of job.changedFiles ?? []) files.add(fileKey(file));
+  return files;
+}
+
+function fileConflict(job, files, unknown = files.size === 0) {
+  for (const other of workers.values()) {
+    if (other.job === job || !other.reserved || !sameFolder(other.job.repo, job.repo)) continue;
+    const reserved = [...other.files];
+    const overlapping = [...files].filter(file => reserved.some(name => pathsOverlap(file, name)));
+    if (unknown || other.unknownFiles || overlapping.length) {
+      return { waitReason: 'file_conflict', conflictingJobId: other.job.id, conflictingFiles: overlapping };
+    }
+  }
+  return null;
+}
+
+async function reserveFiles(job, signal, priorFiles) {
+  signal.throwIfAborted();
+  const worker = workers.get(job.id);
+  worker.files = plannedFiles(job);
+  // Without any planned names, the job needs exclusive access until delivery.
+  worker.unknownFiles = worker.files.size === 0;
+  for (const file of priorFiles) worker.files.add(fileKey(file));
+  const conflict = fileConflict(job, worker.files, worker.unknownFiles);
+  if (!conflict) {
+    worker.reserved = true;
+    return;
+  }
+
+  // Keep the prepared worktree and approved plan. A parked job releases its execution slot.
+  const since = Date.now();
+  await new Promise((resolve, reject) => {
+    const abort = () => reject(signal.reason);
+    worker.resume = () => {
+      signal.removeEventListener('abort', abort);
+      job.waitedMs = (job.waitedMs || 0) + Date.now() - since;
+      resolve();
+    };
+    signal.addEventListener('abort', abort, { once: true });
+    job.resuming = true;
+    job.status = 'queued';
+    queueWaits.set(job.id, conflict);
+    save();
+    setImmediate(drain);
+  });
+  signal.throwIfAborted();
+}
+
 function stopJob(job, reason) {
   job.status = 'stopping';
+  queueWaits.delete(job.id);
   closeJobStages(job, 'cancelled');
-  active.controller.abort(reason);
+  workers.get(job.id).controller.abort(reason);
   save();
 }
 
-async function drain() {
-  if (active || isRestarting()) return;
-  const job = state.jobs.find(item => item.status === 'queued');
-  if (!job) return;
-  active = { id: job.id, controller: new AbortController() };
+async function runJob(job) {
+  const worker = { job, controller: new AbortController() };
+  workers.set(job.id, worker);
   job.status = 'running';
   job.startedAt = Date.now();
   save();
-  try { await work(job, active.controller.signal); }
+  const { signal } = worker.controller;
+  try { await work(job, signal); }
   catch (error) {
     if (job.worktree) job.diffStat = await readDiffStat(job.worktree, job.base, 'HEAD');
-    job.status = active.controller.signal.aborted || error.userRejected ? 'cancelled' : 'failed';
+    job.status = signal.aborted || error.userRejected ? 'cancelled' : 'failed';
     job.error = error.message.slice(0, 1800);
     closeJobStages(job, job.status);
   } finally {
     job.finishedAt = Date.now();
+    workers.delete(job.id);
+    queueWaits.delete(job.id);
     save();
-    active = null;
     setImmediate(drain);
   }
+}
+
+async function drain() {
+  if (isRestarting()) return;
+  const { maxJobs, planAhead } = state.settings.concurrency;
+  let running = activeJobIds().length;
+  const checking = [...workers.values()].some(worker => worker.checking && worker.job.status !== 'stopping');
+  const started = [];
+  for (const job of state.jobs) {
+    if (job.status !== 'queued') continue;
+    const worker = workers.get(job.id);
+    const files = worker?.files ?? (job.plan && plannedFiles(job));
+    const conflict = files && fileConflict(job, files, worker?.unknownFiles);
+    if (conflict) {
+      queueWaits.set(job.id, conflict);
+      continue;
+    }
+    if (running >= maxJobs || (!job.plan && running && !(planAhead && checking))) {
+      queueWaits.set(job.id, { waitReason: 'max_concurrency' });
+      continue;
+    }
+    queueWaits.delete(job.id);
+    running++;
+    if (worker) {
+      const resume = worker.resume;
+      worker.resume = null;
+      worker.reserved = true;
+      job.status = 'running';
+      resume();
+      save();
+    } else started.push(runJob(job));
+  }
+  monitor.publish();
+  await Promise.all(started);
 }
 
 function readRoutes(routes) {
@@ -1452,6 +1640,7 @@ function readSettings(input) {
     agentEdits: input.agentEdits ?? true, approvals: { afterPlan: approvals.afterPlan },
     routing: { mode: routing.mode, profile: routing.profile, minSamples: routing.minSamples },
     team, selfUpdate: normalizeSelfUpdateSettings(input.selfUpdate ?? state.settings.selfUpdate),
+    concurrency: readConcurrencySettings(input.concurrency, state.settings.concurrency),
     models: Object.hasOwn(input, 'models') ? readModels(input.models) : state.settings.models,
     budget: { perJobUsd: budget.perJobUsd, dailyUsd: budget.dailyUsd, countSubscription: budget.countSubscription } };
 }
@@ -1510,11 +1699,18 @@ app.post(restartPath + '/cancel', (_req, res) => {
   res.json({ ok: true, ...restartPayload(restart) });
 });
 app.get('/api/state', (_req, res) => res.json({
-  ...state, jobs: state.jobs.map(publicJob), usage: undefined, quotas: publicQuotas(), ...restartPayload()
+  ...state, jobs: state.jobs.map(publicJob), activeJobs: activeJobIds().map(id => publicJob(workers.get(id).job)),
+  usage: undefined, quotas: publicQuotas(), ...restartPayload()
 }));
 app.get('/api/models', async (_req, res) => res.set('Cache-Control', 'no-store').json(await listModels(root)));
 app.post('/api/quota/refresh', async (_req, res) => { await Promise.all([refreshCodex(root), refreshClaudeCode(root)]); res.json(publicQuotas()); });
-app.put('/api/settings', (req, res) => { state.settings = readSettings(req.body); save(); res.json(state.settings); });
+app.put('/api/settings', (req, res) => {
+  state.settings = readSettings(req.body);
+  for (const provider of Object.keys(names)) dispatchProvider(provider);
+  save();
+  setImmediate(drain);
+  res.json(state.settings);
+});
 app.post('/api/jobs', async (req, res) => {
   const { title, prompt, repo, runChecks, routes, fromJob, type, approvals, cardFrom } = req.body || {};
   // Re-running or resuming a Task Card job keeps what the card asked for: file scope, command checks, AI preferences,
@@ -1562,6 +1758,7 @@ app.get('/api/jobs/:id/summary', async (req, res) => {
   res.json({ id: job.id, title: job.title, status: job.status, error: job.error || null, repo: job.repo, branch: job.worktree || job.branchKept ? job.branch : null, merged: job.merged || null,
     mergeCommand: (job.worktree || job.branchKept) && !job.merged ? `git -C "${job.repo}" merge ${job.branch}` : null,
     type: job.type || 'feature', approval: job.approval || null, plan: job.plan || null, scope: job.scope || null, budgetUsd: job.budgetUsd ?? null,
+    ...jobWait(job),
     stages: job.stages || {}, card: job.card ?? null, review: job.review || null,
     ...reviewDetails(job), manualChecks: job.manualChecks ?? {}, acceptance: evaluateAcceptance(job),
     checks: (job.checks || []).map(item => ({ label: item.label, code: item.code, output: String(item.output ?? '').slice(-1500) })),
@@ -1585,7 +1782,7 @@ app.patch('/api/jobs/:id/acceptance', finishBeforeRestart((req, res) => {
   save();
   res.json({ ok: true, id: job.id, manualChecks: job.manualChecks, acceptance: evaluateAcceptance(job) });
 }));
-app.post('/api/jobs/:id/approve', (req, res) => {
+app.post('/api/jobs/:id/approve', async (req, res) => {
   const job = state.jobs.find(item => item.id === req.params.id);
   const approval = job?.approval;
   const resolve = job && approvals.get(job.id)?.resolve;
@@ -1602,7 +1799,9 @@ app.post('/api/jobs/:id/approve', (req, res) => {
   if (decision === 'revise' && !text) throw Error('บอกด้วยว่าต้องการให้แก้แผนตรงไหน');
   approvals.delete(job.id);
   resolve({ decision, note: text });
-  res.json({ ok: true });
+  // Let the approval gate publish the job's current state before replying.
+  await Promise.resolve();
+  res.json({ ok: true, id: job.id, status: job.status });
 });
 // One more fix round on a finished job's own branch: the open review findings plus the user's note, then test and review again.
 app.post('/api/jobs/:id/fix', async (req, res) => {
@@ -1843,7 +2042,7 @@ function reviewDetails(job) {
 }
 
 function publicJob({ monitor: _monitor, lastReviewedRound: _lastReviewedRound, ...job }) {
-  return { ...job, ...reviewDetails(job), manualChecks: job.manualChecks ?? {} };
+  return { ...job, ...reviewDetails(job), ...jobWait(job), manualChecks: job.manualChecks ?? {} };
 }
 
 const findJob = id => state.jobs.find(item => item.id === id);
@@ -1955,7 +2154,7 @@ async function rebuildSelf(job, from, to) {
   if (dependencies) addEvent(job, 'อัปเดต Relay', 'งานนี้แก้ package.json ต้องรัน npm install ใน ' + root + ' ก่อน build หรือรีสตาร์ท');
   return { ...result, at: Date.now() };
 }
-const busy = job => ['queued', 'running', 'stopping', 'waiting_approval'].includes(job.status);
+const busy = job => workers.has(job.id) || ['queued', 'running', 'stopping', 'waiting_approval'].includes(job.status);
 async function cleanup(job, deleteBranch) {
   // Remove every folder for this job (including role worktrees left by a failed removal), then let git forget them.
   const jobRoot = path.join(dataDir, 'worktrees', job.id);
@@ -1994,12 +2193,14 @@ app.delete('/api/jobs/:id', finishBeforeRestart(async (req, res) => {
 app.post('/api/jobs/:id/cancel', (req, res) => {
   const job = state.jobs.find(item => item.id === req.params.id);
   if (!job || !['queued', 'running', 'waiting_approval'].includes(job.status)) return res.status(409).json({ error: 'งานนี้หยุดไม่ได้แล้ว' });
-  if (active?.id === job.id) stopJob(job, Error('ผู้ใช้หยุดงาน'));
+  if (workers.has(job.id)) stopJob(job, Error('ผู้ใช้หยุดงาน'));
   else {
     job.status = 'cancelled';
     job.finishedAt = Date.now();
+    queueWaits.delete(job.id);
     closeJobStages(job, 'cancelled');
     save();
+    setImmediate(drain);
   }
   res.json(publicJob(job));
 });

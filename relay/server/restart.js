@@ -20,8 +20,8 @@ export function shouldAutoRestart(selfUpdate, settings) {
 
 const busyStatuses = new Set(['queued', 'running', 'stopping', 'waiting_approval']);
 
-export function busyJobs(jobs = []) {
-  return jobs.filter(job => busyStatuses.has(job.status))
+export function busyJobs(jobs = [], workers) {
+  return jobs.filter(job => busyStatuses.has(job.status) || workers?.has(job.id))
     .map(({ id, title, status }) => ({ id, title, status }));
 }
 
@@ -127,7 +127,7 @@ const idle = { status: 'idle', source: null, reason: null, requestedAt: null, er
 const errorMessage = error => error?.message || String(error);
 
 export function createRestartController({
-  getJobs, closeServer, reopenServer,
+  getJobs, getWorkers, closeServer, reopenServer,
   checkSyntax = checkRelaySyntax, spawnProcess = spawnRelay,
   writeMarker = marker => writeFile(marker, '', { flag: 'wx' }), exit = code => process.exit(code),
   supervised = process.env.RELAY_SUPERVISED === '1', markerPath = process.env.RELAY_RESTART_MARKER,
@@ -139,7 +139,9 @@ export function createRestartController({
   let pendingWrites = 0;
   let writeRevision = 0;
 
-  function getState(jobs = busyJobs(getJobs())) {
+  const currentBusyJobs = () => busyJobs(getJobs(), getWorkers?.());
+
+  function getState(jobs = currentBusyJobs()) {
     return { ...state, busyCount: jobs.length, busyJobs: jobs };
   }
 
@@ -167,7 +169,7 @@ export function createRestartController({
   async function finishRestart(pending) {
     await delay(flushMs);
     // A request already in flight can finish adding a job during the HTTP response flush.
-    const jobs = busyJobs(getJobs());
+    const jobs = currentBusyJobs();
     if (jobs.length || pendingWrites) {
       waitForJobs(pending, jobs);
       return;
@@ -207,7 +209,7 @@ export function createRestartController({
   async function preflight(pending) {
     try {
       while (request === pending) {
-        const jobs = busyJobs(getJobs());
+        const jobs = currentBusyJobs();
         if (jobs.length || pendingWrites) return waitForJobs(pending, jobs);
         const checkedRevision = writeRevision;
         let failure;
@@ -220,7 +222,7 @@ export function createRestartController({
         if (request !== pending) break;
         // A merge admitted during the check can change files the check has already read.
         if (writeRevision !== checkedRevision) continue;
-        const remaining = busyJobs(getJobs());
+        const remaining = currentBusyJobs();
         if (remaining.length) return waitForJobs(pending, remaining);
         if (failure) return fail(pending, failure);
         const snapshot = publish({ ...pending.details, status: 'restarting', error: null }, remaining);
@@ -236,7 +238,7 @@ export function createRestartController({
   async function onJobsChanged() {
     const pending = request;
     if (!pending || state.status === 'restarting') return getState();
-    const jobs = busyJobs(getJobs());
+    const jobs = currentBusyJobs();
     if (jobs.length || pendingWrites) return waitForJobs(pending, jobs);
     pending.preflight ??= Promise.resolve().then(() => preflight(pending));
     return pending.preflight;

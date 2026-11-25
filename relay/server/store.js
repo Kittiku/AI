@@ -5,6 +5,38 @@ import { DatabaseSync } from 'node:sqlite';
 import { existsSync, readFileSync, renameSync } from 'node:fs';
 import path from 'node:path';
 
+export const defaultConcurrencySettings = Object.freeze({
+  maxJobs: 1, planAhead: true, perProvider: Object.freeze({})
+});
+
+const providerIds = ['claudecode', 'codex', 'gemini'];
+const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+const validMaxJobs = value => Number.isInteger(value) && value >= 1 && value <= 4;
+const validProviderLimit = value => Number.isSafeInteger(value) && value >= 1;
+
+// Old or malformed stored settings are normalized field by field. Missing provider limits are unlimited.
+export function normalizeConcurrencySettings(settings) {
+  return {
+    maxJobs: validMaxJobs(settings?.maxJobs) ? settings.maxJobs : defaultConcurrencySettings.maxJobs,
+    planAhead: typeof settings?.planAhead === 'boolean' ? settings.planAhead : defaultConcurrencySettings.planAhead,
+    perProvider: Object.fromEntries(providerIds.filter(id => validProviderLimit(settings?.perProvider?.[id]))
+      .map(id => [id, settings.perProvider[id]]))
+  };
+}
+
+export function readConcurrencySettings(input, previous) {
+  if (input === undefined) return normalizeConcurrencySettings(previous);
+  if (!object(input)) throw Error('settings.concurrency ต้องเป็นออบเจ็กต์');
+  const { maxJobs, planAhead, perProvider } = input;
+  if (Object.hasOwn(input, 'maxJobs') && !validMaxJobs(maxJobs)) throw Error('maxJobs ต้องเป็นจำนวนเต็มระหว่าง 1 ถึง 4');
+  if (Object.hasOwn(input, 'planAhead') && typeof planAhead !== 'boolean') throw Error('planAhead ต้องเป็น true หรือ false');
+  if (Object.hasOwn(input, 'perProvider') && (!object(perProvider) ||
+      Object.entries(perProvider).some(([id, value]) => !providerIds.includes(id) || !validProviderLimit(value)))) {
+    throw Error('perProvider ต้องระบุชื่อ AI ที่รองรับและเพดานเป็นจำนวนเต็มบวก');
+  }
+  return normalizeConcurrencySettings({ ...previous, ...input });
+}
+
 export function openStore(dataDir) {
   const db = new DatabaseSync(path.join(dataDir, 'relay.db'));
   db.exec(`

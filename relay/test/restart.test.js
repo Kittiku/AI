@@ -125,6 +125,19 @@ test('all four busy statuses hold the request until the last job finishes', { ti
   assert.deepEqual(calls, ['check', 'close', 'spawn', 'unref', ['exit', 0]]);
 });
 
+test('restart waits for every worker to release its slot even after terminal statuses are set', async () => {
+  const workers = new Map([['complete', {}], ['cancelled', {}]]);
+  const { controller, jobs, calls, finished } = setup({ getWorkers: () => workers });
+  jobs.push(job('complete'), job('cancelled'));
+  assert.equal((await controller.requestRestart()).busyCount, 2);
+  workers.delete('complete');
+  assert.equal((await controller.onJobsChanged()).busyCount, 1);
+  assert.deepEqual(calls, []);
+  workers.delete('cancelled');
+  assert.equal((await controller.onJobsChanged()).status, 'restarting');
+  await finished;
+});
+
 test('cancelling a waiting restart clears its request even after the jobs finish', async () => {
   const { controller, jobs, calls } = setup();
   jobs.push(job('queued'));

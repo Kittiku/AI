@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { registerHooks } from 'node:module';
 import { after, before, test } from 'node:test';
+import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { evaluateAcceptance } from '../server/cards.js';
 
@@ -19,8 +20,8 @@ export const refreshClaudeCode = async () => {}, refreshCodex = async () => {};
 export const listModels = () => { throw Error('Unexpected model listing'); };
 export const quota = () => Object.fromEntries(Object.keys(names).map(id => [id, { ready: true, windows: [] }]));
 export const mock = {};
-export async function generate(provider, _cwd, prompt, kind, _signal, onUsage, { context }) {
-  const result = await mock.respond({ provider, prompt, kind, context: JSON.parse(context) });
+export async function generate(provider, _cwd, prompt, kind, signal, onUsage, { context }) {
+  const result = await mock.respond({ provider, prompt, kind, signal, context: JSON.parse(context) });
   onUsage();
   return structuredClone(result);
 }
@@ -54,12 +55,12 @@ export async function git(_cwd, cmd, ...args) {
     return 'the patch';
   }
   if (cmd === 'rev-parse') return args.includes('--abbrev-ref') ? 'main' : 'tip';
-  if (cmd === 'check-ignore' || cmd === 'worktree' || cmd === '-c') return '';
+  if (cmd === 'check-ignore' || cmd === 'worktree' || cmd === '-c' || cmd === 'reset') return '';
   throw Error('Unexpected git command: ' + cmd);
 }
 `);
 const fsUrl = inline("export * from 'node:fs'; export const mkdirSync = () => {}, existsSync = () => false, readdirSync = () => [];");
-const sqliteUrl = inline("import { DatabaseSync as SQLite } from 'node:sqlite'; export class DatabaseSync extends SQLite { constructor() { super(':memory:'); } }");
+const sqliteUrl = inline("import { DatabaseSync as SQLite } from 'node:sqlite'; let db; export function DatabaseSync() { return db ??= new SQLite(':memory:'); }");
 
 let server;
 let routes;
@@ -82,7 +83,7 @@ before(async () => {
     load(url, context, nextLoad) {
       const loaded = nextLoad(url, context);
       if (url !== indexUrl) return loaded;
-      return { ...loaded, source: loaded.source.toString() + '\nexport { defaults, drain, save, state, store, serverReady };' };
+      return { ...loaded, source: loaded.source.toString() + '\nexport { defaults, drain, initializeState, save, state, store, serverReady };' };
     }
   });
   try {
@@ -105,6 +106,7 @@ after(() => server?.store?.close());
 async function request(method, route, body, id) {
   const res = {
     statusCode: 200,
+    set() { return this; },
     status(code) { this.statusCode = code; return this; },
     json(payload) { this.body = JSON.parse(JSON.stringify(payload)); return this; }
   };
@@ -405,4 +407,256 @@ test('PATCH acceptance rejects unknown jobs, invalid indices, non-manual criteri
   }
   assert.deepEqual((await request('GET', '/api/jobs/:id/summary', undefined, id)).body.manualChecks, {});
   assert.equal(server.store.load().jobs.find(job => job.id === id).manualChecks, undefined);
+});
+
+async function queueJob(title) {
+  const response = await request('POST', '/api/jobs', { title, prompt: title, repo, type: 'bugfix' });
+  assert.equal(response.statusCode, 201, response.body.error);
+  return response.body.id;
+}
+
+const jobsPath = '/api/jobs/:id/cancel';
+const currentJob = id => server.state.jobs.find(job => job.id === id);
+const distinctPlan = file => ({ ...plan, backendFiles: [file] });
+const noChange = { status: 'no_work', summary: 'No edits needed', files: [], edits: [] };
+const jobName = prompt => prompt.split('\nUSER TASK\n').at(-1);
+
+function hold() {
+  const { promise, resolve } = Promise.withResolvers();
+  return {
+    release: resolve,
+    async wait(signal) {
+      signal.throwIfAborted();
+      const stopped = Promise.withResolvers();
+      const abort = () => stopped.reject(signal.reason);
+      signal.addEventListener('abort', abort, { once: true });
+      try { await Promise.race([promise, stopped.promise]); }
+      finally { signal.removeEventListener('abort', abort); }
+    }
+  };
+}
+
+async function until(check, message) {
+  const deadline = Date.now() + 2500;
+  do {
+    const value = await check();
+    if (value) return value;
+    await delay(5);
+  } while (Date.now() < deadline);
+  assert.fail(message);
+}
+
+async function waitForJob(id, status) {
+  return until(() => {
+    const job = currentJob(id);
+    if (job.status === status) return job;
+    assert.ok(!job.finishedAt, job.id + ' finished with ' + job.status + ': ' + (job.error ?? ''));
+    return false;
+  }, id + ' did not reach ' + status);
+}
+
+test('plans during review, lets disjoint jobs overlap, and waits on overlapping files until the owner stops', async t => {
+  const previous = server.state.settings.concurrency;
+  server.state.settings.concurrency = { ...previous, maxJobs: 2 };
+  const review = hold();
+  const edit = hold();
+  const entered = new Map();
+  t.after(() => {
+    review.release();
+    edit.release();
+    server.state.settings.concurrency = previous;
+  });
+  mock.respond = async ({ kind, prompt, signal }) => {
+    const name = jobName(prompt);
+    entered.set(name + '/' + kind, signal);
+    if (kind === 'plan') {
+      return distinctPlan({ owner: 'src/shared.txt', overlap: './SRC\\shared.txt', disjoint: 'src/other.txt' }[name]);
+    }
+    if (kind === 'review' && name === 'owner') await review.wait(signal);
+    if (kind === 'edit' && name === 'disjoint') await edit.wait(signal);
+    return kind === 'review' ? pass : noChange;
+  };
+
+  const owner = await queueJob('owner');
+  await until(() => entered.has('owner/review'), 'owner did not reach review');
+  const overlap = await queueJob('overlap');
+  const disjoint = await queueJob('disjoint');
+  await until(() => entered.has('disjoint/edit'), 'disjoint job did not reach implementation while owner was reviewing');
+  const { body: state } = await request('GET', '/api/state');
+  const { body: monitor } = await request('GET', '/api/monitor');
+  for (const activeJobs of [state.activeJobs, monitor.activeJobs]) {
+    assert.deepEqual(activeJobs.map(job => job.id), [owner, disjoint]);
+  }
+  for (const jobs of [state.jobs, monitor.queuedJobs]) {
+    const parked = jobs.find(job => job.id === overlap);
+    assert.equal(parked.status, 'queued');
+    assert.equal(parked.waitReason, 'file_conflict');
+    assert.equal(parked.conflictingJobId, owner);
+    assert.deepEqual(parked.conflictingFiles, ['src/shared.txt']);
+  }
+  assert.ok(entered.has('overlap/plan'));
+  assert.equal(entered.has('overlap/edit'), false);
+  assert.equal((await request('POST', jobsPath, {}, owner)).body.status, 'stopping');
+  await waitForJob(owner, 'cancelled');
+  await waitForJob(overlap, 'complete');
+  assert.equal(entered.get('disjoint/edit').aborted, false);
+  assert.equal(currentJob(disjoint).status, 'running');
+  edit.release();
+  await waitForJob(disjoint, 'complete');
+});
+
+test('two jobs with disjoint approved plans can both implement up to maxJobs', async t => {
+  const previous = server.state.settings.concurrency;
+  server.state.settings.concurrency = { ...previous, maxJobs: 2, planAhead: false };
+  const edit = hold();
+  t.after(() => {
+    edit.release();
+    server.state.settings.concurrency = previous;
+  });
+  const editing = new Set();
+  mock.respond = async ({ kind, prompt, signal }) => {
+    if (kind === 'review') return pass;
+    assert.equal(kind, 'edit');
+    const name = jobName(prompt);
+    editing.add(name);
+    await edit.wait(signal);
+    return { ...change, files: [{ path: name + '.txt', content: name }] };
+  };
+  const a = await queueJob('writer-a');
+  currentJob(a).plan = distinctPlan('writer-a.txt');
+  const b = await queueJob('writer-b');
+  currentJob(b).plan = distinctPlan('writer-b.txt');
+  await until(() => editing.size === 2, 'both jobs did not reach implementation');
+  assert.equal(currentJob(a).stages.backend.status, 'running');
+  assert.equal(currentJob(b).stages.backend.status, 'running');
+  edit.release();
+  await Promise.all([waitForJob(a, 'complete'), waitForJob(b, 'complete')]);
+});
+
+test('default concurrency keeps the next job from even planning until the running job finishes', async t => {
+  assert.equal(server.state.settings.concurrency.maxJobs, 1);
+  const review = hold();
+  t.after(review.release);
+  const phases = [];
+  mock.respond = async ({ kind, prompt, signal }) => {
+    const name = jobName(prompt);
+    phases.push(name + '/' + kind);
+    if (kind === 'review' && name === 'serial-first') await review.wait(signal);
+    return kind === 'plan' ? distinctPlan(name + '.txt') : kind === 'review' ? pass : noChange;
+  };
+  const first = await queueJob('serial-first');
+  await until(() => phases.includes('serial-first/review'), 'first job did not reach review');
+  const next = await queueJob('serial-next');
+  await until(async () => (await request('GET', '/api/state')).body.jobs
+    .some(job => job.id === next && job.waitReason === 'max_concurrency'), 'next job did not report the cap');
+  assert.equal(phases.includes('serial-next/plan'), false);
+  assert.equal(currentJob(first).status, 'running');
+  review.release();
+  await waitForJob(next, 'complete');
+  assert.equal(currentJob(first).status, 'complete');
+});
+
+test('a provider cap queues the chosen AI and cancelling its waiter does not stop the running call', async t => {
+  const previous = server.state.settings;
+  const updated = structuredClone(previous);
+  updated.concurrency = { ...updated.concurrency, maxJobs: 2, perProvider: { claudecode: 1 } };
+  updated.routes.review = ['claudecode', 'codex'];
+  assert.deepEqual((await request('PUT', '/api/settings', updated)).body.concurrency, updated.concurrency);
+  const review = hold();
+  t.after(() => {
+    review.release();
+    server.state.settings = previous;
+  });
+  let ownerSignal;
+  const calls = [];
+  mock.respond = async ({ kind, prompt, provider, signal }) => {
+    const name = jobName(prompt);
+    calls.push([name, kind, provider]);
+    if (name === 'provider-owner' && kind === 'review') {
+      ownerSignal = signal;
+      await review.wait(signal);
+    }
+    return kind === 'plan' ? distinctPlan(name + '.txt') : kind === 'review' ? pass : noChange;
+  };
+  const first = await queueJob('provider-owner');
+  await until(() => ownerSignal, 'provider owner did not reach review');
+  const second = await queueJob('provider-waiter');
+  await until(async () => (await request('GET', '/api/state')).body.activeJobs
+    .some(job => job.id === second && job.waitReason === 'provider_limit' && job.waitingProvider === 'claudecode'),
+  'provider wait reason did not appear');
+  assert.equal(calls.some(([name]) => name === 'provider-waiter'), false);
+  assert.equal((await request('POST', jobsPath, {}, second)).body.status, 'stopping');
+  await waitForJob(second, 'cancelled');
+  assert.equal(ownerSignal.aborted, false);
+
+  const third = await queueJob('provider-next');
+  await until(async () => (await request('GET', '/api/monitor')).body.activeJobs
+    .some(job => job.id === third && job.waitReason === 'provider_limit'), 'next call did not wait for the same AI');
+  review.release();
+  await waitForJob(first, 'complete');
+  await waitForJob(third, 'complete');
+  assert.deepEqual(calls.find(([name]) => name === 'provider-next'), ['provider-next', 'plan', 'claudecode']);
+});
+
+test('settings validate concurrency and preserve it for clients that omit the field', async t => {
+  const previous = server.state.settings;
+  t.after(() => { server.state.settings = previous; });
+  const settings = structuredClone(previous);
+  settings.concurrency = { maxJobs: 4, planAhead: false, perProvider: { codex: 2 } };
+  assert.deepEqual((await request('PUT', '/api/settings', settings)).body.concurrency, settings.concurrency);
+  assert.deepEqual(server.store.load().settings.concurrency, settings.concurrency);
+  const { concurrency, ...legacy } = settings;
+  assert.deepEqual((await request('PUT', '/api/settings', legacy)).body.concurrency, concurrency);
+  for (const invalid of [null, { maxJobs: 0 }, { maxJobs: 5 }, { maxJobs: 1.5 }, { planAhead: 'true' },
+    { perProvider: null }, { perProvider: { codex: 0 } }, { perProvider: { unknown: 1 } }]) {
+    await assert.rejects(request('PUT', '/api/settings', { ...legacy, concurrency: invalid }));
+  }
+  assert.deepEqual(server.store.load().settings.concurrency, concurrency);
+});
+
+test('startup recovers each persisted running or parked job and keeps an interrupted stop cancelled', async () => {
+  const previous = structuredClone(server.state.settings);
+  const savedJobs = [
+    ['recovery-running', 'running'],
+    ['recovery-approval', 'waiting_approval'],
+    ['recovery-parked', 'queued'],
+    ['recovery-stopping', 'stopping']
+  ].map(([id, status]) => ({
+    id, status, repo, base: 'base', branch: 'relay/' + id, title: id, prompt: id,
+    plan: distinctPlan(id + '.txt'), events: [], settings: structuredClone(previous), single: true,
+    resuming: status === 'queued',
+    ...(status === 'waiting_approval' ? { approvalGates: ['after_plan'], approval: { kind: 'plan', requestedAt: 1 } } : {}),
+    createdAt: Date.now()
+  }));
+  delete server.state.settings.concurrency;
+  for (const job of savedJobs) delete job.settings.concurrency;
+  server.state.jobs.push(...savedJobs);
+  server.save();
+  for (const job of savedJobs.slice(0, 2)) {
+    server.store.startStep({ jobId: job.id, role: 'plan', provider: 'claudecode' });
+  }
+
+  server.initializeState();
+  assert.deepEqual(server.state.settings.concurrency, { maxJobs: 1, planAhead: true, perProvider: {} });
+  assert.deepEqual(server.store.load().settings.concurrency, server.state.settings.concurrency);
+  for (const { id } of savedJobs.slice(0, 2)) {
+    const job = currentJob(id);
+    assert.equal(job.status, 'queued');
+    assert.equal(job.resuming, true);
+    assert.equal(job.restarts, 1);
+    assert.ok(!job.approval);
+    assert.equal(server.store.steps(id).at(-1).status, 'interrupted');
+  }
+  assert.equal(currentJob('recovery-parked').restarts, undefined);
+  assert.equal(currentJob('recovery-stopping').status, 'cancelled');
+  mock.respond = ({ kind }) => {
+    assert.notEqual(kind, 'plan', 'recovered jobs must reuse existing plans');
+    return kind === 'review' ? pass : noChange;
+  };
+  await server.drain();
+  const pending = await waitForJob('recovery-approval', 'waiting_approval');
+  assert.notEqual(pending.approval.requestedAt, 1);
+  const approved = await request('POST', '/api/jobs/:id/approve', { decision: 'approve' }, pending.id);
+  assert.deepEqual(approved.body, { ok: true, id: pending.id, status: 'running' });
+  for (const { id } of savedJobs.slice(0, 3)) await waitForJob(id, 'complete');
 });
