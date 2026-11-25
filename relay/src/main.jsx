@@ -750,16 +750,103 @@ function MonitorRoleFiles({ stage }) {
   </>;
 }
 
-function MonitorActivityList({ job, expanded }) {
+const roundLimit = 5;
+const roundLabel = round => round > 1 ? 'รอบแก้ ' + (round - 1) : 'รอบแรก';
+const endCodes = new Set(['completed', 'failed', 'cancelled']);
+
+// Activities arrive newest first. Build one line per stage: a start and its finish become a single line,
+// and repeated events (same stage, time and AI) are dropped.
+function timelineLines(activities) {
+  const seen = new Set();
+  const lines = [];
+  const open = new Map();
+  const ordered = [...activities].sort((a, b) => a.at - b.at);
+  for (const activity of ordered) {
+    const sig = [activity.stageKey, activity.at, activity.provider, activity.code].join('|');
+    if (seen.has(sig)) continue;
+    seen.add(sig);
+    if (activity.code === 'started') {
+      const line = { id: activity.id, stageKey: activity.stageKey, at: activity.at, endedAt: null,
+        provider: activity.provider, model: activity.model ?? null, code: 'started' };
+      lines.push(line);
+      open.set(activity.stageKey, line);
+    } else if (endCodes.has(activity.code) && open.has(activity.stageKey)) {
+      const line = open.get(activity.stageKey);
+      open.delete(activity.stageKey);
+      line.endedAt = activity.at;
+      line.code = activity.code;
+      line.provider = activity.provider ?? line.provider;
+      line.model = activity.model ?? line.model;
+    } else {
+      lines.push({ id: activity.id, stageKey: activity.stageKey, at: activity.at, endedAt: null,
+        provider: activity.provider, model: activity.model ?? null, code: activity.code });
+    }
+  }
+  return lines.reverse();
+}
+
+function groupRounds(activities, history) {
+  const map = new Map();
+  const entry = round => {
+    if (!map.has(round)) map.set(round, { round, activities: [], info: null });
+    return map.get(round);
+  };
+  for (const item of Array.isArray(history) ? history : []) {
+    if (Number.isInteger(item?.round) && item.round >= 1) entry(item.round).info = item;
+  }
+  for (const activity of activities) {
+    entry(Number.isInteger(activity.round) && activity.round >= 1 ? activity.round : 1).activities.push(activity);
+  }
+  return [...map.values()].sort((a, b) => b.round - a.round)
+    .map(group => ({ ...group, lines: timelineLines(group.activities) }));
+}
+
+function RoundSection({ group, current, single }) {
+  const [all, setAll] = useState(false);
+  const { round, lines, info } = group;
+  const shown = all ? lines : lines.slice(0, roundLimit);
+  const startedAt = info?.startedAt ?? lines.at(-1)?.at;
+  const endedAt = info?.endedAt ?? (current ? null : lines[0]?.endedAt ?? lines[0]?.at);
+  const status = info?.status ? statusLabels[info.status] || stageStatus[info.status] || info.status : current ? 'กำลังดำเนินการ' : 'จบแล้ว';
+  const span = startedAt && endedAt ? duration(endedAt - startedAt) : '';
+  return <details className="round-section" open={current ? true : undefined}>
+    <summary>
+      <strong>{roundLabel(round)}</strong>
+      <span className="round-status">{status}</span>
+      {span ? <span className="round-span">{span}</span> : null}
+      <span className="round-count">{lines.length}</span>
+      {info?.reason ? <span className="round-reason">สาเหตุ: {info.reason}</span> : null}
+    </summary>
+    {lines.length ? <ol className="round-lines">
+      {shown.map(line => {
+        const stage = line.stageKey === 'backend' && single ? 'ลงมือทำ' : monitorStageNames[line.stageKey] || 'งาน';
+        return <li key={line.id} className={'round-line ' + line.code}>
+          <time dateTime={new Date(line.at).toISOString()}>{monitorTime(line.at)}</time>
+          <span className="round-line-main">
+            <strong>{stage}</strong>
+            <span className="round-line-result">{monitorActivities[line.code] || 'อัปเดตสถานะ'}</span>
+          </span>
+          <span className="round-line-meta">
+            {line.provider ? <span>{providerName(line.provider)}</span> : null}
+            {line.model ? <span>{line.model}</span> : null}
+            {line.endedAt ? <span>{duration(line.endedAt - line.at)}</span> : null}
+          </span>
+        </li>;
+      })}
+    </ol> : <p className="muted">ยังไม่มีกิจกรรมในรอบนี้</p>}
+    {lines.length > roundLimit ? <button type="button" className="link small round-more" aria-expanded={all}
+      onClick={() => setAll(value => !value)}>{all ? 'ย่อ' : 'ดูทั้งหมด (' + lines.length + ')'}</button> : null}
+  </details>;
+}
+
+function MonitorActivityList({ job, expanded, rounds }) {
+  const groups = useMemo(() => groupRounds(job.activities, rounds ?? job.roundHistory ?? job.rounds), [job.activities, rounds, job.roundHistory, job.rounds]);
+  const total = groups.reduce((sum, group) => sum + group.lines.length, 0);
   return <details className="monitor-activity-list" open={expanded ? true : undefined}>
-    <summary>กิจกรรมล่าสุด <span>{job.activities.length}</span></summary>
-    <ol className="events">
-      {job.activities.map(activity => <li key={activity.id}>
-        <time dateTime={new Date(activity.at).toISOString()}>{monitorTime(activity.at)}</time>
-        <div><MonitorActivity activity={activity} />
-          <p>{activity.stageKey === 'backend' && job.single ? 'ลงมือทำ' : monitorStageNames[activity.stageKey] || 'งาน'}</p></div>
-      </li>)}
-    </ol>
+    <summary>กิจกรรมแยกตามรอบ <span>{total}</span></summary>
+    <div className="rounds">
+      {groups.map((group, index) => <RoundSection key={group.round} group={group} current={index === 0} single={job.single} />)}
+    </div>
   </details>;
 }
 
@@ -2156,7 +2243,7 @@ function JobDetail({ job, projectName, monitor, relayRestart, approvalRequested,
         <div className="archived-stage-details">
           {archivedStages.length ? <MonitorTimeline job={monitorJob} keys={archivedStages.map(stage => stage.key)} /> : null}
           <TeamTree job={job} team={job.team ?? monitorJob?.team} roleStages={roleStages} archived />
-          {monitorJob?.activities.length ? <MonitorActivityList key={job.id} job={monitorJob} /> : null}
+          {monitorJob?.activities.length ? <MonitorActivityList key={job.id} job={monitorJob} rounds={job.roundHistory ?? job.rounds} /> : null}
         </div>
       </StageStepper>
     </>}
