@@ -1060,20 +1060,26 @@ function Queue({ jobs, activeById, projects = [], filter, setFilter, select, cre
 }
 
 function RouteTable({ routes, onChange, quotas, label }) {
-  return <div className="route-table" aria-label={label}>
-    <strong>บทบาท</strong><strong>ตัวหลัก</strong><strong>ตัวสำรอง</strong>
+  const columns = ['ตัวหลัก', 'ตัวสำรอง'];
+  return <div className="route-table" role="group" aria-label={label}>
+    <div className="route-table-head" aria-hidden="true">
+      <span>บทบาท</span>{columns.map(column => <span key={column}>{column}</span>)}
+    </div>
     {Object.entries(roleNames).map(([role, name]) => {
       const duplicate = routes[role][0] === routes[role][1];
-      return <React.Fragment key={role}>
-        <span>{name}</span>
-        {[0, 1].map(index => <select aria-label={name + (index ? ' ตัวสำรอง' : ' ตัวหลัก')} key={index} value={routes[role][index]}
-          aria-invalid={index === 1 && duplicate} onChange={event => onChange(role, index, event.target.value)}>
-          {index ? <option value="">ไม่มี</option> : null}
-          {Object.entries(providers).map(([id, model]) => <option key={id} value={id}>
-            {model.name}{quotas && !quotas[id]?.ready ? ' (ยังไม่เชื่อมต่อ)' : ''}</option>)}
-        </select>)}
+      return <div className="route-row" key={role}>
+        <strong>{name}</strong>
+        {columns.map((column, index) => <label key={column}>
+          <span aria-hidden="true">{column}</span>
+          <select aria-label={name + ' ' + column} value={routes[role][index]}
+            aria-invalid={index === 1 && duplicate} onChange={event => onChange(role, index, event.target.value)}>
+            {index ? <option value="">ไม่มี</option> : null}
+            {Object.entries(providers).map(([id, model]) => <option key={id} value={id}>
+              {model.name}{quotas && !quotas[id]?.ready ? ' (ยังไม่เชื่อมต่อ)' : ''}</option>)}
+          </select>
+        </label>)}
         {duplicate ? <p className="row-warning">ตัวหลักและตัวสำรองซ้ำกัน เลือกตัวสำรองอื่นหรือ "ไม่มี"</p> : null}
-      </React.Fragment>;
+      </div>;
     })}
   </div>;
 }
@@ -1081,13 +1087,14 @@ const updateRoutes = (routes, role, index, value) => ({ ...routes, [role]: route
 const hasDuplicate = routes => Object.values(routes).some(route => route[0] === route[1]);
 
 function NewJob({ close, created, previous, jobs, projects, settings, quotas }) {
-  const initial = useMemo(() => {
+  const cardRequiresMergeApproval = previous?.card?.approvals?.includes('before_merge') === true;
+  const [form, setForm] = useState(() => {
     const draft = previous?.title ? null : readStorage(draftKey);
     const source = previous?.title ? previous : { ...draft, ...(previous?.repo ? { repo: previous.repo } : {}) };
     return { title: source.title || '', repo: source.repo || '', prompt: source.prompt || '', runChecks: Boolean(source.runChecks),
-      type: source.type || 'feature', approvePlan: Boolean(source.approvalGates?.includes('after_plan') ?? source.approvePlan) };
-  }, [previous]);
-  const [form, setForm] = useState(initial);
+      type: source.type || 'feature', approvePlan: Boolean(source.approvalGates?.includes('after_plan') ?? source.approvePlan),
+      approveMerge: cardRequiresMergeApproval || Boolean(source.approvalGates?.includes('before_merge') ?? source.approveMerge) };
+  });
   const [override, setOverride] = useState(Boolean(previous?.settings) && JSON.stringify(previous.settings.routes) !== JSON.stringify(settings.routes));
   const [routes, setRoutes] = useState(structuredClone(previous?.settings?.routes || settings.routes));
   const [repoInfo, setRepoInfo] = useState(null);
@@ -1127,9 +1134,12 @@ function NewJob({ close, created, previous, jobs, projects, settings, quotas }) 
     setError('');
     try {
       if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission().catch(() => {});
+      const approvals = [];
+      if (form.approvePlan) approvals.push('after_plan');
+      if (form.approveMerge) approvals.push('before_merge');
       const job = mode === 'card' ? await api('/cards', 'POST', { card: { ...card, source: card.source || { kind: 'paste' } } }) :
         await api('/jobs', 'POST', { title: form.title, repo: form.repo, prompt: form.prompt, runChecks: form.runChecks, type: form.type,
-          approvals: form.approvePlan ? ['after_plan'] : [], routes: override ? routes : undefined, fromJob: previous?.id,
+          approvals, routes: override ? routes : undefined, fromJob: previous?.id,
           cardFrom: previous?.card ? previous.cardFrom ?? previous.id : undefined });
       if (!previous?.title) writeStorage(draftKey, null);
       created(job);
@@ -1138,62 +1148,70 @@ function NewJob({ close, created, previous, jobs, projects, settings, quotas }) 
   const limit = previous?.card ? Math.max(20_000, previous.prompt?.length || 0) : promptLimit;
   const canReusePlan = previous?.plan && previous.prompt === form.prompt.trim();
   const resumable = previous?.stages?.backend?.status === 'done' && previous?.stages?.frontend?.status === 'done' && (previous.worktree || previous.branchKept);
-  return <div className="overlay">
-    <form role="dialog" aria-modal="true" aria-labelledby="create-title" className="card dialog" onSubmit={submit}>
+  return <div className="overlay new-job-overlay">
+    <form role="dialog" aria-modal="true" aria-labelledby="create-title" className="card dialog new-job-dialog" onSubmit={submit}>
       <header><h2 id="create-title">{previous?.title ? 'สร้างงานจากโจทย์เดิม' : 'สร้างงาน'}</h2>
         <button title="ปิด" aria-label="ปิด" className="icon-button" type="button" onClick={close} disabled={pending}><X size={22} /></button>
       </header>
-      {previous?.title ? null : <div className="filters" aria-label="วิธีสร้างงาน">
-        <button type="button" aria-pressed={mode === 'form'} onClick={() => { setMode('form'); setError(''); }}>กรอกเอง</button>
-        <button type="button" aria-pressed={mode === 'card'} onClick={() => { setMode('card'); setError(''); }}>วาง Task Card</button>
-      </div>}
-      {mode === 'card' ? <>
-        <label>Task Card (JSON)<textarea className="card-json" required rows={14} value={cardText} spellCheck={false}
-          placeholder={'{\n  "title": "…",\n  "project": "ชื่อโปรเจกต์ใน Relay",\n  "goal": "…",\n  "acceptance": [{ "text": "…", "check": "command", "command": "…" }]\n}'}
-          onChange={event => setCardText(event.target.value)} /></label>
-        <small>วาง Task Card ที่ได้จาก Chat ฟิลด์ที่จำเป็นคือ title, project และ goal ส่วน acceptance แบบ command Relay จะรันเป็นคำสั่งทดสอบให้</small>
-      </> : <>
-      <label>ชื่องาน<input autoFocus required name="title" maxLength={100} placeholder="เพิ่มระบบจองคิว" value={form.title} onChange={event => set('title', event.target.value)} /></label>
-      {projects.length ? <label>โปรเจกต์<select value={chosenProject?.id || ''} onChange={event => {
-        const project = projects.find(item => item.id === event.target.value);
-        set('repo', project ? project.path : '');
-        if (project?.checks?.length) set('runChecks', true);
-      }}>
-        <option value="">พาธอื่น (พิมพ์เอง)</option>
-        {projects.map(project => <option key={project.id} value={project.id}>{project.name}</option>)}
-      </select></label> : null}
-      <label>พาธ Git repo<input required name="repo" maxLength={500} list="recent-repos" placeholder={'D:\\Projects\\my-app'} value={form.repo} onChange={event => set('repo', event.target.value)} /></label>
-      <datalist id="recent-repos">{recentRepos.map(repo => <option key={repo} value={repo} />)}</datalist>
-      {repoInfo?.ok ? <p className="repo-info"><GitBranch size={15} aria-hidden="true" /> {repoInfo.branch} · <code>{repoInfo.base}</code> {repoInfo.subject}
-        {repoInfo.uncommitted ? <span className="warn-text"> · มี {repoInfo.uncommitted} ไฟล์ที่ยังไม่ commit จะไม่ถูกส่งไป</span> : null}</p> :
-        repoInfo ? <p className="repo-info bad">{repoInfo.error}</p> :
-        <small>แอปส่งไฟล์โค้ดจาก commit HEAD และโจทย์ไปยัง AI ที่เลือกตามการตั้งค่า</small>}
-      <label>โจทย์และเกณฑ์รับงาน<textarea required name="prompt" maxLength={limit} rows={6} placeholder="ระบุสิ่งที่ต้องการให้ AI ทำและวิธีตรวจว่าเสร็จแล้ว" value={form.prompt} onChange={event => set('prompt', event.target.value)} /></label>
-      <small className={'counter' + (form.prompt.length > limit * 0.9 ? ' warn-text' : '')}>{form.prompt.length.toLocaleString()} / {limit.toLocaleString()} ตัวอักษร{previous?.title ? '' : ' · บันทึกร่างอัตโนมัติ'}</small>
-      {previous?.card ? <p className="repo-info">ใช้ค่าจาก Task Card เดิมด้วย: {[
-        previous.scope ? 'ขอบเขตไฟล์' : null,
-        previous.checkCommands?.length ? 'คำสั่งตรวจ ' + previous.checkCommands.length + ' คำสั่ง' : null,
-        previous.pinned ? 'AI ที่ต้องการ' : null,
-        previous.cardSubtasks ? 'งานย่อยที่กำหนดเอง' : null,
-        previous.card.routing?.budget_usd !== undefined ? 'งบของการ์ด' : null
-      ].filter(Boolean).join(' · ') || 'ที่มาของการ์ด'}</p> : null}
-      {canReusePlan ? <p className="repo-info">{resumable ?
-        'ทำต่อจากจุดที่ค้างได้ ถ้า repo ยังอยู่ที่ commit เดิม Relay จะใช้แผนและผล Backend / Frontend เดิม แล้วไปขั้นทดสอบและรีวิวต่อ' :
-        'ใช้แผนจากงานเดิมได้ ถ้า repo ยังอยู่ที่ commit เดิม Relay จะข้ามขั้นวางแผนเพื่อประหยัดโควตา'}</p> : null}
-      <label>ประเภทงาน<select value={form.type} onChange={event => set('type', event.target.value)}>
-        {Object.entries(jobTypes).map(([id, label]) => <option key={id} value={id}>{label}</option>)}
-      </select></label>
-      <label className="checkbox"><input type="checkbox" checked={form.approvePlan} onChange={event => set('approvePlan', event.target.checked)} />หยุดให้ฉันตรวจและอนุมัติแผนก่อนลงมือแก้โค้ด</label>
-      <label className="checkbox"><input type="checkbox" name="runChecks" checked={form.runChecks} onChange={event => set('runChecks', event.target.checked)} />
-        {chosenProject?.checks?.length ? 'รันคำสั่งทดสอบของโปรเจกต์ (' + chosenProject.checks.length + ' คำสั่ง) และให้ AI แก้จนผ่าน' : 'รัน npm test และ build ที่มีใน repo นี้ และให้ AI แก้จนผ่าน'}</label>
-      <small>เลือกสำหรับ repo ที่คุณไว้วางใจ แอปอาจติดตั้ง dependencies จาก lockfile และรันโค้ดที่เพิ่งแก้บนเครื่อง</small>
-      <details className="advanced" open={override} onToggle={event => setOverride(event.currentTarget.open)}>
-        <summary>เลือก AI เฉพาะงานนี้ (งานนี้จะไม่ใช้การเลือกอัตโนมัติ)</summary>
-        <RouteTable routes={routes} quotas={quotas} label="AI สำหรับงานนี้" onChange={(role, index, value) => setRoutes(current => updateRoutes(current, role, index, value))} />
-      </details>
-      </>}
-      {error ? <p role="alert" className="error">{error}</p> : null}
-      <footer><Button disabled={pending} onClick={close}>ยกเลิก</Button><button type="submit" className="button primary" disabled={pending}>{pending ? 'กำลังเพิ่มงาน…' : 'เพิ่มเข้าคิว'}</button></footer>
+      <div className="new-job-body">
+        {previous?.title ? null : <div className="filters" aria-label="วิธีสร้างงาน">
+          <button type="button" aria-pressed={mode === 'form'} onClick={() => { setMode('form'); setError(''); }}>กรอกเอง</button>
+          <button type="button" aria-pressed={mode === 'card'} onClick={() => { setMode('card'); setError(''); }}>วาง Task Card</button>
+        </div>}
+        {mode === 'card' ? <>
+          <label>Task Card (JSON)<textarea className="card-json" required rows={14} value={cardText} spellCheck={false}
+            placeholder={'{\n  "title": "…",\n  "project": "ชื่อโปรเจกต์ใน Relay",\n  "goal": "…",\n  "acceptance": [{ "text": "…", "check": "command", "command": "…" }]\n}'}
+            onChange={event => setCardText(event.target.value)} /></label>
+          <small>วาง Task Card ที่ได้จาก Chat ฟิลด์ที่จำเป็นคือ title, project และ goal ส่วน acceptance แบบ command Relay จะรันเป็นคำสั่งทดสอบให้</small>
+          <small>ถ้าต้องการอนุมัติก่อน merge ให้ใส่ <code>before_merge</code> ในรายการ <code>approvals</code></small>
+        </> : <>
+          <label>ชื่องาน<input autoFocus required name="title" maxLength={100} placeholder="เพิ่มระบบจองคิว" value={form.title} onChange={event => set('title', event.target.value)} /></label>
+          {projects.length ? <label>โปรเจกต์<select value={chosenProject?.id || ''} onChange={event => {
+            const project = projects.find(item => item.id === event.target.value);
+            set('repo', project ? project.path : '');
+            if (project?.checks?.length) set('runChecks', true);
+          }}>
+            <option value="">พาธอื่น (พิมพ์เอง)</option>
+            {projects.map(project => <option key={project.id} value={project.id}>{project.name}</option>)}
+          </select></label> : null}
+          <label>พาธ Git repo<input required name="repo" maxLength={500} list="recent-repos" placeholder={'D:\\Projects\\my-app'} value={form.repo} onChange={event => set('repo', event.target.value)} /></label>
+          <datalist id="recent-repos">{recentRepos.map(repo => <option key={repo} value={repo} />)}</datalist>
+          {repoInfo?.ok ? <p className="repo-info"><GitBranch size={15} aria-hidden="true" /> {repoInfo.branch} · <code>{repoInfo.base}</code> {repoInfo.subject}
+            {repoInfo.uncommitted ? <span className="warn-text"> · มี {repoInfo.uncommitted} ไฟล์ที่ยังไม่ commit จะไม่ถูกส่งไป</span> : null}</p> :
+            repoInfo ? <p className="repo-info bad">{repoInfo.error}</p> :
+            <small>แอปส่งไฟล์โค้ดจาก commit HEAD และโจทย์ไปยัง AI ที่เลือกตามการตั้งค่า</small>}
+          <label>โจทย์และเกณฑ์รับงาน<textarea required name="prompt" maxLength={limit} rows={6} placeholder="ระบุสิ่งที่ต้องการให้ AI ทำและวิธีตรวจว่าเสร็จแล้ว" value={form.prompt} onChange={event => set('prompt', event.target.value)} /></label>
+          <small className={'counter' + (form.prompt.length > limit * 0.9 ? ' warn-text' : '')}>{form.prompt.length.toLocaleString()} / {limit.toLocaleString()} ตัวอักษร{previous?.title ? '' : ' · บันทึกร่างอัตโนมัติ'}</small>
+          {previous?.card ? <p className="repo-info">ใช้ค่าจาก Task Card เดิมด้วย: {[
+            previous.scope ? 'ขอบเขตไฟล์' : null,
+            previous.checkCommands?.length ? 'คำสั่งตรวจ ' + previous.checkCommands.length + ' คำสั่ง' : null,
+            previous.pinned ? 'AI ที่ต้องการ' : null,
+            previous.cardSubtasks ? 'งานย่อยที่กำหนดเอง' : null,
+            previous.card.routing?.budget_usd !== undefined ? 'งบของการ์ด' : null
+          ].filter(Boolean).join(' · ') || 'ที่มาของการ์ด'}</p> : null}
+          {canReusePlan ? <p className="repo-info">{resumable ?
+            'ทำต่อจากจุดที่ค้างได้ ถ้า repo ยังอยู่ที่ commit เดิม Relay จะใช้แผนและผล Backend / Frontend เดิม แล้วไปขั้นทดสอบและรีวิวต่อ' :
+            'ใช้แผนจากงานเดิมได้ ถ้า repo ยังอยู่ที่ commit เดิม Relay จะข้ามขั้นวางแผนเพื่อประหยัดโควตา'}</p> : null}
+          <label>ประเภทงาน<select value={form.type} onChange={event => set('type', event.target.value)}>
+            {Object.entries(jobTypes).map(([id, label]) => <option key={id} value={id}>{label}</option>)}
+          </select></label>
+          <label className="checkbox"><input type="checkbox" checked={form.approvePlan} onChange={event => set('approvePlan', event.target.checked)} />หยุดให้ฉันตรวจและอนุมัติแผนก่อนลงมือแก้โค้ด</label>
+          <label className="checkbox"><input type="checkbox" checked={form.approveMerge} disabled={cardRequiresMergeApproval}
+            onChange={event => set('approveMerge', event.target.checked)} />{cardRequiresMergeApproval ? 'Task Card เดิมกำหนดให้อนุมัติก่อน merge' : 'ให้ฉันตรวจผลและอนุมัติก่อน merge'}</label>
+          <label className="checkbox"><input type="checkbox" name="runChecks" checked={form.runChecks} onChange={event => set('runChecks', event.target.checked)} />
+            {chosenProject?.checks?.length ? 'รันคำสั่งทดสอบของโปรเจกต์ (' + chosenProject.checks.length + ' คำสั่ง) และให้ AI แก้จนผ่าน' : 'รัน npm test และ build ที่มีใน repo นี้ และให้ AI แก้จนผ่าน'}</label>
+          <small>เลือกสำหรับ repo ที่คุณไว้วางใจ แอปอาจติดตั้ง dependencies จาก lockfile และรันโค้ดที่เพิ่งแก้บนเครื่อง</small>
+          <details className="advanced" open={override} onToggle={event => setOverride(event.currentTarget.open)}>
+            <summary>เลือก AI เฉพาะงานนี้ (งานนี้จะไม่ใช้การเลือกอัตโนมัติ)</summary>
+            <RouteTable routes={routes} quotas={quotas} label="AI สำหรับงานนี้" onChange={(role, index, value) => setRoutes(current => updateRoutes(current, role, index, value))} />
+          </details>
+        </>}
+      </div>
+      <footer>
+        {error ? <p role="alert" className="error">{error}</p> : null}
+        <Button disabled={pending} onClick={close}>ยกเลิก</Button>
+        <button type="submit" className="button primary" disabled={pending}>{pending ? 'กำลังเพิ่มงาน…' : 'เพิ่มเข้าคิว'}</button>
+      </footer>
     </form>
   </div>;
 }
@@ -1228,15 +1246,21 @@ function RoutingPreview({ refreshKey }) {
   if (error) return <p className="error">{error}</p>;
   if (!data) return <p className="muted">กำลังโหลดตัวอย่างการเลือก…</p>;
   const enough = data.stats.filter(item => item.n >= data.minSamples).length;
+  const ranks = ['อันดับ 1', 'อันดับ 2', 'อันดับ 3'];
   return <div className="routing-preview">
-    <h3>ถ้าสั่งงานตอนนี้ Relay จะเลือก</h3>
-    <div className="table-scroll"><table className="steps">
-      <thead><tr><th>ขั้น</th><th>อันดับ 1</th><th>อันดับ 2</th><th>อันดับ 3</th></tr></thead>
-      <tbody>{Object.entries(roleNames).map(([role, label]) => {
+    <h3 id="routing-preview-title">ถ้าสั่งงานตอนนี้ Relay จะเลือก</h3>
+    <div className="table-scroll"><table className="steps" role="table" aria-labelledby="routing-preview-title">
+      <thead role="rowgroup"><tr role="row">
+        <th role="columnheader" scope="col">ขั้น</th>
+        {ranks.map(rank => <th key={rank} role="columnheader" scope="col">{rank}</th>)}
+      </tr></thead>
+      <tbody role="rowgroup">{Object.entries(roleNames).map(([role, label]) => {
         const { ranking, skipped } = data.roles[role];
-        return <tr key={role}>
-          <td>{label}</td>
-          {[0, 1, 2].map(index => <td key={index} className={index === 0 ? 'wrap' : undefined}>{ranking[index] ? <><strong>{providerName(ranking[index].provider)}</strong> {ranking[index].score} <ScoreBars row={ranking[index]} /></> : index ? '–' : 'ไม่มี AI ที่พร้อมใช้'}
+        return <tr key={role} role="row">
+          <th role="rowheader" scope="row">{label}</th>
+          {ranks.map((rank, index) => <td key={rank} role="cell" className={index === 0 ? 'wrap' : undefined}>
+            <span className="routing-rank-label" aria-hidden="true">{rank}</span>
+            {ranking[index] ? <><strong>{providerName(ranking[index].provider)}</strong> {ranking[index].score} <ScoreBars row={ranking[index]} /></> : index ? '–' : 'ไม่มี AI ที่พร้อมใช้'}
             {index === 0 && ranking[0]?.reason ? <small>{ranking[0].reason}</small> : null}
             {index === 0 && skipped.length ? <small>ข้าม: {skipped.map(item => providerName(item.provider) + ' (' + item.reason + ')').join(', ')}</small> : null}</td>)}
         </tr>;
@@ -1436,6 +1460,11 @@ function SettingsForm({ initial: storedSettings, changed, quotas, onDirty }) {
   return <form className={'settings-layout' + (show('models') ? ' show-models' : '')} onSubmit={submit}>
     <nav className="card settings-nav" aria-label="หมวดการตั้งค่า">{sections.map(([key, label, hint]) =>
       <button key={key} type="button" aria-current={section === key ? 'page' : undefined} onClick={() => setSection(key)}><strong>{label}</strong><small>{hint}</small></button>)}</nav>
+    <label className="settings-section-select">หมวดการตั้งค่า
+      <select value={section} onChange={event => setSection(event.target.value)}>
+        {sections.map(([key, label]) => <option key={key} value={key}>{label}</option>)}
+      </select>
+    </label>
     <div className="card settings">
     {show('routing') ? <>
     <h2>การจ่ายงาน</h2>
@@ -2381,7 +2410,7 @@ function ProjectDetail({ project, info, projectJobs, createJob, removed, select,
         </div>
       </div>
       <div className="action-row project-detail-actions">
-        <Button primary icon={Plus} onClick={() => createJob(project.path)} disabled={removing || Boolean(info && !info.ok)}>สร้างงาน</Button>
+        <Button primary icon={Plus} onClick={createJob} disabled={removing || Boolean(info && !info.ok)}>สร้างงาน</Button>
         <Button icon={FolderOpen} onClick={open}>เปิดโฟลเดอร์</Button>
         <details className="project-actions-menu" onBlur={event => {
           if (!event.currentTarget.contains(event.relatedTarget)) event.currentTarget.open = false;
@@ -2434,9 +2463,8 @@ function ProjectDetail({ project, info, projectJobs, createJob, removed, select,
   </article>;
 }
 
-function ProjectsPage({ projects, jobs, createJob, added, removed, select, updated }) {
-  const [searchQuery, setSearchQuery] = useState('');
-  const [selectedProjectId, setSelectedProjectId] = useState(null);
+function ProjectsPage({ projects, jobs, createJob, added, removed, select, updated,
+  searchQuery, setSearchQuery, visibleProjects, selectedProject, setSelectedProjectId }) {
   const [addOpen, setAddOpen] = useState(false);
   const addProjectButtonRef = useRef(null);
   const projectListRef = useRef(null);
@@ -2455,9 +2483,6 @@ function ProjectsPage({ projects, jobs, createJob, added, removed, select, updat
   const jobsByProject = useMemo(() => new Map(projects.map(project => [
     project.id, jobs.filter(job => samePath(job.repo, project.path))
   ])), [projects, jobs]);
-  const query = searchQuery.trim().toLowerCase();
-  const visibleProjects = projects.filter(project => project.name.toLowerCase().includes(query) || project.path.toLowerCase().includes(query));
-  const selectedProject = visibleProjects.find(project => project.id === selectedProjectId) ?? visibleProjects[0];
 
   useEffect(() => {
     const targets = JSON.parse(repoTargets);
@@ -2637,6 +2662,8 @@ function App() {
   const [approvalTarget, setApprovalTarget] = useState(null);
   const [filter, setFilter] = useState('all');
   const [dialog, setDialog] = useState(null);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [selectedProjectId, setSelectedProjectId] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
   const [settingsDirty, setSettingsDirty] = useState(false);
   const { snapshot, connection } = monitor;
@@ -2646,20 +2673,11 @@ function App() {
     window.addEventListener('beforeunload', warn);
     return () => window.removeEventListener('beforeunload', warn);
   }, [settingsDirty]);
-  const hasData = Boolean(data);
   useEffect(() => {
-    if (!hasData || dialog) return;
-    const onKeyDown = event => {
-      if (event.defaultPrevented || event.repeat || event.isComposing || event.ctrlKey || event.altKey || event.metaKey) return;
-      if (event.key?.toLowerCase() !== 'n') return;
-      if (isEditableTarget(event.target) || isEditableTarget(document.activeElement)) return;
-      if (document.querySelector('dialog[open], [role="dialog"], [aria-modal="true"]')) return;
-      event.preventDefault();
-      setDialog({});
-    };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [hasData, dialog]);
+    if (page === 'projects') return;
+    setSearchQuery('');
+    setSelectedProjectId(null);
+  }, [page]);
   useJobAlerts(data?.jobs);
   const leaveSettings = () => !settingsDirty || confirm('ออกจากหน้าตั้งค่าโดยไม่บันทึก?');
   function open(next) { if (next !== page && !leaveSettings()) return; setPage(next); setSelection(null); setApprovalTarget(null); }
@@ -2689,6 +2707,26 @@ function App() {
   const removeProject = id => setData(previous => ({ ...previous, projects: previous.projects.filter(item => item.id !== id) }));
   const job = jobs.find(item => item.id === selection);
   const projectName = job && (projects.find(project => samePath(project.path, job.repo))?.name || repoName(job.repo));
+  const query = searchQuery.trim().toLowerCase();
+  const visibleProjects = page === 'projects' ? projects.filter(project =>
+    project.name.toLowerCase().includes(query) || project.path.toLowerCase().includes(query)) : [];
+  const selectedProject = visibleProjects.find(project => project.id === selectedProjectId) ?? visibleProjects[0];
+  const contextRepo = job?.repo ?? selectedProject?.path;
+  const openNewJob = useCallback(() => setDialog({ repo: contextRepo }), [contextRepo]);
+  const hasData = Boolean(data);
+  useEffect(() => {
+    if (!hasData || dialog) return;
+    const onKeyDown = event => {
+      if (event.defaultPrevented || event.repeat || event.isComposing || event.ctrlKey || event.altKey || event.metaKey) return;
+      if (event.key?.toLowerCase() !== 'n') return;
+      if (isEditableTarget(event.target) || isEditableTarget(document.activeElement)) return;
+      if (document.querySelector('dialog[open], [role="dialog"], [aria-modal="true"]')) return;
+      event.preventDefault();
+      openNewJob();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [hasData, dialog, openNewJob]);
   const currentSnapshot = connection === 'stale' ? null : snapshot;
   const liveJobs = activeMonitorJobs(currentSnapshot);
   const activeEntries = currentSnapshot?.activeJobs ?? data?.activeJobs ?? [...jobs.filter(isQueueActive), ...liveJobs];
@@ -2718,7 +2756,7 @@ function App() {
           <div className="topbar-status" role="status">
             {runningCount ? <span className="pulse" aria-hidden="true" /> : <span className="idle-dot" aria-hidden="true" />}
             {runningCount ? 'กำลังทำ ' + runningCount + ' งาน' : 'ว่าง'}{waitingCount ? ' · รออนุมัติ ' + waitingCount : ''}{queuedCount ? ' · รอ ' + queuedCount : ''}</div>
-          <div className="actions"><Button icon={RefreshCw} onClick={refresh} disabled={refreshing}>{refreshing ? 'กำลังรีเฟรช' : 'รีเฟรชโควตา'}</Button><Button primary icon={Plus} onClick={() => setDialog({})} disabled={!data} title="สร้างงาน (N)" aria-keyshortcuts="n">สร้างงาน</Button></div>
+          <div className="actions"><Button icon={RefreshCw} onClick={refresh} disabled={refreshing}>{refreshing ? 'กำลังรีเฟรช' : 'รีเฟรชโควตา'}</Button><Button primary icon={Plus} onClick={openNewJob} disabled={!data} title="สร้างงาน (N)" aria-keyshortcuts="n">สร้างงาน</Button></div>
         </header>
         <RestartBanner relayRestart={relayRestart} />
       </div>
@@ -2730,7 +2768,9 @@ function App() {
           retry={setDialog} updated={updateJob} removed={removeJob} onAcceptanceUpdated={onAcceptanceUpdated} /> :
           page === 'settings' ? <>
             {data ? <SettingsForm initial={data.settings} quotas={data.quotas} onDirty={setSettingsDirty} changed={onSettingsUpdated} /> : null}</> :
-          page === 'projects' ? (data ? <ProjectsPage projects={projects} jobs={jobs} createJob={repo => setDialog({ repo })}
+          page === 'projects' ? (data ? <ProjectsPage projects={projects} jobs={jobs} createJob={openNewJob}
+            searchQuery={searchQuery} setSearchQuery={setSearchQuery} visibleProjects={visibleProjects}
+            selectedProject={selectedProject} setSelectedProjectId={setSelectedProjectId}
             added={addProject} removed={removeProject} select={select} updated={updateProject} /> : null) :
           page === 'quota' ? <>{cards(true)}</> :
           page === 'stats' ? <StatsPage api={api} providers={providers} ProviderIcon={ProviderIcon} openJob={select} /> :
@@ -2740,7 +2780,7 @@ function App() {
               <div className="home-main">
                 <LiveMonitor monitor={monitor} job={liveJobs[0]} fallbackJob={monitorFallback} onDetails={select} onApproval={openApproval} showTeam />
                 <Queue jobs={jobs} activeById={activeById} projects={projects} filter={filter} setFilter={setFilter} select={select}
-                  create={() => setDialog({})} hasProjects={projects.length > 0} addProject={() => open('projects')} />
+                  create={openNewJob} hasProjects={projects.length > 0} addProject={() => open('projects')} />
               </div>
               <AiStatus quotas={data?.quotas} reserve={reserve} onMore={() => open('quota')} />
             </div>
