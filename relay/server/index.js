@@ -1,7 +1,7 @@
 import express from 'express';
 import spawn from 'cross-spawn';
 import { execFile, spawn as spawnShell } from 'node:child_process';
-import { promisify } from 'node:util';
+import { promisify, stripVTControlCharacters } from 'node:util';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -726,14 +726,111 @@ async function applyOutput(cwd, output) {
   await applyEdits(cwd, output.edits);
 }
 
+const checkOutputLimit = 6_000;
+const failureDetailsLimit = 4_000;
+const failureNameLimit = 300;
+const failureErrorLimit = 1_200;
+
+function collectCheckOutput(child, label) {
+  let output = '';
+  const failedTests = [];
+  let detailsLength = 2; // The brackets in the serialized failedTests array.
+
+  // Track lines per stream so a partial stderr line cannot split a TAP record on stdout.
+  const flush = [child.stdout, child.stderr].map(stream => {
+    let pending = '';
+    let failure;
+    let diagnostic = false;
+    let blockIndent = null;
+
+    function recordFailure() {
+      if (failure) {
+        const length = JSON.stringify(failure).length + Number(failedTests.length > 0);
+        if (detailsLength + length <= failureDetailsLimit) {
+          failedTests.push(failure);
+          detailsLength += length;
+        }
+      }
+      failure = null;
+      diagnostic = false;
+      blockIndent = null;
+    }
+
+    function readLine(rawLine) {
+      const plain = stripVTControlCharacters(rawLine);
+      const line = plain.trim();
+      const indent = plain.length - plain.trimStart().length;
+      if (blockIndent !== null) {
+        if (!line || indent > blockIndent) {
+          const separator = failure.error ? '\n' : '';
+          failure.error = (failure.error + separator + line).slice(0, failureErrorLimit);
+          return;
+        }
+        blockIndent = null;
+      }
+      if (/^(?:not )?ok(?:\s|$)|^1\.\.\d+\b/.test(line)) {
+        recordFailure();
+        if (!/^not ok(?:\s|$)/.test(line) || /\s+#\s*(?:TODO|SKIP)\b/i.test(line)) return;
+        const name = line.replace(/^not ok(?:\s+\d+(?=\s|$))?(?:\s+-(?=\s|$))?\s*/, '') || line;
+        failure = { name: name.slice(0, failureNameLimit), error: '' };
+        return;
+      }
+      if (!failure) return;
+      if (line === '---') { diagnostic = true; return; }
+      if (line === '...') { recordFailure(); return; }
+      if (!diagnostic) return;
+
+      const message = /^(?:error|message):\s*(.*)$/.exec(line);
+      if (!message || failure.error) return;
+      const value = message[1];
+      if (/^[|>][+-]?$/.test(value)) blockIndent = indent;
+      else if (value.startsWith("'") && value.endsWith("'")) {
+        failure.error = value.slice(1, -1).replaceAll("''", "'").slice(0, failureErrorLimit);
+      } else {
+        let error = value;
+        if (value.startsWith('"') && value.endsWith('"')) {
+          try { error = JSON.parse(value); } catch {}
+        }
+        failure.error = error.slice(0, failureErrorLimit);
+      }
+    }
+
+    stream.setEncoding('utf8');
+    stream.on('data', chunk => {
+      output = (output + chunk).slice(-checkOutputLimit);
+      let start = 0;
+      for (let end = chunk.indexOf('\n'); end !== -1; end = chunk.indexOf('\n', start)) {
+        // A check can print arbitrarily long lines. Retain just enough to read the TAP fields.
+        pending += chunk.slice(start, Math.min(end, start + checkOutputLimit - pending.length));
+        readLine(pending);
+        pending = '';
+        start = end + 1;
+      }
+      pending += chunk.slice(start, start + checkOutputLimit - pending.length);
+    });
+
+    return () => {
+      if (pending) readLine(pending);
+      pending = '';
+      recordFailure();
+    };
+  });
+
+  return (code, error) => {
+    flush.forEach(finish => finish());
+    return { label, code: code ?? -1,
+      output: error ? (output + '\n' + error.message).slice(-checkOutputLimit) : output,
+      ...(failedTests.length && { failedTests: failedTests.slice() }) };
+  };
+}
+
 async function npm(cwd, args, signal) {
   return new Promise((resolve, reject) => {
     const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(?:OPENAI_API_KEY|GEMINI_API_KEY|GOOGLE_API_KEY|ANTHROPIC_API_KEY|CODEX_THREAD_ID)$/i.test(key)));
     const child = spawn('npm', args, { cwd, env, signal: AbortSignal.any([signal, AbortSignal.timeout(240_000)]), windowsHide: true });
-    let output = '';
-    for (const stream of [child.stdout, child.stderr]) stream.on('data', chunk => { output = (output + chunk).slice(-6000); });
+    const result = collectCheckOutput(child, 'npm ' + args.join(' '));
     child.on('error', reject);
-    child.on('close', code => resolve({ label: 'npm ' + args.join(' '), code: code ?? -1, output }));
+    child.on('close', code => resolve(result(code)));
   });
 }
 
@@ -840,10 +937,9 @@ async function runCommands(job, cwd, signal) {
     addEvent(job, 'ทดสอบ', command);
     results.push(await new Promise(resolve => {
       const child = spawnShell(command, { cwd, env, shell: true, windowsHide: true, signal: AbortSignal.any([signal, AbortSignal.timeout(600_000)]) });
-      let output = '';
-      for (const stream of [child.stdout, child.stderr]) stream.on('data', chunk => { output = (output + chunk).slice(-6000); });
-      child.on('error', error => resolve({ label: command, code: -1, output: (output + '\n' + error.message).slice(-6000) }));
-      child.on('close', code => resolve({ label: command, code: code ?? -1, output }));
+      const result = collectCheckOutput(child, command);
+      child.on('error', error => resolve(result(-1, error)));
+      child.on('close', code => resolve(result(code)));
     }));
   }
   return results;
@@ -973,7 +1069,7 @@ async function work(job, signal) {
   ]);
   signal.throwIfAborted();
   job.diffStat = diffStat;
-  const needsReview = Boolean(job.review.findings.length || failedChecks(job.checks).length);
+  const needsReview = Boolean(job.review.partial || job.review.findings.length || failedChecks(job.checks).length);
   job.changedFiles = (changed ?? []).slice(0, 50);
   finishStage(job, 'delivery', needsReview ? 'warning' : 'done', { changedFiles: monitorFiles(changed) });
   job.status = needsReview ? 'needs_review' : 'complete';
@@ -1010,23 +1106,42 @@ async function fixReviewFindings(job, cwd, tracked, signal, request) {
   }
 }
 
+const reviewDiffLimit = 105_000;
+const integratedReviewPrompt = `Review the integrated diff against acceptance and test output. Use failedTests for TAP failure details when available. If the diff is truncated, review the visible changes and state the limitation in the summary.
+Check each of these areas:
+- Whether defaults and the behavior when options are omitted are preserved.
+- What happens on error, cancellation and restart.
+- Whether older saved data or requests without new fields still work.
+- Whether concurrent operations can race or leave inconsistent state.
+- What could break in paths the tests do not cover.
+Report only actionable defects with file references. An empty findings array means no defects observed. Report a missing test only if it blocks acceptance. If any check failed, report at least one finding explaining the failure and assign it to the role most likely responsible.`;
+
 async function reviewIntegrated(job, cwd, signal, request) {
   workers.get(job.id).checking = true;
   setImmediate(drain);
   job.checks = await verify(job, cwd, signal);
   const diff = await git(cwd, 'diff', '--no-ext-diff', job.base, 'HEAD', '--');
-  const review = await call(job, 'review', cwd,
-    'Review the integrated diff against acceptance and test output. Report only actionable defects with file references. An empty findings array means no defects observed. Do not report missing tests unless this blocks acceptance. If any check failed, report at least one finding that explains the failure and assign it to the role most likely responsible.',
-    JSON.stringify({ plan: job.plan, diff: diff.slice(0, 105_000), truncated: diff.length > 105_000, checks: job.checks }), reviewSchema, signal);
+  const partial = diff.length > reviewDiffLimit;
+  const review = await call(job, 'review', cwd, integratedReviewPrompt,
+    JSON.stringify({ plan: job.plan, diff: diff.slice(0, reviewDiffLimit), truncated: partial, checks: job.checks }), reviewSchema, signal);
   signal.throwIfAborted();
   const broken = failedChecks(job.checks);
   const omittedFailures = !review.findings.length && broken.length;
   if (omittedFailures) {
     // Failing tests are a defect even when the reviewer did not call them out.
-    review.findings = broken.map(result => ({ owner: guessOwner(job, result.output),
-      detail: 'คำสั่ง ' + result.label + ' ไม่ผ่าน (exit ' + result.code + '):\n' + result.output.slice(-2500) }));
+    review.findings = broken.map(result => {
+      const failures = result.failedTests?.map(({ name, error }) => error ? name + '\n' + error : name).join('\n\n');
+      const detail = failures ? failures.slice(0, 2500) : result.output.slice(-2500);
+      return { owner: guessOwner(job, detail + '\n' + result.output),
+        detail: 'คำสั่ง ' + result.label + ' ไม่ผ่าน (exit ' + result.code + '):\n' + detail };
+    });
   }
-  review.ok = !review.findings.length && !broken.length;
+  review.ok = !partial && !review.findings.length && !broken.length;
+  if (partial) {
+    review.partial = true;
+    job.events.push({ title: 'รีวิวบางส่วน',
+      detail: 'diff ยาวเกิน ' + reviewDiffLimit + ' ตัวอักษร ผู้รีวิวเห็นไม่ครบ ต้องตรวจเองก่อน merge', at: Date.now() });
+  }
   const history = job.reviewHistory ??= [];
   history.push({
     round: history.length + 1,
@@ -1035,6 +1150,7 @@ async function reviewIntegrated(job, cwd, signal, request) {
     userNote: request?.note || null,
     provider: review[PROVIDER] ?? null,
     ok: review.ok,
+    ...(partial && { partial: true }),
     summary: review.summary,
     findings: structuredClone(review.findings),
     fixedBy: request?.fixedBy ?? []
@@ -1777,7 +1893,8 @@ app.get('/api/jobs/:id/summary', async (req, res) => {
     ...jobWait(job),
     stages: job.stages || {}, card: job.card ?? null, review: job.review || null,
     ...reviewDetails(job), manualChecks: job.manualChecks ?? {}, acceptance: evaluateAcceptance(job),
-    checks: (job.checks || []).map(item => ({ label: item.label, code: item.code, output: String(item.output ?? '').slice(-1500) })),
+    checks: (job.checks || []).map(({ label, code, output, failedTests }) => ({ label, code,
+      output: String(output ?? '').slice(-1500), ...(failedTests?.length && { failedTests }) })),
     usage: job.usage || null, startedAt: job.startedAt || null, finishedAt: job.finishedAt || null,
     events: job.events.slice(-15), diffStatText, diff: diff.slice(0, limit), diffTruncated: diff.length > limit });
 });
