@@ -650,7 +650,7 @@ details.fact summary::marker { color: var(--muted); }
 .approval-panel:focus { outline: 2px solid #f59e0b; outline-offset: 2px; }
 .approval-panel h2 { font-size: 18px; }
 .approval-panel > p { margin-top: 4px; color: var(--warn); }
-.approval-panel label { margin-top: 12px; }
+.approval-panel > label { margin-top: 12px; }
 .plan-view { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 10px; margin-top: 12px; }
 .plan-view > div { background: var(--surface); border: 1px solid #efe1c2; border-radius: 11px; padding: 11px 13px; min-width: 0; }
 .plan-view h3 { font-size: 13.5px; margin-bottom: 4px; }
@@ -1462,9 +1462,7 @@ details.fact summary::marker { color: var(--muted); }
 .failed-tests li { min-width: 0; }
 .failed-tests code { display: block; overflow-wrap: anywhere; white-space: pre-wrap; }
 .failed-tests pre { max-height: 30vh; margin-top: 4px; white-space: pre-wrap; overflow-wrap: anywhere; }
-.merge-gate { margin-top: 10px; padding: 9px 12px; border: 1px solid var(--warn-line); border-radius: var(--radius-sm); background: var(--surface); min-width: 0; }
-.merge-gate strong { font-size: 13px; }
-.merge-gate ul { margin-top: 6px; padding-left: 18px; font-size: 13px; color: var(--ink-2); overflow-wrap: anywhere; }
+.approval-panel .acceptance { margin-top: 10px; }
 .approval-panel .action-row .button { white-space: normal; text-align: start; }
 
 /* ---------- AI stats ---------- */

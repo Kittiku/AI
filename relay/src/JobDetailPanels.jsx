@@ -183,7 +183,7 @@ export function AcceptanceChecklist(props) {
   return <JobAcceptanceChecklist key={props.job?.id} {...props} />;
 }
 
-function JobAcceptanceChecklist({ job, acceptance, onUpdated, readOnly = false }) {
+function JobAcceptanceChecklist({ job, acceptance, onUpdated, readOnly = false, manualOnly = false }) {
   const [manualChecks, setManualChecks] = useState(() => ({ ...(job?.manualChecks || {}) }));
   const [saving, setSaving] = useState({});
   const [notice, setNotice] = useState(null);
@@ -192,15 +192,17 @@ function JobAcceptanceChecklist({ job, acceptance, onUpdated, readOnly = false }
 
   const items = useMemo(() => {
     const base = Array.isArray(acceptance) && acceptance.length ? acceptance : evaluateAcceptance(job);
-    return base.map(item => {
+    const visibleItems = manualOnly ? base.filter(item => item.check === 'manual') : base;
+    return visibleItems.map(item => {
       if (item.check !== 'manual') return item;
       const key = String(item.index);
       const checked = Object.hasOwn(manualChecks, key) ? manualChecks[key] : item.checked;
       return { ...item, checked, status: checked ? 'passed' : 'pending' };
     });
-  }, [acceptance, job, manualChecks]);
+  }, [acceptance, job, manualChecks, manualOnly]);
 
   if (!items.length) {
+    if (manualOnly) return <p className="muted">ไม่มีเกณฑ์ตรวจเองที่ค้างอยู่</p>;
     const text = job?.plan?.acceptance;
     return <section className="card acceptance" aria-label="เกณฑ์รับงาน">
       <div className="card-head"><h2>เกณฑ์รับงาน</h2></div>
@@ -238,14 +240,17 @@ function JobAcceptanceChecklist({ job, acceptance, onUpdated, readOnly = false }
   const done = items.filter(item => item.status === 'passed').length;
   const groups = ['command', 'review', 'manual'].map(kind => [kind, items.filter(item => item.check === kind)]).filter(([, list]) => list.length);
   const busy = Object.keys(saving).length > 0;
+  const title = manualOnly ? 'เกณฑ์ตรวจเอง' : 'เกณฑ์รับงาน';
 
-  return <section className="card acceptance" aria-label="เกณฑ์รับงาน">
+  return <section className="card acceptance" aria-label={title}>
     <div className="card-head">
-      <h2>เกณฑ์รับงาน</h2>
-      <span className={'chip acceptance-count' + (done === items.length ? ' ok' : '')}>ผ่าน {done}/{items.length}</span>
+      <h2>{title}</h2>
+      <span className={'chip acceptance-count' + (done === items.length ? ' ok' : '')}>
+        {manualOnly ? 'ยังไม่ได้ติ๊ก ' + (items.length - done) + ' ข้อ' : 'ผ่าน ' + done + '/' + items.length}
+      </span>
     </div>
     {groups.map(([kind, list]) => <div key={kind} className={'acceptance-group ' + kind}>
-      <h3><span className={'acceptance-kind ' + kind}>{checkKinds[kind][0]}</span><small>{checkKinds[kind][1]}</small></h3>
+      {manualOnly ? null : <h3><span className={'acceptance-kind ' + kind}>{checkKinds[kind][0]}</span><small>{checkKinds[kind][1]}</small></h3>}
       <ul className="acceptance-list">
         {list.map(item => {
           const key = String(item.index);

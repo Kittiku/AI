@@ -8,7 +8,7 @@ import {
 } from 'lucide-react';
 import AddProjectModal from './AddProjectModal.jsx';
 import StatsPage from './StatsPage.jsx';
-import { AcceptanceChecklist, evaluateAcceptance, OutcomeTiles, ReviewHistoryList, StageStepper } from './JobDetailPanels.jsx';
+import { AcceptanceChecklist, OutcomeTiles, ReviewHistoryList, StageStepper } from './JobDetailPanels.jsx';
 import './style.css';
 
 const providers = {
@@ -1634,10 +1634,13 @@ function useJobMerge(job, updated) {
   return { check, cleanupAfter, setCleanupAfter, busyState, error, prepare, merge, close };
 }
 
-function MergePanel({ job, mergeAction }) {
+function MergePanel({ job, mergeAction, mergeNeedsApproval }) {
   const { check, cleanupAfter, setCleanupAfter, busyState, error, prepare, merge, close } = mergeAction;
   if (!check) return error ? <p role="alert" className="error">{error}</p> : null;
   const blocked = check.blockers.length > 0;
+  const confirmLabel = mergeNeedsApproval ? 'ขออนุมัติ merge เข้า ' + check.target :
+    check.alreadyMerged ? 'บันทึกว่า merge แล้ว' : 'ยืนยัน merge เข้า ' + check.target;
+  const pendingLabel = mergeNeedsApproval ? 'กำลังขออนุมัติ…' : 'กำลัง merge…';
   return <div className={'merge-panel open' + (blocked ? ' blocked' : '')}>
     <strong>{check.alreadyMerged ? 'branch นี้อยู่ใน ' + check.target + ' แล้ว' : 'Merge ' + job.branch + ' → ' + check.target}</strong>
     {check.stat ? <small>{check.stat}</small> : null}
@@ -1657,7 +1660,7 @@ function MergePanel({ job, mergeAction }) {
     {error ? <p role="alert" className="error">{error}</p> : null}
     <div className="action-row">
       {blocked ? <Button onClick={prepare} disabled={Boolean(busyState)}>ตรวจอีกครั้ง</Button> :
-        <Button primary icon={Check} onClick={merge} disabled={Boolean(busyState)}>{busyState === 'merge' ? 'กำลัง merge…' : check.alreadyMerged ? 'บันทึกว่า merge แล้ว' : 'ยืนยัน merge เข้า ' + check.target}</Button>}
+        <Button primary icon={Check} onClick={merge} disabled={Boolean(busyState)}>{busyState === 'merge' ? pendingLabel : confirmLabel}</Button>}
       <Button onClick={close} disabled={busyState === 'merge'}>ยกเลิก</Button>
     </div>
   </div>;
@@ -1877,7 +1880,8 @@ function SelfUpdatePanel({ job, relayRestart }) {
   </div>;
 }
 
-function JobActions({ job, relayRestart, updated, removed, retry, canFix, fixOpen, setFixOpen, primaryFix, mergeAction, mergeButton }) {
+function JobActions({ job, relayRestart, updated, removed, retry, canFix, fixOpen, setFixOpen, primaryFix,
+  canMerge, mergeNeedsApproval, mergeAction, mergeButton }) {
   const [working, setWorking] = useState(false);
   const [error, setError] = useState('');
   const hasBranch = Boolean(job.worktree || job.branchKept);
@@ -1886,6 +1890,7 @@ function JobActions({ job, relayRestart, updated, removed, retry, canFix, fixOpe
     try { await task(); } catch (error) { setError(error.message); } finally { setWorking(false); }
   }
   const mergeCommand = 'git -C ' + quote(job.repo) + ' merge ' + job.branch;
+  const canCopyMergeCommand = canMerge && !mergeNeedsApproval;
   const merged = job.merged;
   const undoCommand = merged && (merged.fastForward && merged.before ? 'git -C ' + quote(job.repo) + ' revert --no-edit ' + merged.before.slice(0, 10) + '..' + merged.commit.slice(0, 10)
     : 'git -C ' + quote(job.repo) + ' revert --no-edit -m 1 ' + merged.commit.slice(0, 10));
@@ -1902,12 +1907,12 @@ function JobActions({ job, relayRestart, updated, removed, retry, canFix, fixOpe
       <div className="action-row"><CopyButton text={handoffPrompt(job)}>คัดลอก prompt ให้ Claude Code</CopyButton></div>
     </div> : null}
     {canFix ? <FixPanel job={job} updated={updated} open={fixOpen} setOpen={setFixOpen} showTrigger={!primaryFix} /> : null}
-    {hasBranch && !merged ? <>{mergeButton}<MergePanel job={job} mergeAction={mergeAction} /></> : null}
+    {canMerge ? <>{mergeButton}<MergePanel job={job} mergeAction={mergeAction} mergeNeedsApproval={mergeNeedsApproval} /></> : null}
     {hasBranch ? <>
-      {merged ? null : <p>หรือ merge เองด้วย Git: branch <code>{job.branch}</code></p>}
+      {canCopyMergeCommand ? <p>หรือ merge เองด้วย Git ที่ branch <code>{job.branch}</code></p> : null}
       <div className="action-row">
         <CopyButton text={job.branch}>คัดลอกชื่อ branch</CopyButton>
-        {merged ? null : <CopyButton text={mergeCommand}>คัดลอกคำสั่ง merge</CopyButton>}
+        {canCopyMergeCommand ? <CopyButton text={mergeCommand}>คัดลอกคำสั่ง merge</CopyButton> : null}
         {job.worktree ? <Button icon={FolderOpen} disabled={working} onClick={() => run(() => api('/jobs/' + job.id + '/open', 'POST'))}>เปิดโฟลเดอร์</Button> : null}
       </div>
     </> : merged ? null : <p>{job.cleanedAt ? 'ล้าง worktree และ branch ของงานนี้แล้ว' : 'งานนี้ไม่มี branch ผลลัพธ์'}</p>}
@@ -1993,8 +1998,8 @@ function CardSubtaskBadge({ plan }) {
   return plan?.subtasksFromCard === true ? <> <span className="plan-source-badge">งานย่อยจากการ์ด</span></> : null;
 }
 
-// Shown while a job waits: the plan to approve, revise or reject, or a budget question.
-function ApprovalPanel({ job, panelRef }) {
+// Shown while a job waits for a decision on the plan, budget or merge.
+function ApprovalPanel({ job, panelRef, onAcceptanceUpdated }) {
   const [note, setNote] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -2002,7 +2007,6 @@ function ApprovalPanel({ job, panelRef }) {
   const { kind, requestedAt } = job.approval;
   const plan = kind === 'plan' ? job.plan : null;
   const merging = kind === 'before_merge';
-  const openManual = merging ? evaluateAcceptance(job).filter(item => item.check === 'manual' && !item.checked) : [];
   const partial = merging && job.review?.partial === true;
   useEffect(() => () => verification.current?.abort(), []);
   async function decide(decision) {
@@ -2031,10 +2035,7 @@ function ApprovalPanel({ job, panelRef }) {
     <h2>{plan ? 'ตรวจแผนก่อนลงมือ' : merging ? 'อนุมัติก่อน merge' : 'ถึงงบที่ตั้งไว้'}<CardSubtaskBadge plan={plan} /></h2>
     <p>{job.approval.message}</p>
     {partial ? <p className="partial-badge" role="note"><TriangleExclamationPoint size={14} aria-hidden="true" /> รีวิวบางส่วน (diff ถูกตัด)</p> : null}
-    {merging ? <div className="merge-gate">
-      <strong>เกณฑ์ตรวจเองที่ยังไม่ได้ติ๊ก ({openManual.length})</strong>
-      {openManual.length ? <ul>{openManual.map(item => <li key={item.index}>{item.text}</li>)}</ul> : <p className="muted">ไม่มีเกณฑ์ตรวจเองที่ค้างอยู่</p>}
-    </div> : null}
+    {merging ? <AcceptanceChecklist job={job} onUpdated={onAcceptanceUpdated} manualOnly /> : null}
     {plan ? <div className="plan-view">
       <div><h3>{job.single ? 'สิ่งที่จะทำ' : 'Backend'}</h3><p className="preline">{plan.backend}</p>{plan.backendFiles?.length ? <small>ไฟล์: {plan.backendFiles.join(', ')}</small> : null}</div>
       {job.single ? null : <div><h3>Frontend</h3><p className="preline">{plan.frontend}</p>{plan.frontendFiles?.length ? <small>ไฟล์: {plan.frontendFiles.join(', ')}</small> : null}</div>}
@@ -2140,7 +2141,8 @@ function JobDetail({ job, projectName, monitor, relayRestart, approvalRequested,
     (job.approval.kind !== 'plan' || Boolean(job.plan)) && (!liveJob || sameApproval(job.approval, liveJob.approval));
   const hasBranch = Boolean(job.worktree || job.branchKept);
   const hasResult = hasBranch || Boolean(job.merged);
-  const canMerge = canAct && hasBranch && !job.merged;
+  const mergeNeedsApproval = job.approvalGates?.includes('before_merge');
+  const canMerge = canAct && hasBranch && !job.merged && (!mergeNeedsApproval || doneStatuses.has(job.status));
   const canFix = canMerge && doneStatuses.has(job.status);
   const primaryMerge = canMerge && status === 'complete';
   const primaryFix = canFix && status === 'needs_review';
@@ -2195,8 +2197,8 @@ function JobDetail({ job, projectName, monitor, relayRestart, approvalRequested,
       jumpTo(nextStepRef);
       if (!mergeAction.check) void mergeAction.prepare();
     }} disabled={Boolean(mergeAction.busyState)}>
-    {mergeAction.busyState === 'check' ? 'กำลังตรวจ…' : primaryMerge ? 'Merge เข้า repo' :
-      job.status === 'needs_review' ? 'Merge ทั้งที่ยังมีปัญหา' : 'Merge เข้า repo'}
+    {mergeAction.busyState === 'check' ? 'กำลังตรวจ…' : mergeNeedsApproval ? 'ขออนุมัติ merge' :
+      primaryMerge || job.status !== 'needs_review' ? 'Merge เข้า repo' : 'Merge ทั้งที่ยังมีปัญหา'}
   </Button> : null;
   const roleStages = monitorJob?.stages.filter(stage => workKeys.has(stage.key)) ?? [];
   const archivedStages = monitorJob?.stages.filter(stage =>
@@ -2240,7 +2242,8 @@ function JobDetail({ job, projectName, monitor, relayRestart, approvalRequested,
           <TeamTree job={job} />
         </div>
       </LiveMonitor>
-      {showApproval ? <ApprovalPanel key={job.approval.kind + ':' + job.approval.requestedAt} job={job} panelRef={approvalRef} /> : null}
+      {showApproval ? <ApprovalPanel key={job.approval.kind + ':' + job.approval.requestedAt}
+        job={job} panelRef={approvalRef} onAcceptanceUpdated={onAcceptanceUpdated} /> : null}
     </> : <>
       <OutcomeTiles job={job} diffStat={emptyDiffStat} diffText={diffText}
         onOpenTab={nextTab => { openDetailTab(nextTab); jumpTo(detailRef); }} />
@@ -2248,7 +2251,8 @@ function JobDetail({ job, projectName, monitor, relayRestart, approvalRequested,
         {canAct ? <section ref={nextStepRef} tabIndex={-1} className="card detail next-step" aria-label="ขั้นต่อไป">
           <JobActions job={job} relayRestart={relayRestart} updated={updated} removed={removed} retry={retry}
             canFix={canFix} fixOpen={fixOpen} setFixOpen={setFixOpen} primaryFix={primaryFix}
-            mergeAction={mergeAction} mergeButton={primaryMerge || mergeAction.check ? null : mergeButton} />
+            canMerge={canMerge} mergeNeedsApproval={mergeNeedsApproval} mergeAction={mergeAction}
+            mergeButton={primaryMerge || mergeAction.check ? null : mergeButton} />
         </section> : null}
         <AcceptanceChecklist job={job} onUpdated={onAcceptanceUpdated} readOnly={!canAct} />
       </div>
