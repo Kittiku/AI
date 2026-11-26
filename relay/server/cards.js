@@ -62,8 +62,8 @@ export const taskCardSchema = {
       }
     },
     approvals: {
-      type: 'array', maxItems: 3, items: { type: 'string', enum: ['after_plan'] },
-      description: 'after_plan: Relay stops after planning and waits for the user to approve, revise or reject the plan.'
+      type: 'array', maxItems: 3, items: { type: 'string', enum: ['after_plan', 'before_merge'] },
+      description: 'after_plan: approve, revise or reject the plan. before_merge: approve or reject merging the result branch.'
     },
     source: {
       type: 'object', additionalProperties: false,

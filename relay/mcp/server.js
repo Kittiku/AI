@@ -36,7 +36,8 @@ const tools = [
     name: 'relay_create_task',
     description: 'Queue a Task Card in Relay, which plans, implements, tests and reviews it with several AIs on a separate Git branch. ' +
       'Use when the user asks to send or create work in Relay. Follow the scope and decisions already authorized in the conversation. ' +
-      'Prefer acceptance items with check "command" whenever a criterion can be verified by a shell command.',
+      'Prefer acceptance items with check "command" whenever a criterion can be verified by a shell command. ' +
+      'Add before_merge to the card approvals when the user wants to approve merging the result branch.',
     inputSchema: { type: 'object', properties: { card: taskCardSchema }, required: ['card'], additionalProperties: false },
     run: async ({ card }) => {
       const problem = validateCard(card);
@@ -64,8 +65,8 @@ const tools = [
   },
   {
     name: 'relay_approve',
-    description: 'Answer a Relay job that is waiting for approval (status "waiting_approval"; relay_job_status shows the plan or budget question). ' +
-      'decision: "approve", "revise" (plan only; note says what to change) or "reject" (stops the job). ' +
+    description: 'Answer a Relay job that is waiting for approval (status "waiting_approval"; relay_job_status shows the plan, budget or merge request). ' +
+      'decision: "approve", "revise" (plan only; note says what to change) or "reject" (stops the job and keeps the result branch when rejecting a merge). ' +
       'Only call after the user decided in this conversation; never approve on your own judgment.',
     inputSchema: { type: 'object', properties: { job_id: { type: 'string' }, decision: { type: 'string', enum: ['approve', 'revise', 'reject'] }, note: { type: 'string', maxLength: 4000 } },
       required: ['job_id', 'decision'], additionalProperties: false },

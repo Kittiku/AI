@@ -103,6 +103,10 @@ function recoverJobs(jobs) {
       job.status = 'cancelled';
       job.finishedAt ??= Date.now();
     }
+    if (waitingForMergeApproval(job)) {
+      lastApprovalRequestedAt = Math.max(lastApprovalRequestedAt, job.approval.requestedAt);
+      continue;
+    }
     if (job.status === 'waiting_approval') { job.status = 'running'; job.approval = null; }
     if (job.status !== 'running') {
       closeJobStages(job, job.status === 'queued' ? 'pending' : job.status === 'cancelled' ? 'cancelled' : 'failed');
@@ -127,7 +131,11 @@ const cooldowns = {};
 const workers = new Map();
 const queueWaits = new Map();
 const jobWrites = new Map();
-const activeJobIds = () => [...workers.values()].filter(worker => !worker.resume).map(worker => worker.job.id);
+const activeJobs = () => [
+  ...[...workers.values()].filter(worker => !worker.resume).map(worker => worker.job),
+  ...state.jobs.filter(job => !workers.has(job.id) && waitingForMergeApproval(job))
+];
+const activeJobIds = () => activeJobs().map(job => job.id);
 const slotsUsed = () => [...workers.values()].filter(worker => !worker.resume && !worker.planningAhead).length;
 let monitor;
 let httpServer;
@@ -595,11 +603,28 @@ const approvals = new Map();
 const budgetGates = new Map();
 let lastApprovalRequestedAt = 0;
 
+function createApproval(kind, message, started = Date.now()) {
+  lastApprovalRequestedAt = Math.max(started, lastApprovalRequestedAt + 1);
+  return { kind, message, requestedAt: lastApprovalRequestedAt };
+}
+
+const requiresMergeApproval = job => job.approvalGates?.includes('before_merge');
+const waitingForMergeApproval = job => job.status === 'waiting_approval' && job.approval?.kind === 'before_merge';
+
+// Keep the request in the job document so waiting for a merge decision needs no worker.
+function waitForMergeApproval(job, { target, tip, cleanup = false }) {
+  const message = 'ตรวจผลลัพธ์ก่อนอนุมัติ merge' + (target ? ' เข้า ' + target : '');
+  job.approval = { ...createApproval('before_merge', message), target, tip, cleanup, previousStatus: job.status };
+  job.status = 'waiting_approval';
+  job.finishedAt = null;
+  recordMonitor(job, 'delivery', { status: 'waiting', action: 'wait_approval', endedAt: null }, 'approval_requested');
+  addEvent(job, 'รออนุมัติ', message);
+}
+
 async function requestApproval(job, kind, message, signal, stages) {
   signal.throwIfAborted();
   const started = Date.now();
-  lastApprovalRequestedAt = Math.max(started, lastApprovalRequestedAt + 1);
-  job.approval = { kind, message, requestedAt: lastApprovalRequestedAt };
+  job.approval = createApproval(kind, message, started);
   job.status = 'waiting_approval';
   const previousStages = new Map();
   function addStage(key) {
@@ -1073,8 +1098,10 @@ async function work(job, signal) {
   job.changedFiles = (changed ?? []).slice(0, 50);
   finishStage(job, 'delivery', needsReview ? 'warning' : 'done', { changedFiles: monitorFiles(changed) });
   job.status = needsReview ? 'needs_review' : 'complete';
-  rememberJob(job);
   job.events.push({ title: 'ส่งมอบ', detail: 'ผลลัพธ์อยู่บน branch ' + job.branch, at: Date.now() });
+  if (!needsReview && requiresMergeApproval(job)) {
+    waitForMergeApproval(job, { target: job.baseBranch, tip: job.reviewedTip });
+  } else rememberJob(job);
 }
 
 async function fixReviewFindings(job, cwd, tracked, signal, request) {
@@ -1120,7 +1147,8 @@ async function reviewIntegrated(job, cwd, signal, request) {
   workers.get(job.id).checking = true;
   setImmediate(drain);
   job.checks = await verify(job, cwd, signal);
-  const diff = await git(cwd, 'diff', '--no-ext-diff', job.base, 'HEAD', '--');
+  const reviewedTip = requiresMergeApproval(job) ? await git(cwd, 'rev-parse', 'HEAD') : null;
+  const diff = await git(cwd, 'diff', '--no-ext-diff', job.base, reviewedTip ?? 'HEAD', '--');
   const partial = diff.length > reviewDiffLimit;
   const review = await call(job, 'review', cwd, integratedReviewPrompt,
     JSON.stringify({ plan: job.plan, diff: diff.slice(0, reviewDiffLimit), truncated: partial, checks: job.checks }), reviewSchema, signal);
@@ -1156,6 +1184,7 @@ async function reviewIntegrated(job, cwd, signal, request) {
     fixedBy: request?.fixedBy ?? []
   });
   job.review = review;
+  if (reviewedTip) job.reviewedTip = reviewedTip;
   job.lastReviewedRound = job.round;
   if (request) job.fixRequest = null;
   finishRole(job, 'review');
@@ -1661,7 +1690,7 @@ async function runJob(job, planningAhead) {
     job.error = error.message.slice(0, 1800);
     closeJobStages(job, job.status);
   } finally {
-    job.finishedAt = Date.now();
+    if (!waitingForMergeApproval(job)) job.finishedAt = Date.now();
     workers.delete(job.id);
     queueWaits.delete(job.id);
     save();
@@ -1831,7 +1860,7 @@ app.post(restartPath + '/cancel', (_req, res) => {
   res.json({ ok: true, ...restartPayload(restart) });
 });
 app.get('/api/state', (_req, res) => res.json({
-  ...state, jobs: state.jobs.map(publicJob), activeJobs: activeJobIds().map(id => publicJob(workers.get(id).job)),
+  ...state, jobs: state.jobs.map(publicJob), activeJobs: activeJobs().map(publicJob),
   usage: undefined, quotas: publicQuotas(), ...restartPayload()
 }));
 app.get('/api/models', async (_req, res) => res.set('Cache-Control', 'no-store').json(await listModels(root)));
@@ -1888,7 +1917,7 @@ app.get('/api/jobs/:id/summary', async (req, res) => {
   ]) : ['', ''];
   const limit = Math.min(Number(req.query.diffChars) || 20_000, 200_000);
   res.json({ id: job.id, title: job.title, status: job.status, error: job.mergeConflict?.error || job.error || null, repo: job.repo, branch: job.worktree || job.branchKept ? job.branch : null, merged: job.merged || null,
-    mergeCommand: (job.worktree || job.branchKept) && !job.merged ? `git -C "${job.repo}" merge ${job.branch}` : null,
+    mergeCommand: (job.worktree || job.branchKept) && !job.merged && !requiresMergeApproval(job) ? `git -C "${job.repo}" merge ${job.branch}` : null,
     type: job.type || 'feature', approval: job.approval || null, plan: job.plan || null, scope: job.scope || null, budgetUsd: job.budgetUsd ?? null,
     ...jobWait(job),
     stages: job.stages || {}, card: job.card ?? null, review: job.review || null,
@@ -1919,7 +1948,9 @@ app.post('/api/jobs/:id/approve', async (req, res) => {
   const job = state.jobs.find(item => item.id === req.params.id);
   const approval = job?.approval;
   const resolve = job && approvals.get(job.id)?.resolve;
-  if (job?.status !== 'waiting_approval' || !approval || !resolve) return res.status(409).json({ error: 'งานนี้ไม่ได้รออนุมัติ' });
+  if (job?.status !== 'waiting_approval' || !approval || (!resolve && !waitingForMergeApproval(job))) {
+    return res.status(409).json({ error: 'งานนี้ไม่ได้รออนุมัติ' });
+  }
   const { decision, note, kind, requestedAt } = req.body || {};
   // MCP clients can still answer without an identifier. If supplied, both fields must match.
   if ((kind !== undefined || requestedAt !== undefined) &&
@@ -1930,12 +1961,31 @@ app.post('/api/jobs/:id/approve', async (req, res) => {
   if (decision === 'revise' && approval.kind !== 'plan') throw Error('ขอแก้ได้เฉพาะตอนตรวจแผน');
   const text = typeof note === 'string' ? note.trim().slice(0, 4000) : '';
   if (decision === 'revise' && !text) throw Error('บอกด้วยว่าต้องการให้แก้แผนตรงไหน');
+  if (waitingForMergeApproval(job)) {
+    return restartController.runWrite(() => decideMergeApproval(job, approval, decision, text, res));
+  }
   approvals.delete(job.id);
   resolve({ decision, note: text });
   // Let the approval gate publish the job's current state before replying.
   await Promise.resolve();
   res.json({ ok: true, id: job.id, status: job.status });
 });
+function decideMergeApproval(job, approval, decision, note, res) {
+  job.approval = null;
+  job.finishedAt = Date.now();
+  const approved = decision === 'approve';
+  job.status = approved ? approval.previousStatus : 'cancelled';
+  finishStage(job, 'delivery', approved ? (job.status === 'needs_review' ? 'warning' : 'done') : 'cancelled', { action: 'finish' });
+  const detail = note ? ' · ' + note : '';
+  if (!approved) {
+    addEvent(job, 'ปฏิเสธ merge', 'เก็บ branch ' + job.branch + ' ไว้' + detail);
+    return res.json({ ok: true, id: job.id, status: job.status });
+  }
+  rememberJob(job);
+  addEvent(job, 'อนุมัติ merge', 'อนุมัติให้ merge ผลลัพธ์' + detail);
+  return queueMerge(job, () => mergeJob(job, approval, res, true));
+}
+
 // One more fix round on a finished job's own branch: the open review findings plus the user's note, then test and review again.
 app.post('/api/jobs/:id/fix', async (req, res) => {
   requireJobIntake();
@@ -1998,7 +2048,7 @@ app.get('/api/cards/schema', (_req, res) => res.json(taskCardSchema));
 async function createJob({ title, prompt, repo, runChecks, routes, fromJob, extraChecks = [], maxPrompt = 8000, card, cardSubtasks, budgetUsd, type, scope, approvals, pinned, profile }) {
   requireJobIntake();
   if (type !== undefined && !Object.hasOwn(jobTypes, type)) throw Error('ประเภทงานไม่ถูกต้อง');
-  if (approvals !== undefined && (!Array.isArray(approvals) || approvals.some(item => item !== 'after_plan'))) throw Error('จุดอนุมัติไม่ถูกต้อง');
+  if (approvals !== undefined && (!Array.isArray(approvals) || approvals.some(item => !taskCardSchema.properties.approvals.items.enum.includes(item)))) throw Error('จุดอนุมัติไม่ถูกต้อง');
   if (![title, prompt, repo].every(value => typeof value === 'string' && value.trim()) ||
     title.length > 100 || prompt.length > maxPrompt || repo.length > 500) throw Error('กรอกชื่องาน โจทย์ และพาธ Git repo ให้ครบ');
   const settings = structuredClone(state.settings);
@@ -2015,7 +2065,11 @@ async function createJob({ title, prompt, repo, runChecks, routes, fromJob, extr
   const job = { id, repo: repoRoot, base, baseBranch: startBranch === 'HEAD' ? null : startBranch, branch: 'relay/' + id.slice(0, 12), title: title.trim(),
     prompt: prompt.trim(), runChecks: runChecks === true, settings, status: 'queued', events: [], reviewHistory: [], manualChecks: {}, createdAt: Date.now(),
     type: type || 'feature', single: jobTypes[type || 'feature'].single, scope: scope || null,
-    approvalGates: [...new Set([...(approvals || []), ...(settings.approvals?.afterPlan ? ['after_plan'] : [])])] };
+    approvalGates: [...new Set([
+      ...(approvals || []),
+      ...(settings.approvals?.afterPlan ? ['after_plan'] : []),
+      ...(card?.approvals?.includes('before_merge') ? ['before_merge'] : [])
+    ])] };
   // Resuming reuses the earlier plan when the task, repo and HEAD are unchanged, so the plan step costs no quota.
   const source = typeof fromJob === 'string' && state.jobs.find(item => item.id === fromJob);
   if (source?.plan && source.repo === repoRoot && source.base === base && source.prompt === job.prompt) {
@@ -2179,7 +2233,7 @@ function reviewDetails(job) {
   return { reviewHistory: job.reviewHistory ?? [], diffStat: job.diffStat ?? null };
 }
 
-function publicJob({ monitor: _monitor, monitorLegacyReview: _legacyReview, lastReviewedRound: _lastReviewedRound, ...job }) {
+function publicJob({ monitor: _monitor, monitorLegacyReview: _legacyReview, lastReviewedRound: _lastReviewedRound, reviewedTip: _reviewedTip, ...job }) {
   return { ...job, ...(job.mergeConflict && { error: job.mergeConflict.error }), ...reviewDetails(job), ...jobWait(job), manualChecks: job.manualChecks ?? {} };
 }
 
@@ -2272,18 +2326,33 @@ app.post('/api/jobs/:id/merge', finishBeforeRestart((req, res) => {
   const job = findJob(req.params.id);
   if (!job) return res.status(404).json({ error: 'ไม่พบงานนี้' });
   if (busy(job)) return res.status(409).json({ error: 'งานกำลังดำเนินการอยู่' });
+  if (requiresMergeApproval(job) && !job.merged && !['complete', 'needs_review'].includes(job.status)) {
+    return res.status(409).json({ error: 'งานนี้ยังไม่ได้รับอนุมัติให้ merge' });
+  }
   return queueMerge(job, () => mergeJob(job, req.body, res));
 }));
 
-async function mergeJob(job, input, res) {
+async function mergeJob(job, input, res, approved = false) {
+  const respond = () => res.json(approved ? { ok: true, id: job.id, status: job.status } : publicJob(job));
   const { check, head, tip, tree, conflicts, recordedRebase } = await mergeCheck(job);
-  // Recheck the target after waiting in the queue.
-  if (input?.target !== check.target) return res.status(409).json({ error: 'branch ของ repo เปลี่ยนไปเป็น ' + check.target + ' ตรวจอีกครั้งก่อน merge', check });
+  const blocked = error => {
+    if (approved) addEvent(job, 'Merge', error);
+    return res.status(409).json({ error, check });
+  };
+  // Recheck the target and the approved commit after waiting in the queue.
+  if (input?.target !== check.target) return blocked('branch ของ repo เปลี่ยนไปเป็น ' + check.target + ' ตรวจอีกครั้งก่อน merge');
+  if (approved && input.tip !== tip) {
+    return blocked('branch ของงานเปลี่ยนหลังขออนุมัติ กรุณาตรวจ diff และขออนุมัติใหม่');
+  }
   if (conflicts) return rejectMergeConflict(job, res, check, conflicts);
-  if (check.blockers.length) return res.status(409).json({ error: check.blockers.join(' · '), check });
+  if (check.blockers.length) return blocked(check.blockers.join(' · '));
+  if (!approved && !job.merged && requiresMergeApproval(job)) {
+    waitForMergeApproval(job, { target: check.target, tip, cleanup: input.cleanup === true });
+    return res.json(publicJob(job));
+  }
   if (recordedRebase) {
     if (input.cleanup) await cleanupMerged(job);
-    return res.json(publicJob(job));
+    return respond();
   }
 
   let mergeTip = tip;
@@ -2295,10 +2364,10 @@ async function mergeJob(job, input, res) {
     }
 
     const identity = await git(job.repo, 'config', 'user.name').catch(() => '') ? [] : ['-c', 'user.name=Relay', '-c', 'user.email=relay@localhost'];
-    if (await pendingMerge(job.repo)) return res.status(409).json({ error: 'repo มี merge ที่ค้างอยู่ ให้จัดการใน Git ก่อน', check });
+    if (await pendingMerge(job.repo)) return blocked('repo มี merge ที่ค้างอยู่ ให้จัดการใน Git ก่อน');
     const current = await git(job.repo, 'rev-parse', '--abbrev-ref', 'HEAD');
     if (current !== check.target || await git(job.repo, 'rev-parse', 'HEAD') !== head) {
-      return res.status(409).json({ error: 'HEAD ของ repo เปลี่ยนระหว่างเตรียม merge กรุณาตรวจอีกครั้ง', check });
+      return blocked('HEAD ของ repo เปลี่ยนระหว่างเตรียม merge กรุณาตรวจอีกครั้ง');
     }
     try {
       await userGit(job.repo, ...identity, 'merge', '--no-autostash', '--no-overwrite-ignore',
@@ -2337,7 +2406,7 @@ async function mergeJob(job, input, res) {
     void restartController.requestRestart({ source: 'auto', reason: job.title });
   }
   if (input.cleanup) await cleanupMerged(job);
-  res.json(publicJob(job));
+  return respond();
 }
 
 const pendingMerge = cwd => git(cwd, 'rev-parse', '--verify', '-q', 'MERGE_HEAD').catch(error => {
