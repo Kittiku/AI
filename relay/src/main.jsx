@@ -8,7 +8,7 @@ import {
 } from 'lucide-react';
 import AddProjectModal from './AddProjectModal.jsx';
 import StatsPage from './StatsPage.jsx';
-import { AcceptanceChecklist, OutcomeTiles, ReviewHistoryList, StageStepper } from './JobDetailPanels.jsx';
+import { AcceptanceChecklist, evaluateAcceptance, OutcomeTiles, ReviewHistoryList, StageStepper } from './JobDetailPanels.jsx';
 import './style.css';
 
 const providers = {
@@ -181,7 +181,7 @@ const monitorActivities = {
 const monitorConnections = {
   connecting: 'กำลังเชื่อมต่อ', live: 'สด', polling: 'อัปเดตเป็นระยะ', stale: 'ข้อมูลล่าสุดอาจล้าสมัย'
 };
-const approvalLabels = { plan: 'รออนุมัติแผน', budget: 'รออนุมัติงบงาน', daily_budget: 'รออนุมัติงบรายวัน' };
+const approvalLabels = { plan: 'รออนุมัติแผน', budget: 'รออนุมัติงบงาน', daily_budget: 'รออนุมัติงบรายวัน', before_merge: 'รออนุมัติ merge' };
 const sameApproval = (first, second) => Number.isFinite(first?.requestedAt) &&
   first.kind === second?.kind && first.requestedAt === second?.requestedAt;
 const workKeys = new Set(['backend', 'frontend']);
@@ -2001,11 +2001,14 @@ function ApprovalPanel({ job, panelRef }) {
   const verification = useRef(null);
   const { kind, requestedAt } = job.approval;
   const plan = kind === 'plan' ? job.plan : null;
+  const merging = kind === 'before_merge';
+  const openManual = merging ? evaluateAcceptance(job).filter(item => item.check === 'manual' && !item.checked) : [];
+  const partial = merging && job.review?.partial === true;
   useEffect(() => () => verification.current?.abort(), []);
   async function decide(decision) {
     if (busy || verification.current) return;
     if (decision === 'revise' && !note.trim()) { setError('บอกด้วยว่าต้องการให้แก้แผนตรงไหน'); return; }
-    if (decision === 'reject' && !confirm('หยุดงานนี้?')) return;
+    if (decision === 'reject' && !confirm(merging ? 'ปฏิเสธ merge? branch ของงานนี้จะยังอยู่' : 'หยุดงานนี้?')) return;
     const controller = new AbortController();
     verification.current = controller;
     setBusy(true); setError('');
@@ -2025,8 +2028,13 @@ function ApprovalPanel({ job, panelRef }) {
     }
   }
   return <section ref={panelRef} tabIndex={-1} className="card approval-panel" aria-label="รออนุมัติ">
-    <h2>{plan ? 'ตรวจแผนก่อนลงมือ' : 'ถึงงบที่ตั้งไว้'}<CardSubtaskBadge plan={plan} /></h2>
+    <h2>{plan ? 'ตรวจแผนก่อนลงมือ' : merging ? 'อนุมัติก่อน merge' : 'ถึงงบที่ตั้งไว้'}<CardSubtaskBadge plan={plan} /></h2>
     <p>{job.approval.message}</p>
+    {partial ? <p className="partial-badge" role="note"><TriangleExclamationPoint size={14} aria-hidden="true" /> รีวิวบางส่วน (diff ถูกตัด)</p> : null}
+    {merging ? <div className="merge-gate">
+      <strong>เกณฑ์ตรวจเองที่ยังไม่ได้ติ๊ก ({openManual.length})</strong>
+      {openManual.length ? <ul>{openManual.map(item => <li key={item.index}>{item.text}</li>)}</ul> : <p className="muted">ไม่มีเกณฑ์ตรวจเองที่ค้างอยู่</p>}
+    </div> : null}
     {plan ? <div className="plan-view">
       <div><h3>{job.single ? 'สิ่งที่จะทำ' : 'Backend'}</h3><p className="preline">{plan.backend}</p>{plan.backendFiles?.length ? <small>ไฟล์: {plan.backendFiles.join(', ')}</small> : null}</div>
       {job.single ? null : <div><h3>Frontend</h3><p className="preline">{plan.frontend}</p>{plan.frontendFiles?.length ? <small>ไฟล์: {plan.frontendFiles.join(', ')}</small> : null}</div>}
@@ -2038,9 +2046,9 @@ function ApprovalPanel({ job, panelRef }) {
     {plan ? <label>หมายเหตุ (ต้องใส่ถ้าขอแก้แผน)<textarea rows={3} value={note} onChange={event => setNote(event.target.value)} placeholder="เช่น อย่าแตะไฟล์ CSS ของหน้า Records" /></label> : null}
     {error ? <p role="alert" className="error">{error}</p> : null}
     <div className="action-row">
-      <Button primary icon={Check} disabled={busy} onClick={() => decide('approve')}>{plan ? 'อนุมัติแผน' : 'อนุมัติให้ทำต่อ'}</Button>
+      <Button primary icon={Check} disabled={busy} onClick={() => decide('approve')}>{plan ? 'อนุมัติแผน' : merging ? 'อนุมัติ merge' : 'อนุมัติให้ทำต่อ'}</Button>
       {plan ? <Button icon={RotateCcw} disabled={busy} onClick={() => decide('revise')}>ขอแก้แผน</Button> : null}
-      <Button danger icon={X} disabled={busy} onClick={() => decide('reject')}>{plan ? 'ไม่อนุมัติ หยุดงาน' : 'หยุดงาน'}</Button>
+      <Button danger icon={X} disabled={busy} onClick={() => decide('reject')}>{plan ? 'ไม่อนุมัติ หยุดงาน' : merging ? 'ปฏิเสธ merge (เก็บ branch ไว้)' : 'หยุดงาน'}</Button>
     </div>
   </section>;
 }
@@ -2094,6 +2102,10 @@ function JobChecks({ checks = [] }) {
     return <details key={index} className="check">
       <summary><span className={'check-dot ' + (status === true ? 'ok' : status === false ? 'bad' : 'off')} />
         {check.command ?? check.label}<em>{status === true ? 'ผ่าน' : status === false ? 'ไม่ผ่าน' : 'ไม่ได้รัน'}</em></summary>
+      {Array.isArray(check.failedTests) && check.failedTests.length ? <div className="failed-tests">
+        <strong>เทสต์ที่ล้ม ({check.failedTests.length})</strong>
+        <ul>{check.failedTests.map((test, i) => <li key={i}><code>{test.name}</code>{test.error ? <pre>{test.error}</pre> : null}</li>)}</ul>
+      </div> : null}
       <pre>{check.output}</pre>
     </details>;
   });
@@ -2201,7 +2213,8 @@ function JobDetail({ job, projectName, monitor, relayRestart, approvalRequested,
     <header className="job-header card">
       <div className="job-header-main">
         <div className="job-title-row"><h1>{job.title}</h1><span className={'status ' + status}>{statusLabels[status]}</span>
-          {job.merged ? <span className="tag merged">merge แล้ว</span> : null}</div>
+          {job.merged ? <span className="tag merged">merge แล้ว</span> : null}
+          {job.review?.partial === true ? <span className="partial-badge" title="diff ใหญ่เกินที่ส่งให้ผู้รีวิว จึงไม่ merge อัตโนมัติ"><TriangleExclamationPoint size={13} aria-hidden="true" /> รีวิวบางส่วน (diff ถูกตัด)</span> : null}</div>
         <p className="job-meta">
           <span>{projectName}</span><span>{jobTypes[job.type || 'feature']}</span><span>สร้าง {dateTime(job.createdAt)}</span>
           {!busy && job.startedAt ? <span>ใช้เวลา {jobDuration({ ...job, finishedAt: finishedJob?.finishedAt ?? job.finishedAt })}</span> : null}

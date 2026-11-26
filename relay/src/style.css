@@ -1452,6 +1452,21 @@ details.fact summary::marker { color: var(--muted); }
   .job-detail .stepper { grid-template-columns: repeat(auto-fit, minmax(min(100%, 130px), 1fr)); }
 }
 
+/* Partial review, failed tests, merge gate */
+.partial-badge { display: inline-flex; align-items: center; gap: 5px; max-width: 100%; padding: 2px 9px; border: 1px solid var(--warn-line); border-radius: 20px; background: var(--warn-soft); color: var(--warn); font-size: 12px; font-weight: 650; overflow-wrap: anywhere; }
+.partial-badge svg { flex: none; }
+.approval-panel > p.partial-badge { margin-top: 8px; }
+.failed-tests { min-width: 0; margin-top: 8px; padding: 8px 10px; border: 1px solid var(--bad-line); border-radius: var(--radius-sm); background: var(--bad-soft); }
+.failed-tests strong { color: var(--bad); font-size: 13px; }
+.failed-tests ul { padding: 0; margin-top: 6px; list-style: none; display: grid; gap: 6px; }
+.failed-tests li { min-width: 0; }
+.failed-tests code { display: block; overflow-wrap: anywhere; white-space: pre-wrap; }
+.failed-tests pre { max-height: 30vh; margin-top: 4px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.merge-gate { margin-top: 10px; padding: 9px 12px; border: 1px solid var(--warn-line); border-radius: var(--radius-sm); background: var(--surface); min-width: 0; }
+.merge-gate strong { font-size: 13px; }
+.merge-gate ul { margin-top: 6px; padding-left: 18px; font-size: 13px; color: var(--ink-2); overflow-wrap: anywhere; }
+.approval-panel .action-row .button { white-space: normal; text-align: start; }
+
 /* ---------- AI stats ---------- */
 .stats-page { display: grid; gap: 16px; }
 .stats-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
