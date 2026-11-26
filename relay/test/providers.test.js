@@ -304,6 +304,38 @@ test('Antigravity CLI trims the normal context when no CLI context is given', as
   assert.ok(repo.files.length < 20);
 });
 
+test('Antigravity CLI truncates the review diff to fit the encoded request and retains failed tests', async () => {
+  const fake = withStdin(() => JSON.stringify({ event: 'result', result: { status: 'SUCCESS', structured_output: answer } }) + '\n');
+  cli.processes.spawn = fake.spawn;
+  const review = {
+    plan: { acceptance: 'Keep the default behavior' },
+    diff: ('+ const text = "ไทย😀";\n').repeat(4000),
+    truncated: false,
+    checks: [{ label: 'npm test', code: 1, failedTests: [{ name: 'ค่าเริ่มต้น', error: 'Expected default' }] }]
+  };
+  const context = JSON.stringify(review);
+  assert.ok(review.diff.length < 105_000);
+  assert.ok(bytes(geminiCliEncoder(prompt, reviewSchema, true)(context)) > 88_000);
+  let truncations = 0;
+  await run(cli, 'gemini', { context, onReviewDiffTruncated: () => { truncations++; } });
+  assert.equal(fake.calls.length, 1);
+  assert.equal(truncations, 1);
+  const input = fake.calls[0].input;
+  assert.ok(input.length <= 88_000);
+  const received = unpack(input.toString('utf8'), 'stream');
+  assert.ok(received.diff.length > 0 && received.diff.length < review.diff.length);
+  assert.ok(review.diff.startsWith(received.diff));
+  assert.doesNotMatch(received.diff, /[\uD800-\uDBFF]$/);
+  assert.equal(received.truncated, true);
+  assert.deepEqual(received.plan, review.plan);
+  assert.deepEqual(received.checks, review.checks);
+
+  const shortContext = JSON.stringify({ ...review, diff: 'small diff' });
+  await run(cli, 'gemini', { context: shortContext, onReviewDiffTruncated: () => { truncations++; } });
+  assert.equal(truncations, 1);
+  assert.equal(fake.calls[1].input.toString('utf8'), geminiCliEncoder(prompt, reviewSchema, true)(shortContext));
+});
+
 test('Antigravity CLI is not started when even the required files are too large', async () => {
   const fake = withStdin(() => '');
   cli.processes.spawn = fake.spawn;

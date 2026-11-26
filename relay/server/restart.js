@@ -21,7 +21,8 @@ export function shouldAutoRestart(selfUpdate, settings) {
 const busyStatuses = new Set(['queued', 'running', 'stopping', 'waiting_approval']);
 
 export function busyJobs(jobs = [], workers) {
-  return jobs.filter(job => busyStatuses.has(job.status) || workers?.has(job.id))
+  return jobs.filter(job => workers?.has(job.id) ||
+    (busyStatuses.has(job.status) && !(job.status === 'waiting_approval' && job.approval?.kind === 'before_merge')))
     .map(({ id, title, status }) => ({ id, title, status }));
 }
 

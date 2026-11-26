@@ -18,12 +18,21 @@ const providersUrl = inline(`
   export const editSchema = 'edit', planSchema = 'plan', reviewSchema = 'review', subtaskCheckSchema = 'check';
   export const refreshClaudeCode = async () => {}, refreshCodex = async () => {};
   export const listModels = () => [], pacificDay = () => 'test-day';
-  export const quota = () => Object.fromEntries(Object.keys(names).map(id => [id, { ready: true, windows: [] }]));
-  export async function generate(_provider, _cwd, prompt, schema, _signal, _onUsage, { context }) {
+  export const quota = () => Object.fromEntries(Object.keys(names).map(id => [id, {
+    ready: !fixture.cliOnly || id === 'gemini', windows: []
+  }]));
+  export async function generate(provider, _cwd, prompt, schema, _signal, _onUsage, { context, onReviewDiffTruncated }) {
     if (schema === 'plan') return { backend: 'Update text', frontend: 'none', backendFiles: ['file.txt'], frontendFiles: [] };
     if (schema === 'edit') return { status: 'done', summary: 'Edited', files: [], edits: [] };
     if (schema !== reviewSchema) throw Error('Unexpected schema: ' + schema);
-    fixture.reviews.push({ prompt, context: JSON.parse(context) });
+    const evidence = JSON.parse(context);
+    if (fixture.cliReviewTooLarge) throw Object.assign(Error('Review request too large'), { code: 'RELAY_CONTEXT_TOO_LARGE' });
+    if (fixture.cliOnly && evidence.diff.length > fixture.cliDiffLimit) {
+      evidence.diff = evidence.diff.slice(0, fixture.cliDiffLimit);
+      evidence.truncated = true;
+      onReviewDiffTruncated();
+    }
+    fixture.reviews.push({ provider, prompt, context: evidence });
     return { summary: 'No defects observed', findings: [] };
   }
 `);
@@ -40,15 +49,16 @@ const gitMockUrl = inline(`
     if (cmd === 'rev-parse') {
       if (args.at(-1) === 'MERGE_HEAD') throw Object.assign(Error('No merge in progress'), { code: 1 });
       if (args.includes('--verify')) throw Error('Branch does not exist yet');
-      if (args.includes('--abbrev-ref')) return 'main';
+      if (args.includes('--abbrev-ref')) return fixture.target ?? 'main';
       if (args[0].startsWith('relay/')) return fixture.branchTip;
       return cwd === fixture.repo ? fixture.head : 'result-tip';
     }
     if (cmd === 'merge-base' && args[0] === '--is-ancestor') {
-      if (args[1] === 'base' || args[1] === args[2]) return '';
+      if (args[1] === 'base' || args[1] === args[2] || (args[1] === 'result-tip' && args[2] === 'new-tip')) return '';
       throw Object.assign(Error('Not an ancestor'), { code: 1 });
     }
-    if (cmd === 'status' || cmd === 'config') return '';
+    if (cmd === 'status') return fixture.repoStatus ?? '';
+    if (cmd === 'config' || cmd === 'branch') return '';
     if (cmd === 'diff' && args.includes('--shortstat')) return '1 file changed';
     if (cmd === 'diff') {
       if (args.includes('--name-only')) return 'file.txt\\0';
@@ -93,7 +103,7 @@ const expressUrl = inline(`
     }
   }), { json: noop, static: noop });
 `);
-const fsUrl = inline("export * from 'node:fs'; export const mkdirSync = () => {}, existsSync = () => false, readdirSync = () => [];");
+const fsUrl = inline("export * from 'node:fs'; export const mkdirSync = () => {}, existsSync = () => false, readdirSync = () => [], rmSync = () => {};");
 const npmUrl = inline(`export { spawn as default } from ${JSON.stringify(childProcessUrl)};`);
 const sqliteUrl = inline(`
   import { DatabaseSync as SQLite } from 'node:sqlite';
@@ -248,13 +258,40 @@ test('a diff over the review limit requires manual review even with clean checks
   assert.equal((await get('/api/jobs/:id/summary', partial.id)).review.partial, true);
 });
 
+test('Gemini CLI can mark a diff below the normal limit as partial', async t => {
+  Object.assign(fixture, { cliOnly: true, cliDiffLimit: 20_000, diff: 'ก'.repeat(30_000) });
+  t.after(() => { fixture.cliOnly = false; });
+  const job = await runJob();
+  const [{ provider, context }] = fixture.reviews;
+  assert.equal(provider, 'gemini');
+  assert.equal(context.diff, fixture.diff.slice(0, fixture.cliDiffLimit));
+  assert.equal(context.truncated, true);
+  assert.equal(job.review.partial, true);
+  assert.equal(job.reviewHistory[0].partial, true);
+  assert.equal(job.status, 'needs_review');
+  assert.equal(job.merged, undefined);
+});
+
+test('an unsendable review request still delivers the branch for manual review', async t => {
+  Object.assign(fixture, { cliOnly: true, cliReviewTooLarge: true, diff: 'x'.repeat(105_001) });
+  t.after(() => Object.assign(fixture, { cliOnly: false, cliReviewTooLarge: false }));
+  const job = await server.createJob({ title: 'Review evidence', prompt: 'Update text', repo: path.resolve('fixture-review') });
+  await server.drain();
+  assert.equal(job.status, 'needs_review');
+  assert.equal(job.review.partial, true);
+  assert.equal(job.review.ok, false);
+  assert.equal(job.stages.review.status, 'failed');
+  assert.ok(job.events.some(event => event.title === 'รีวิวบางส่วน'));
+  assert.equal(job.merged, undefined);
+});
+
 const mergePath = '/api/jobs/:id/merge';
 const approvePath = '/api/jobs/:id/approve';
 
 async function runCard(approvals, { diff = 'small patch', exitCode = 0 } = {}) {
   const repo = path.resolve('fixture-review');
   Object.assign(fixture, { repo, diff, exitCode, output: 'TAP version 13\nok 1 - passes\n1..1\n',
-    head: 'base', branchTip: 'result-tip', mergeCalls: [], gitCalls: [], reviews: [] });
+    head: 'base', branchTip: 'result-tip', target: 'main', repoStatus: '', mergeCalls: [], gitCalls: [], reviews: [] });
   const { statusCode, body } = await request('POST', '/api/cards', undefined, {
     card: {
       title: 'Merge gate', project: repo, goal: 'Update text', ...(approvals && { approvals }),
@@ -292,12 +329,14 @@ test('a before_merge card waits after checks and review and merges once after ap
   assert.equal((await request('POST', approvePath, job.id, {
     decision: 'approve', kind: 'plan', requestedAt: job.approval.requestedAt
   })).statusCode, 409);
-  const [approved, duplicate] = await Promise.all([
+  const [approved, duplicate, cancel] = await Promise.all([
     request('POST', approvePath, job.id, { decision: 'approve', note: 'Reviewed', kind: 'before_merge', requestedAt: job.approval.requestedAt }),
-    request('POST', approvePath, job.id, { decision: 'approve' })
+    request('POST', approvePath, job.id, { decision: 'approve' }),
+    request('POST', '/api/jobs/:id/cancel', job.id)
   ]);
   assert.deepEqual(approved.body, { ok: true, id: job.id, status: 'complete' });
   assert.equal(duplicate.statusCode, 409);
+  assert.equal(cancel.statusCode, 409);
   assert.equal(fixture.mergeCalls.length, 1);
   assert.equal(fixture.reviews.length, 1);
   const merged = await get('/api/jobs/:id/summary', job.id);
@@ -352,11 +391,86 @@ test('partial review still requires manual review and an explicit merge request 
   assert.equal(fixture.mergeCalls.length, 1);
 });
 
-test('merge approval does not apply to a different branch tip', async () => {
+test('a staged file blocks merge and the same approval can be retried', async () => {
   const job = await runCard(['before_merge']);
-  fixture.branchTip = 'new-tip';
-  const response = await request('POST', approvePath, job.id, { decision: 'approve' });
+  const decision = { decision: 'approve', kind: 'before_merge', requestedAt: job.approval.requestedAt };
+  fixture.repoStatus = 'M  staged.txt\0';
+  const response = await request('POST', approvePath, job.id, decision);
   assert.equal(response.statusCode, 409);
+  assert.deepEqual(response.body.check.staged, ['staged.txt']);
+  const waiting = await get('/api/jobs/:id/summary', job.id);
+  assert.equal(waiting.status, 'waiting_approval');
+  assert.deepEqual(waiting.approval, job.approval);
   assert.equal(fixture.mergeCalls.length, 0);
-  assert.equal((await get('/api/jobs/:id/summary', job.id)).branch, job.branch);
+  fixture.repoStatus = '';
+  const retried = await request('POST', approvePath, job.id, decision);
+  assert.equal(retried.body.status, 'complete');
+  assert.equal(fixture.mergeCalls.length, 1);
+});
+
+for (const change of [{ branchTip: 'new-tip' }, { target: 'release' }]) {
+  test('merge approval is renewed when checkout state changes to ' + Object.values(change)[0], async () => {
+    const job = await runCard(['before_merge']);
+    const decision = { decision: 'approve', kind: 'before_merge', requestedAt: job.approval.requestedAt };
+    Object.assign(fixture, change);
+    const response = await request('POST', approvePath, job.id, decision);
+    assert.equal(response.statusCode, 409);
+    assert.equal(fixture.mergeCalls.length, 0);
+    const waiting = await get('/api/jobs/:id/summary', job.id);
+    assert.equal(waiting.status, 'waiting_approval');
+    assert.equal(waiting.branch, job.branch);
+    assert.equal(waiting.approval.target, fixture.target);
+    assert.equal(waiting.approval.tip, fixture.branchTip);
+    assert.ok(waiting.approval.requestedAt > job.approval.requestedAt);
+    assert.equal((await request('POST', approvePath, job.id, decision)).statusCode, 409);
+    await request('POST', approvePath, job.id, { ...decision, requestedAt: waiting.approval.requestedAt });
+    assert.equal(fixture.mergeCalls.length, 1);
+  });
+}
+
+test('a previous merge still requires approval for a new commit or destination and permits cleanup', async () => {
+  const job = await runCard(['before_merge']);
+  await request('POST', approvePath, job.id, { decision: 'approve' });
+  assert.equal(fixture.mergeCalls.length, 1);
+
+  fixture.branchTip = 'new-tip';
+  const newer = await request('POST', mergePath, job.id, { target: 'main' });
+  assert.equal(newer.body.approval.tip, 'new-tip');
+  assert.equal(newer.body.merged.tip, 'result-tip');
+  assert.equal(fixture.mergeCalls.length, 1);
+  await request('POST', approvePath, job.id, { decision: 'approve' });
+  assert.equal(fixture.mergeCalls.length, 2);
+
+  Object.assign(fixture, { target: 'release', head: 'base' });
+  const other = await request('POST', mergePath, job.id, { target: 'release' });
+  assert.equal(other.body.approval.target, 'release');
+  assert.equal(other.body.merged.into, 'main');
+  assert.equal(fixture.mergeCalls.length, 2);
+  await request('POST', approvePath, job.id, { decision: 'approve' });
+  assert.equal(fixture.mergeCalls.length, 3);
+
+  const cleaned = await request('POST', mergePath, job.id, { target: 'release', cleanup: true });
+  assert.equal(cleaned.body.status, 'complete');
+  assert.equal(cleaned.body.approval, null);
+  assert.equal(cleaned.body.worktree, null);
+  assert.equal(cleaned.body.merged.tip, 'new-tip');
+  assert.equal(fixture.mergeCalls.length, 3);
+});
+
+test('the recorded rebase can be cleaned up without another approval', async () => {
+  const { id } = await runCard(['before_merge']);
+  const job = server.state.jobs.find(item => item.id === id);
+  fixture.head = 'rebased-tip';
+  Object.assign(job, {
+    status: 'complete', approval: null,
+    merged: { into: 'main', tip: 'result-tip', rebasedTip: 'rebased-tip', before: 'base', commit: fixture.head }
+  });
+
+  const cleaned = await request('POST', mergePath, id, { target: 'main', cleanup: true });
+  assert.equal(cleaned.statusCode, 200);
+  assert.equal(cleaned.body.worktree, null);
+  assert.equal(cleaned.body.branchKept, true);
+  assert.equal(cleaned.body.approval, null);
+  assert.equal(cleaned.body.merged.rebasedTip, 'rebased-tip');
+  assert.equal(fixture.mergeCalls.length, 0);
 });

@@ -441,10 +441,11 @@ let geminiCliInFlight;
 
 // Keep the entire encoded CLI request below the size that has caused silent truncation.
 // `encode` turns a context string into the exact stdin text; its UTF-8 size is what is measured.
+// Integrated reviews can shorten the diff while retaining their plan and checks.
 // Required files the snapshot could not include (too large or past its budget) are not an error: they are listed
 // first in omittedPaths. Only when the required files that are present, with nothing optional, still exceed the
 // limit does this throw RELAY_CONTEXT_TOO_LARGE so the caller can move on to the next AI.
-export function fitGeminiCliInput(context, encode, limit = 88_000) {
+export function fitGeminiCliInput(context, encode, limit = 88_000, trimReviewDiff = false) {
   const fits = text => Buffer.byteLength(text, 'utf8') <= limit;
   const oversized = () => Object.assign(
     Error('บริบทเกินขนาดที่ส่งให้ Gemini CLI ได้ (' + limit + ' ไบต์) ระบบจะลอง AI ตัวถัดไปที่พร้อมใช้'),
@@ -454,6 +455,13 @@ export function fitGeminiCliInput(context, encode, limit = 88_000) {
   if (fits(input)) return input;
   let data = null;
   try { data = context ? JSON.parse(context) : null; } catch {}
+  if (trimReviewDiff && typeof data?.diff === 'string' && data.diff.length) {
+    const packDiff = count => encode(JSON.stringify({
+      ...data, diff: data.diff.slice(0, count).replace(/[\uD800-\uDBFF]$/, ''), truncated: true
+    }));
+    if (!fits(packDiff(0))) throw oversized();
+    return largest(0, data.diff.length - 1, packDiff);
+  }
   const repo = data?.repo;
   if (!repo || !Array.isArray(repo.files)) throw oversized();
 
@@ -510,7 +518,7 @@ export function geminiCliEncoder(prompt, schema, stream) {
     : withContext(prompt, packed);
 }
 
-async function geminiCliTurn(cwd, prompt, context, schema, signal, onUsage, model, configured) {
+async function geminiCliTurn(cwd, prompt, context, schema, signal, onUsage, model, configured, trimReviewDiff) {
   const backend = geminiCli.backend || 'agy';
   const binary = backend === 'agy' ? agyBinary : geminiBinary;
   const label = backend === 'agy' ? 'Antigravity CLI (agy)' : 'Gemini CLI';
@@ -518,7 +526,8 @@ async function geminiCliTurn(cwd, prompt, context, schema, signal, onUsage, mode
   const args = useStream
     ? ['--input-format', 'stream-json', '--output-format', 'stream-json', '--json-schema', JSON.stringify(schema), '--disable-slash-commands']
     : ['-p', geminiCliInstruction(schema), '--output-format', 'json'];
-  const input = fitGeminiCliInput(context, geminiCliEncoder(prompt, schema, useStream));
+  const encode = geminiCliEncoder(prompt, schema, useStream);
+  const input = fitGeminiCliInput(context, encode, undefined, trimReviewDiff);
   addModelArgument(args, model, configured);
   const { code, stdout, stderr } = await runCliBinary(binary, args, {
     cwd,
@@ -538,7 +547,7 @@ async function geminiCliTurn(cwd, prompt, context, schema, signal, onUsage, mode
       result[USAGE] = { inputTokens: meta.inputTokens ?? null, outputTokens: meta.outputTokens ?? null, costUsd: null, billing: 'subscription',
         model: meta.model || model || (backend === 'agy' ? 'agy (ค่าเริ่มต้น)' : 'gemini-cli (ค่าเริ่มต้น)') };
     }
-    return result;
+    return { result, diffTruncated: trimReviewDiff && input !== encode(context) };
   } catch (parseError) {
     const detail = String(stderr || stdout || parseError.message || `exit ${code}`).trim();
     const error = Error(`${label} (exit ${code}): ${detail.slice(0, 700)}`);
@@ -746,7 +755,7 @@ async function geminiApiTurn(prompt, schema, signal, onUsage, model) {
 
 // geminiCliContext replaces context on the Gemini / Antigravity CLI path, for example a snapshot built for its size limit.
 export async function generate(provider, cwd, prompt, schema, jobSignal, onUsage, {
-  write = false, context, geminiCliContext, model, beforeModelRetry
+  write = false, context, geminiCliContext, model, beforeModelRetry, onReviewDiffTruncated
 } = {}) {
   if (provider === 'gemini' && !geminiCli.updatedAt) await refreshGemini(cwd);
   const useCli = provider === 'gemini' && shouldUseCli();
@@ -756,13 +765,14 @@ export async function generate(provider, cwd, prompt, schema, jobSignal, onUsage
   const fullPrompt = withContext(prompt, context);
   const tryModel = (legacyModel, defaultModel, run) => runWithModel(model, legacyModel, defaultModel, run, signal, beforeModelRetry);
 
-  let result;
+  let result, diffTruncated;
   if (provider === 'claudecode') {
     result = await tryModel(process.env.RELAY_CLAUDE_CODE_MODEL || '', '', (selected, configured) =>
       claudeCodeTurn(cwd, fullPrompt, schema, signal, write, selected, configured));
   } else if (useCli) {
-    result = await tryModel(geminiCliModel, '', (selected, configured) =>
-      geminiCliTurn(cwd, prompt, geminiCliContext ?? context, schema, signal, onUsage, selected, configured));
+    ({ result, diffTruncated } = await tryModel(geminiCliModel, '', (selected, configured) =>
+      geminiCliTurn(cwd, prompt, geminiCliContext ?? context, schema, signal, onUsage, selected, configured,
+        Boolean(onReviewDiffTruncated))));
   } else {
     let output, usage;
     if (provider === 'codex') {
@@ -778,5 +788,6 @@ export async function generate(provider, cwd, prompt, schema, jobSignal, onUsage
     if (result && typeof result === 'object') result[USAGE] = usage;
   }
   if (!validate(result, schema)) throw Error(names[provider] + ' ส่งข้อมูลไม่ตรงกับรูปแบบที่กำหนด');
+  if (diffTruncated) onReviewDiffTruncated();
   return result;
 }

@@ -179,6 +179,26 @@ test('a job added during preflight keeps Relay waiting', { timeout: 3000 }, asyn
   await finished;
 });
 
+test('restart skips a saved merge approval after its worker and active write finish', { timeout: 3000 }, async () => {
+  const workers = new Map();
+  const { controller, jobs, calls, finished } = setup({ getWorkers: () => workers });
+  const pending = { ...job('waiting_approval'), approval: { kind: 'before_merge' } };
+  jobs.push(pending);
+  workers.set(pending.id, {});
+  assert.equal((await controller.requestRestart()).status, 'waiting');
+  const write = Promise.withResolvers();
+  const merging = controller.runWrite(() => write.promise);
+  workers.delete(pending.id);
+  assert.deepEqual(busyJobs(jobs, workers), []);
+  assert.equal((await controller.onJobsChanged()).status, 'waiting');
+  assert.deepEqual(calls, []);
+  write.resolve();
+  await merging;
+  await finished;
+  assert.equal(controller.getState().status, 'restarting');
+  assert.ok(calls.includes('close'));
+});
+
 test('a write completed during preflight invalidates that syntax check', { timeout: 3000 }, async () => {
   const firstCheck = Promise.withResolvers();
   let checks = 0;
