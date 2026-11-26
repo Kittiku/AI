@@ -650,7 +650,7 @@ details.fact summary::marker { color: var(--muted); }
 .approval-panel:focus { outline: 2px solid #f59e0b; outline-offset: 2px; }
 .approval-panel h2 { font-size: 18px; }
 .approval-panel > p { margin-top: 4px; color: var(--warn); }
-.approval-panel label { margin-top: 12px; }
+.approval-panel > label { margin-top: 12px; }
 .plan-view { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 10px; margin-top: 12px; }
 .plan-view > div { background: var(--surface); border: 1px solid #efe1c2; border-radius: 11px; padding: 11px 13px; min-width: 0; }
 .plan-view h3 { font-size: 13.5px; margin-bottom: 4px; }
@@ -1451,6 +1451,19 @@ details.fact summary::marker { color: var(--muted); }
   .stage-detail small { grid-column: 1 / -1; text-align: start; }
   .job-detail .stepper { grid-template-columns: repeat(auto-fit, minmax(min(100%, 130px), 1fr)); }
 }
+
+/* Partial review, failed tests, merge gate */
+.partial-badge { display: inline-flex; align-items: center; gap: 5px; max-width: 100%; padding: 2px 9px; border: 1px solid var(--warn-line); border-radius: 20px; background: var(--warn-soft); color: var(--warn); font-size: 12px; font-weight: 650; overflow-wrap: anywhere; }
+.partial-badge svg { flex: none; }
+.approval-panel > p.partial-badge { margin-top: 8px; }
+.failed-tests { min-width: 0; margin-top: 8px; padding: 8px 10px; border: 1px solid var(--bad-line); border-radius: var(--radius-sm); background: var(--bad-soft); }
+.failed-tests strong { color: var(--bad); font-size: 13px; }
+.failed-tests ul { padding: 0; margin-top: 6px; list-style: none; display: grid; gap: 6px; }
+.failed-tests li { min-width: 0; }
+.failed-tests code { display: block; overflow-wrap: anywhere; white-space: pre-wrap; }
+.failed-tests pre { max-height: 30vh; margin-top: 4px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.approval-panel .acceptance { margin-top: 10px; }
+.approval-panel .action-row .button { white-space: normal; text-align: start; }
 
 /* ---------- AI stats ---------- */
 .stats-page {

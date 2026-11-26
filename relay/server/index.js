@@ -1,7 +1,7 @@
 import express from 'express';
 import spawn from 'cross-spawn';
 import { execFile, spawn as spawnShell } from 'node:child_process';
-import { promisify } from 'node:util';
+import { promisify, stripVTControlCharacters } from 'node:util';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -103,6 +103,10 @@ function recoverJobs(jobs) {
       job.status = 'cancelled';
       job.finishedAt ??= Date.now();
     }
+    if (waitingForMergeApproval(job)) {
+      lastApprovalRequestedAt = Math.max(lastApprovalRequestedAt, job.approval.requestedAt);
+      continue;
+    }
     if (job.status === 'waiting_approval') { job.status = 'running'; job.approval = null; }
     if (job.status !== 'running') {
       closeJobStages(job, job.status === 'queued' ? 'pending' : job.status === 'cancelled' ? 'cancelled' : 'failed');
@@ -127,7 +131,11 @@ const cooldowns = {};
 const workers = new Map();
 const queueWaits = new Map();
 const jobWrites = new Map();
-const activeJobIds = () => [...workers.values()].filter(worker => !worker.resume).map(worker => worker.job.id);
+const activeJobs = () => [
+  ...[...workers.values()].filter(worker => !worker.resume).map(worker => worker.job),
+  ...state.jobs.filter(job => !workers.has(job.id) && waitingForMergeApproval(job))
+];
+const activeJobIds = () => activeJobs().map(job => job.id);
 const slotsUsed = () => [...workers.values()].filter(worker => !worker.resume && !worker.planningAhead).length;
 let monitor;
 let httpServer;
@@ -478,6 +486,7 @@ async function callCore(job, role, cwd, task, context, schema, signal, accept, o
       const response = await generate(provider, cwd, toolInstructions + '\n' + text +
         '\nUSER TASK\n' + job.prompt, schema, signal, () => { day = null; }, {
           write, context, geminiCliContext: options.geminiCliContext, model,
+          onReviewDiffTruncated: options.onReviewDiffTruncated,
           async beforeModelRetry(rejectedModel, canRetry = true) {
             signal.throwIfAborted();
             if (canRetry) stageTrack({ model: null });
@@ -595,11 +604,29 @@ const approvals = new Map();
 const budgetGates = new Map();
 let lastApprovalRequestedAt = 0;
 
+function createApproval(kind, message, started = Date.now()) {
+  lastApprovalRequestedAt = Math.max(started, lastApprovalRequestedAt + 1);
+  return { kind, message, requestedAt: lastApprovalRequestedAt };
+}
+
+const requiresMergeApproval = job => job.approvalGates?.includes('before_merge');
+const waitingForMergeApproval = job => job.status === 'waiting_approval' && job.approval?.kind === 'before_merge';
+
+// Keep the request in the job document so waiting for a merge decision needs no worker.
+function waitForMergeApproval(job, { target, tip, cleanup = false }) {
+  const message = 'ตรวจผลลัพธ์ก่อนอนุมัติ merge' + (target ? ' เข้า ' + target : '') + (tip ? ' (' + tip.slice(0, 7) + ')' : '');
+  const previousStatus = job.approval?.previousStatus ?? job.status;
+  job.approval = { ...createApproval('before_merge', message), target, tip, cleanup, previousStatus };
+  job.status = 'waiting_approval';
+  job.finishedAt = null;
+  recordMonitor(job, 'delivery', { status: 'waiting', action: 'wait_approval', endedAt: null }, 'approval_requested');
+  addEvent(job, 'รออนุมัติ', message);
+}
+
 async function requestApproval(job, kind, message, signal, stages) {
   signal.throwIfAborted();
   const started = Date.now();
-  lastApprovalRequestedAt = Math.max(started, lastApprovalRequestedAt + 1);
-  job.approval = { kind, message, requestedAt: lastApprovalRequestedAt };
+  job.approval = createApproval(kind, message, started);
   job.status = 'waiting_approval';
   const previousStages = new Map();
   function addStage(key) {
@@ -726,14 +753,111 @@ async function applyOutput(cwd, output) {
   await applyEdits(cwd, output.edits);
 }
 
+const checkOutputLimit = 6_000;
+const failureDetailsLimit = 4_000;
+const failureNameLimit = 300;
+const failureErrorLimit = 1_200;
+
+function collectCheckOutput(child, label) {
+  let output = '';
+  const failedTests = [];
+  let detailsLength = 2; // The brackets in the serialized failedTests array.
+
+  // Track lines per stream so a partial stderr line cannot split a TAP record on stdout.
+  const flush = [child.stdout, child.stderr].map(stream => {
+    let pending = '';
+    let failure;
+    let diagnostic = false;
+    let blockIndent = null;
+
+    function recordFailure() {
+      if (failure) {
+        const length = JSON.stringify(failure).length + Number(failedTests.length > 0);
+        if (detailsLength + length <= failureDetailsLimit) {
+          failedTests.push(failure);
+          detailsLength += length;
+        }
+      }
+      failure = null;
+      diagnostic = false;
+      blockIndent = null;
+    }
+
+    function readLine(rawLine) {
+      const plain = stripVTControlCharacters(rawLine);
+      const line = plain.trim();
+      const indent = plain.length - plain.trimStart().length;
+      if (blockIndent !== null) {
+        if (!line || indent > blockIndent) {
+          const separator = failure.error ? '\n' : '';
+          failure.error = (failure.error + separator + line).slice(0, failureErrorLimit);
+          return;
+        }
+        blockIndent = null;
+      }
+      if (/^(?:not )?ok(?:\s|$)|^1\.\.\d+\b/.test(line)) {
+        recordFailure();
+        if (!/^not ok(?:\s|$)/.test(line) || /\s+#\s*(?:TODO|SKIP)\b/i.test(line)) return;
+        const name = line.replace(/^not ok(?:\s+\d+(?=\s|$))?(?:\s+-(?=\s|$))?\s*/, '') || line;
+        failure = { name: name.slice(0, failureNameLimit), error: '' };
+        return;
+      }
+      if (!failure) return;
+      if (line === '---') { diagnostic = true; return; }
+      if (line === '...') { recordFailure(); return; }
+      if (!diagnostic) return;
+
+      const message = /^(?:error|message):\s*(.*)$/.exec(line);
+      if (!message || failure.error) return;
+      const value = message[1];
+      if (/^[|>][+-]?$/.test(value)) blockIndent = indent;
+      else if (value.startsWith("'") && value.endsWith("'")) {
+        failure.error = value.slice(1, -1).replaceAll("''", "'").slice(0, failureErrorLimit);
+      } else {
+        let error = value;
+        if (value.startsWith('"') && value.endsWith('"')) {
+          try { error = JSON.parse(value); } catch {}
+        }
+        failure.error = error.slice(0, failureErrorLimit);
+      }
+    }
+
+    stream.setEncoding('utf8');
+    stream.on('data', chunk => {
+      output = (output + chunk).slice(-checkOutputLimit);
+      let start = 0;
+      for (let end = chunk.indexOf('\n'); end !== -1; end = chunk.indexOf('\n', start)) {
+        // A check can print arbitrarily long lines. Retain just enough to read the TAP fields.
+        pending += chunk.slice(start, Math.min(end, start + checkOutputLimit - pending.length));
+        readLine(pending);
+        pending = '';
+        start = end + 1;
+      }
+      pending += chunk.slice(start, start + checkOutputLimit - pending.length);
+    });
+
+    return () => {
+      if (pending) readLine(pending);
+      pending = '';
+      recordFailure();
+    };
+  });
+
+  return (code, error) => {
+    flush.forEach(finish => finish());
+    return { label, code: code ?? -1,
+      output: error ? (output + '\n' + error.message).slice(-checkOutputLimit) : output,
+      ...(failedTests.length && { failedTests: failedTests.slice() }) };
+  };
+}
+
 async function npm(cwd, args, signal) {
   return new Promise((resolve, reject) => {
     const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(?:OPENAI_API_KEY|GEMINI_API_KEY|GOOGLE_API_KEY|ANTHROPIC_API_KEY|CODEX_THREAD_ID)$/i.test(key)));
     const child = spawn('npm', args, { cwd, env, signal: AbortSignal.any([signal, AbortSignal.timeout(240_000)]), windowsHide: true });
-    let output = '';
-    for (const stream of [child.stdout, child.stderr]) stream.on('data', chunk => { output = (output + chunk).slice(-6000); });
+    const result = collectCheckOutput(child, 'npm ' + args.join(' '));
     child.on('error', reject);
-    child.on('close', code => resolve({ label: 'npm ' + args.join(' '), code: code ?? -1, output }));
+    child.on('close', code => resolve(result(code)));
   });
 }
 
@@ -840,10 +964,9 @@ async function runCommands(job, cwd, signal) {
     addEvent(job, 'ทดสอบ', command);
     results.push(await new Promise(resolve => {
       const child = spawnShell(command, { cwd, env, shell: true, windowsHide: true, signal: AbortSignal.any([signal, AbortSignal.timeout(600_000)]) });
-      let output = '';
-      for (const stream of [child.stdout, child.stderr]) stream.on('data', chunk => { output = (output + chunk).slice(-6000); });
-      child.on('error', error => resolve({ label: command, code: -1, output: (output + '\n' + error.message).slice(-6000) }));
-      child.on('close', code => resolve({ label: command, code: code ?? -1, output }));
+      const result = collectCheckOutput(child, command);
+      child.on('error', error => resolve(result(-1, error)));
+      child.on('close', code => resolve(result(code)));
     }));
   }
   return results;
@@ -973,12 +1096,14 @@ async function work(job, signal) {
   ]);
   signal.throwIfAborted();
   job.diffStat = diffStat;
-  const needsReview = Boolean(job.review.findings.length || failedChecks(job.checks).length);
+  const needsReview = Boolean(job.review.partial || job.review.findings.length || failedChecks(job.checks).length);
   job.changedFiles = (changed ?? []).slice(0, 50);
   finishStage(job, 'delivery', needsReview ? 'warning' : 'done', { changedFiles: monitorFiles(changed) });
   job.status = needsReview ? 'needs_review' : 'complete';
-  rememberJob(job);
   job.events.push({ title: 'ส่งมอบ', detail: 'ผลลัพธ์อยู่บน branch ' + job.branch, at: Date.now() });
+  if (!needsReview && requiresMergeApproval(job)) {
+    waitForMergeApproval(job, { target: job.baseBranch, tip: job.reviewedTip });
+  } else rememberJob(job);
 }
 
 async function fixReviewFindings(job, cwd, tracked, signal, request) {
@@ -1010,23 +1135,52 @@ async function fixReviewFindings(job, cwd, tracked, signal, request) {
   }
 }
 
+const reviewDiffLimit = 105_000;
+const integratedReviewPrompt = `Review the integrated diff against acceptance and test output. Use failedTests for TAP failure details when available. If the diff is truncated, review the visible changes and state the limitation in the summary.
+Check each of these areas:
+- Whether defaults and the behavior when options are omitted are preserved.
+- What happens on error, cancellation and restart.
+- Whether older saved data or requests without new fields still work.
+- Whether concurrent operations can race or leave inconsistent state.
+- What could break in paths the tests do not cover.
+Report only actionable defects with file references. An empty findings array means no defects observed. Report a missing test only if it blocks acceptance. If any check failed, report at least one finding explaining the failure and assign it to the role most likely responsible.`;
+
 async function reviewIntegrated(job, cwd, signal, request) {
   workers.get(job.id).checking = true;
   setImmediate(drain);
   job.checks = await verify(job, cwd, signal);
-  const diff = await git(cwd, 'diff', '--no-ext-diff', job.base, 'HEAD', '--');
-  const review = await call(job, 'review', cwd,
-    'Review the integrated diff against acceptance and test output. Report only actionable defects with file references. An empty findings array means no defects observed. Do not report missing tests unless this blocks acceptance. If any check failed, report at least one finding that explains the failure and assign it to the role most likely responsible.',
-    JSON.stringify({ plan: job.plan, diff: diff.slice(0, 105_000), truncated: diff.length > 105_000, checks: job.checks }), reviewSchema, signal);
+  const reviewedTip = requiresMergeApproval(job) ? await git(cwd, 'rev-parse', 'HEAD') : null;
+  const diff = await git(cwd, 'diff', '--no-ext-diff', job.base, reviewedTip ?? 'HEAD', '--');
+  let partial = diff.length > reviewDiffLimit;
+  let review;
+  try {
+    review = await call(job, 'review', cwd, integratedReviewPrompt,
+      JSON.stringify({ plan: job.plan, diff: diff.slice(0, reviewDiffLimit), truncated: partial, checks: job.checks }), reviewSchema, signal, null,
+      { onReviewDiffTruncated: () => { partial = true; } });
+  } catch (error) {
+    signal.throwIfAborted();
+    if (error.code !== 'RELAY_CONTEXT_TOO_LARGE') throw error;
+    partial = true;
+    review = { summary: 'บริบทรีวิวเกินขนาดที่ AI รับได้ ต้องตรวจผลด้วยตนเอง', findings: [] };
+  }
   signal.throwIfAborted();
   const broken = failedChecks(job.checks);
-  const omittedFailures = !review.findings.length && broken.length;
+  const omittedFailures = review[PROVIDER] && !review.findings.length && broken.length;
   if (omittedFailures) {
     // Failing tests are a defect even when the reviewer did not call them out.
-    review.findings = broken.map(result => ({ owner: guessOwner(job, result.output),
-      detail: 'คำสั่ง ' + result.label + ' ไม่ผ่าน (exit ' + result.code + '):\n' + result.output.slice(-2500) }));
+    review.findings = broken.map(result => {
+      const failures = result.failedTests?.map(({ name, error }) => error ? name + '\n' + error : name).join('\n\n');
+      const detail = failures ? failures.slice(0, 2500) : result.output.slice(-2500);
+      return { owner: guessOwner(job, detail + '\n' + result.output),
+        detail: 'คำสั่ง ' + result.label + ' ไม่ผ่าน (exit ' + result.code + '):\n' + detail };
+    });
   }
-  review.ok = !review.findings.length && !broken.length;
+  review.ok = !partial && !review.findings.length && !broken.length;
+  if (partial) {
+    review.partial = true;
+    job.events.push({ title: 'รีวิวบางส่วน',
+      detail: 'บริบทรีวิวเกินขนาดที่ส่งได้ ต้องตรวจ diff ด้วยตนเองก่อน merge', at: Date.now() });
+  }
   const history = job.reviewHistory ??= [];
   history.push({
     round: history.length + 1,
@@ -1035,14 +1189,16 @@ async function reviewIntegrated(job, cwd, signal, request) {
     userNote: request?.note || null,
     provider: review[PROVIDER] ?? null,
     ok: review.ok,
+    ...(partial && { partial: true }),
     summary: review.summary,
     findings: structuredClone(review.findings),
     fixedBy: request?.fixedBy ?? []
   });
   job.review = review;
+  if (reviewedTip) job.reviewedTip = reviewedTip;
   job.lastReviewedRound = job.round;
   if (request) job.fixRequest = null;
-  finishRole(job, 'review');
+  if (review[PROVIDER]) finishRole(job, 'review');
   if (omittedFailures) addEvent(job, 'ทดสอบ', 'ทดสอบไม่ผ่าน ' + broken.length + ' คำสั่ง ส่ง error ให้ AI แก้');
 }
 
@@ -1545,7 +1701,7 @@ async function runJob(job, planningAhead) {
     job.error = error.message.slice(0, 1800);
     closeJobStages(job, job.status);
   } finally {
-    job.finishedAt = Date.now();
+    if (!waitingForMergeApproval(job)) job.finishedAt = Date.now();
     workers.delete(job.id);
     queueWaits.delete(job.id);
     save();
@@ -1715,7 +1871,7 @@ app.post(restartPath + '/cancel', (_req, res) => {
   res.json({ ok: true, ...restartPayload(restart) });
 });
 app.get('/api/state', (_req, res) => res.json({
-  ...state, jobs: state.jobs.map(publicJob), activeJobs: activeJobIds().map(id => publicJob(workers.get(id).job)),
+  ...state, jobs: state.jobs.map(publicJob), activeJobs: activeJobs().map(publicJob),
   usage: undefined, quotas: publicQuotas(), ...restartPayload()
 }));
 app.get('/api/models', async (_req, res) => res.set('Cache-Control', 'no-store').json(await listModels(root)));
@@ -1772,12 +1928,13 @@ app.get('/api/jobs/:id/summary', async (req, res) => {
   ]) : ['', ''];
   const limit = Math.min(Number(req.query.diffChars) || 20_000, 200_000);
   res.json({ id: job.id, title: job.title, status: job.status, error: job.mergeConflict?.error || job.error || null, repo: job.repo, branch: job.worktree || job.branchKept ? job.branch : null, merged: job.merged || null,
-    mergeCommand: (job.worktree || job.branchKept) && !job.merged ? `git -C "${job.repo}" merge ${job.branch}` : null,
+    mergeCommand: (job.worktree || job.branchKept) && !job.merged && !requiresMergeApproval(job) ? `git -C "${job.repo}" merge ${job.branch}` : null,
     type: job.type || 'feature', approval: job.approval || null, plan: job.plan || null, scope: job.scope || null, budgetUsd: job.budgetUsd ?? null,
     ...jobWait(job),
     stages: job.stages || {}, card: job.card ?? null, review: job.review || null,
     ...reviewDetails(job), manualChecks: job.manualChecks ?? {}, acceptance: evaluateAcceptance(job),
-    checks: (job.checks || []).map(item => ({ label: item.label, code: item.code, output: String(item.output ?? '').slice(-1500) })),
+    checks: (job.checks || []).map(({ label, code, output, failedTests }) => ({ label, code,
+      output: String(output ?? '').slice(-1500), ...(failedTests?.length && { failedTests }) })),
     usage: job.usage || null, startedAt: job.startedAt || null, finishedAt: job.finishedAt || null,
     events: job.events.slice(-15), diffStatText, diff: diff.slice(0, limit), diffTruncated: diff.length > limit });
 });
@@ -1802,7 +1959,9 @@ app.post('/api/jobs/:id/approve', async (req, res) => {
   const job = state.jobs.find(item => item.id === req.params.id);
   const approval = job?.approval;
   const resolve = job && approvals.get(job.id)?.resolve;
-  if (job?.status !== 'waiting_approval' || !approval || !resolve) return res.status(409).json({ error: 'งานนี้ไม่ได้รออนุมัติ' });
+  if (job?.status !== 'waiting_approval' || !approval || (!resolve && !waitingForMergeApproval(job))) {
+    return res.status(409).json({ error: 'งานนี้ไม่ได้รออนุมัติ' });
+  }
   const { decision, note, kind, requestedAt } = req.body || {};
   // MCP clients can still answer without an identifier. If supplied, both fields must match.
   if ((kind !== undefined || requestedAt !== undefined) &&
@@ -1813,12 +1972,35 @@ app.post('/api/jobs/:id/approve', async (req, res) => {
   if (decision === 'revise' && approval.kind !== 'plan') throw Error('ขอแก้ได้เฉพาะตอนตรวจแผน');
   const text = typeof note === 'string' ? note.trim().slice(0, 4000) : '';
   if (decision === 'revise' && !text) throw Error('บอกด้วยว่าต้องการให้แก้แผนตรงไหน');
+  if (waitingForMergeApproval(job)) {
+    if (jobWrites.has(job.id)) return res.status(409).json({ error: 'งานกำลังดำเนินการอยู่' });
+    return restartController.runWrite(() => decideMergeApproval(job, approval, decision, text, res));
+  }
   approvals.delete(job.id);
   resolve({ decision, note: text });
   // Let the approval gate publish the job's current state before replying.
   await Promise.resolve();
   res.json({ ok: true, id: job.id, status: job.status });
 });
+function decideMergeApproval(job, approval, decision, note, res) {
+  if (decision === 'approve') {
+    return queueMerge(job, () => mergeJob(job, approval, res, { approved: true, note }));
+  }
+  finishMergeApproval(job, 'cancelled');
+  addEvent(job, 'ปฏิเสธ merge', 'เก็บ branch ' + job.branch + ' ไว้' + (note ? ' · ' + note : ''));
+  return res.json({ ok: true, id: job.id, status: job.status });
+}
+
+function finishMergeApproval(job, status) {
+  job.approval = null;
+  job.finishedAt = Date.now();
+  job.status = status;
+  recordMonitor(job, 'delivery', {
+    status: status === 'needs_review' ? 'warning' : status === 'cancelled' ? 'cancelled' : 'done',
+    action: 'finish', endedAt: job.finishedAt, waitUntil: null
+  }, 'completed');
+}
+
 // One more fix round on a finished job's own branch: the open review findings plus the user's note, then test and review again.
 app.post('/api/jobs/:id/fix', async (req, res) => {
   requireJobIntake();
@@ -1881,7 +2063,7 @@ app.get('/api/cards/schema', (_req, res) => res.json(taskCardSchema));
 async function createJob({ title, prompt, repo, runChecks, routes, fromJob, extraChecks = [], maxPrompt = 8000, card, cardSubtasks, budgetUsd, type, scope, approvals, pinned, profile }) {
   requireJobIntake();
   if (type !== undefined && !Object.hasOwn(jobTypes, type)) throw Error('ประเภทงานไม่ถูกต้อง');
-  if (approvals !== undefined && (!Array.isArray(approvals) || approvals.some(item => item !== 'after_plan'))) throw Error('จุดอนุมัติไม่ถูกต้อง');
+  if (approvals !== undefined && (!Array.isArray(approvals) || approvals.some(item => !taskCardSchema.properties.approvals.items.enum.includes(item)))) throw Error('จุดอนุมัติไม่ถูกต้อง');
   if (![title, prompt, repo].every(value => typeof value === 'string' && value.trim()) ||
     title.length > 100 || prompt.length > maxPrompt || repo.length > 500) throw Error('กรอกชื่องาน โจทย์ และพาธ Git repo ให้ครบ');
   const settings = structuredClone(state.settings);
@@ -1898,7 +2080,11 @@ async function createJob({ title, prompt, repo, runChecks, routes, fromJob, extr
   const job = { id, repo: repoRoot, base, baseBranch: startBranch === 'HEAD' ? null : startBranch, branch: 'relay/' + id.slice(0, 12), title: title.trim(),
     prompt: prompt.trim(), runChecks: runChecks === true, settings, status: 'queued', events: [], reviewHistory: [], manualChecks: {}, createdAt: Date.now(),
     type: type || 'feature', single: jobTypes[type || 'feature'].single, scope: scope || null,
-    approvalGates: [...new Set([...(approvals || []), ...(settings.approvals?.afterPlan ? ['after_plan'] : [])])] };
+    approvalGates: [...new Set([
+      ...(approvals || []),
+      ...(settings.approvals?.afterPlan ? ['after_plan'] : []),
+      ...(card?.approvals?.includes('before_merge') ? ['before_merge'] : [])
+    ])] };
   // Resuming reuses the earlier plan when the task, repo and HEAD are unchanged, so the plan step costs no quota.
   const source = typeof fromJob === 'string' && state.jobs.find(item => item.id === fromJob);
   if (source?.plan && source.repo === repoRoot && source.base === base && source.prompt === job.prompt) {
@@ -2062,7 +2248,7 @@ function reviewDetails(job) {
   return { reviewHistory: job.reviewHistory ?? [], diffStat: job.diffStat ?? null };
 }
 
-function publicJob({ monitor: _monitor, monitorLegacyReview: _legacyReview, lastReviewedRound: _lastReviewedRound, ...job }) {
+function publicJob({ monitor: _monitor, monitorLegacyReview: _legacyReview, lastReviewedRound: _lastReviewedRound, reviewedTip: _reviewedTip, ...job }) {
   return { ...job, ...(job.mergeConflict && { error: job.mergeConflict.error }), ...reviewDetails(job), ...jobWait(job), manualChecks: job.manualChecks ?? {} };
 }
 
@@ -2119,8 +2305,8 @@ async function mergeCheck(job) {
 
 function rejectMergeConflict(job, res, check, files, error = conflictMessage(files)) {
   job.mergeConflict = { target: check.target, files: files.slice(0, 20), error,
-    previousStatus: job.mergeConflict?.previousStatus ?? job.status };
-  job.status = 'needs_review';
+    previousStatus: job.mergeConflict?.previousStatus ?? job.approval?.previousStatus ?? job.status };
+  if (!waitingForMergeApproval(job)) job.status = 'needs_review';
   addEvent(job, 'Merge', error + (files.length ? ' · ' + files.slice(0, 8).join(', ') : ''));
   check.conflicts = job.mergeConflict.files;
   if (!check.blockers.includes(error)) check.blockers.push(error);
@@ -2158,15 +2344,36 @@ app.post('/api/jobs/:id/merge', finishBeforeRestart((req, res) => {
   return queueMerge(job, () => mergeJob(job, req.body, res));
 }));
 
-async function mergeJob(job, input, res) {
+async function mergeJob(job, input, res, { approved = false, note = '' } = {}) {
+  const respond = () => res.json(approved ? { ok: true, id: job.id, status: job.status } : publicJob(job));
   const { check, head, tip, tree, conflicts, recordedRebase } = await mergeCheck(job);
-  // Recheck the target after waiting in the queue.
-  if (input?.target !== check.target) return res.status(409).json({ error: 'branch ของ repo เปลี่ยนไปเป็น ' + check.target + ' ตรวจอีกครั้งก่อน merge', check });
+  const gated = requiresMergeApproval(job);
+  const alreadyRecorded = check.alreadyMerged && job.merged?.into === check.target && job.merged.tip === tip;
+  const needsApproval = gated && !approved && !alreadyRecorded;
+  const blocked = error => {
+    if (approved) addEvent(job, 'Merge', error);
+    return res.status(409).json({ error, check });
+  };
+  // Compare the queued decision with the current destination and source commit.
+  if (approved && check.target !== 'HEAD' && (input.target !== check.target || input.tip !== tip)) {
+    waitForMergeApproval(job, { target: check.target, tip, cleanup: input.cleanup });
+    return blocked('branch ปลายทางหรือ commit ของงานเปลี่ยน กรุณาตรวจคำขออนุมัติใหม่');
+  }
+  if (approved && check.target === 'HEAD') return blocked(check.blockers.join(' · '));
+  if (input?.target !== check.target) return blocked('branch ของ repo เปลี่ยนไปเป็น ' + check.target + ' ตรวจอีกครั้งก่อน merge');
+  if (needsApproval && !['complete', 'needs_review'].includes(job.status)) {
+    return blocked('งานนี้ยังไม่ได้รับอนุมัติให้ merge');
+  }
   if (conflicts) return rejectMergeConflict(job, res, check, conflicts);
-  if (check.blockers.length) return res.status(409).json({ error: check.blockers.join(' · '), check });
-  if (recordedRebase) {
-    if (input.cleanup) await cleanupMerged(job);
+  if (check.blockers.length) return blocked(check.blockers.join(' · '));
+  if (needsApproval) {
+    waitForMergeApproval(job, { target: check.target, tip, cleanup: input.cleanup === true });
     return res.json(publicJob(job));
+  }
+  if (recordedRebase || (gated && alreadyRecorded)) {
+    if (approved) recordApprovedMerge();
+    if (input.cleanup) await cleanupMerged(job);
+    return respond();
   }
 
   let mergeTip = tip;
@@ -2178,10 +2385,10 @@ async function mergeJob(job, input, res) {
     }
 
     const identity = await git(job.repo, 'config', 'user.name').catch(() => '') ? [] : ['-c', 'user.name=Relay', '-c', 'user.email=relay@localhost'];
-    if (await pendingMerge(job.repo)) return res.status(409).json({ error: 'repo มี merge ที่ค้างอยู่ ให้จัดการใน Git ก่อน', check });
+    if (await pendingMerge(job.repo)) return blocked('repo มี merge ที่ค้างอยู่ ให้จัดการใน Git ก่อน');
     const current = await git(job.repo, 'rev-parse', '--abbrev-ref', 'HEAD');
     if (current !== check.target || await git(job.repo, 'rev-parse', 'HEAD') !== head) {
-      return res.status(409).json({ error: 'HEAD ของ repo เปลี่ยนระหว่างเตรียม merge กรุณาตรวจอีกครั้ง', check });
+      return blocked('HEAD ของ repo เปลี่ยนระหว่างเตรียม merge กรุณาตรวจอีกครั้ง');
     }
     try {
       await userGit(job.repo, ...identity, 'merge', '--no-autostash', '--no-overwrite-ignore',
@@ -2210,6 +2417,7 @@ async function mergeJob(job, input, res) {
   }
   job.merged = { at: Date.now(), into: check.target, commit, tip, fastForward, before: check.alreadyMerged ? null : head,
     ...(rebased && { rebasedTip: mergeTip }) };
+  if (approved) recordApprovedMerge();
   addEvent(job, 'Merge', (check.alreadyMerged ? 'branch นี้อยู่ใน ' : 'merge เข้า ') + check.target + ' แล้ว (' +
     commit.slice(0, 7) + (rebased ? ', rebase และ fast-forward' : fastForward ? ', fast-forward' : '') + ')');
   job.selfUpdate = check.alreadyMerged
@@ -2220,7 +2428,14 @@ async function mergeJob(job, input, res) {
     void restartController.requestRestart({ source: 'auto', reason: job.title });
   }
   if (input.cleanup) await cleanupMerged(job);
-  res.json(publicJob(job));
+  return respond();
+
+  function recordApprovedMerge() {
+    delete job.mergeConflict;
+    finishMergeApproval(job, input.previousStatus);
+    rememberJob(job);
+    addEvent(job, 'อนุมัติ merge', 'อนุมัติให้ merge ผลลัพธ์' + (note ? ' · ' + note : ''));
+  }
 }
 
 const pendingMerge = cwd => git(cwd, 'rev-parse', '--verify', '-q', 'MERGE_HEAD').catch(error => {
@@ -2301,6 +2516,7 @@ app.delete('/api/jobs/:id', finishBeforeRestart((req, res) => cleanupJob(req, re
 app.post('/api/jobs/:id/cancel', (req, res) => {
   const job = state.jobs.find(item => item.id === req.params.id);
   if (!job || !['queued', 'running', 'waiting_approval'].includes(job.status)) return res.status(409).json({ error: 'งานนี้หยุดไม่ได้แล้ว' });
+  if (jobWrites.has(job.id)) return res.status(409).json({ error: 'งานกำลังดำเนินการอยู่' });
   if (workers.has(job.id)) stopJob(job, Error('ผู้ใช้หยุดงาน'));
   else {
     job.status = 'cancelled';
