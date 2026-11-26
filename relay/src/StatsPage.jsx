@@ -22,7 +22,11 @@ function compact(value) {
   return number(value);
 }
 const percent = value => value == null ? '–' : Math.round(value * 100) + '%';
-const money = value => value == null ? '–' : '$' + value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 8 });
+// Two decimals for normal amounts; tiny per-call amounts keep four so they do not show as $0.00.
+const money = value => value == null ? '–' : '$' + value.toLocaleString('en-US',
+  Math.abs(value) > 0 && Math.abs(value) < 0.01 ? { minimumFractionDigits: 4, maximumFractionDigits: 4 } : { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+// m:ss for ranges, so a p50–p90 pair fits one line in a narrow table cell.
+const clock = ms => { const total = Math.round(ms / 1000); return Math.floor(total / 60) + ':' + String(total % 60).padStart(2, '0'); };
 function duration(ms) {
   if (ms == null) return '–';
   const seconds = Math.round(ms / 1000);
@@ -259,7 +263,7 @@ function Heatmap({ matrix, groups, providers, bind }) {
         return <table key={columns[0].key} className="stats-heatmap" aria-label={'จำนวนครั้งตามประเภทงานและรุ่น กลุ่ม ' + (index + 1)}>
           <thead><tr><th scope="col">ประเภทงาน</th>{columns.map(model =>
             <th scope="col" key={model.key}><span>{providerName(providers, model.provider)}</span>{modelName(model.model)}</th>)}</tr></thead>
-          <tbody>{[...counts].map(([type, row]) => <tr key={type}>
+          <tbody>{[...counts].filter(([, row]) => columns.some(model => (row.get(model.key) ?? 0) > 0)).map(([type, row]) => <tr key={type}>
             <th scope="row">{taskName(type)}</th>
             {columns.map(model => {
               const count = row.get(model.key) ?? 0;
@@ -281,7 +285,7 @@ function LatencyRange({ row, peak }) {
   const end = 100 * row.p90Ms / peak + '%';
   return <span className="stats-latency">
     <span className="stats-latency-track" aria-hidden="true" style={{ '--start': start, '--end': end, '--range-color': row.color }}><i /></span>
-    <span>{duration(row.p50Ms)} – {duration(row.p90Ms)}</span>
+    <span title={duration(row.p50Ms) + ' ถึง ' + duration(row.p90Ms)} aria-label={duration(row.p50Ms) + ' ถึง ' + duration(row.p90Ms)}>{clock(row.p50Ms)} – {clock(row.p90Ms)}</span>
   </span>;
 }
 
