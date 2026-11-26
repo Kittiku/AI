@@ -153,6 +153,13 @@ main { max-width: 1440px; margin-inline: auto; padding: 22px 28px 40px; }
 .status.needs_review, .status.waiting_approval { background: var(--warn-soft); color: var(--warn); }
 .status.failed, .status.interrupted { background: var(--bad-soft); color: var(--bad); }
 .status.queued { background: var(--info-soft); color: var(--info); }
+.status.merged { background: #e9e6fb; color: var(--brand-ink); }
+.markdown { overflow-wrap: anywhere; }
+.markdown > * + * { margin-top: 4px; }
+.markdown p { white-space: pre-wrap; }
+.markdown ul { padding-left: 18px; }
+.markdown code { padding: 0 4px; border-radius: 4px; background: var(--surface-2); border: 1px solid var(--line); }
+.events .markdown p { margin-top: 0; }
 .tag { display: inline-flex; align-items: center; font-size: 11.5px; font-weight: 650; background: var(--ok-soft); color: var(--ok); border-radius: 10px; padding: 1px 8px; margin-left: 6px; }
 .tag.merged { background: #e9e6fb; color: var(--brand-ink); margin-left: 0; }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; }

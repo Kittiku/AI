@@ -9,6 +9,8 @@ import {
 import AddProjectModal from './AddProjectModal.jsx';
 import StatsPage from './StatsPage.jsx';
 import { AcceptanceChecklist, OutcomeTiles, ReviewHistoryList, StageStepper } from './JobDetailPanels.jsx';
+import { Markdown, InlineMarkdown } from './markdown.js';
+import { getJobStatusBadge } from './jobBadge.js';
 import './style.css';
 
 const providers = {
@@ -1043,8 +1045,10 @@ function Queue({ jobs, activeById, projects = [], filter, setFilter, select, cre
             <small>{projectOf(job)} · {dateTime(job.createdAt)}{job.startedAt ? ' · ' + jobDuration(job) : ''}</small>
           </span>
           <span className="job-ais">{jobProviders(job).map(id => <span key={id} title={providers[id].name}><ProviderIcon id={id} size={13} /></span>)}</span>
-          <span className="job-tags">{job.merged ? <span className="tag merged">merge แล้ว</span> : null}
-            <span className={'status ' + status}>{wait ? 'รอคิว' : statusLabels[status] || status}</span></span>
+          <span className="job-tags">{(() => {
+            const badge = wait ? { status, label: 'รอคิว' } : getJobStatusBadge(job);
+            return <span className={'status ' + badge.status}>{badge.label}</span>;
+          })()}</span>
           <ArrowRight className="job-arrow" size={16} aria-hidden="true" />
           {stage ? <span className="queue-stage">ขั้นตอน · {stage}</span> : null}
           {wait ? <QueueWait wait={wait} jobsById={jobsById} /> : null}
@@ -1624,11 +1628,11 @@ function Finding({ text, openFile }) {
   let last = 0;
   for (const match of text.matchAll(filePattern)) {
     if (!match[1].includes('/') && !/\.(?:jsx?|tsx?|css|html|json|md|py|go|rs|vue|svelte|mjs|cjs)$/.test(match[1])) continue;
-    parts.push(text.slice(last, match.index));
+    parts.push(<InlineMarkdown key={'t' + match.index} text={text.slice(last, match.index)} />);
     parts.push(<button type="button" className="file-link" key={match.index} onClick={() => openFile(match[1])}>{match[0]}</button>);
     last = match.index + match[0].length;
   }
-  parts.push(text.slice(last));
+  parts.push(<InlineMarkdown key="tail" text={text.slice(last)} />);
   return <>{parts}</>;
 }
 
@@ -2113,7 +2117,7 @@ function EventItem({ event }) {
     <span className="event-time">{time(event.at)}</span>
     <div>
       <strong>{event.title}{event.provider ? <em>{providerName(event.provider)}</em> : null}</strong>
-      <p className={long && !open ? 'clamp' : ''}>{event.detail}</p>
+      <div className={long && !open ? 'clamp' : ''}><Markdown text={event.detail} /></div>
       {long ? <button type="button" className="link small" onClick={() => setOpen(value => !value)}>{open ? 'ย่อ' : 'อ่านต่อ'}</button> : null}
     </div>
   </li>;
@@ -2243,8 +2247,10 @@ function JobDetail({ job, projectName, monitor, relayRestart, approvalRequested,
     <button type="button" className="back" onClick={back}><ChevronLeft size={16} /> กลับไปภาพรวม</button>
     <header className="job-header card">
       <div className="job-header-main">
-        <div className="job-title-row"><h1>{job.title}</h1><span className={'status ' + status}>{statusLabels[status]}</span>
-          {job.merged ? <span className="tag merged">merge แล้ว</span> : null}
+        <div className="job-title-row"><h1>{job.title}</h1>{(() => {
+          const badge = getJobStatusBadge({ ...job, status });
+          return <span className={'status ' + badge.status}>{badge.label}</span>;
+        })()}
           {job.review?.partial === true ? <span className="partial-badge" title="diff ใหญ่เกินที่ส่งให้ผู้รีวิว จึงไม่ merge อัตโนมัติ"><TriangleExclamationPoint size={13} aria-hidden="true" /> รีวิวบางส่วน (diff ถูกตัด)</span> : null}</div>
         <p className="job-meta">
           <span>{projectName}</span><span>{jobTypes[job.type || 'feature']}</span><span>สร้าง {dateTime(job.createdAt)}</span>
@@ -2447,7 +2453,7 @@ function ProjectDetail({ project, info, projectJobs, createJob, removed, select,
       <h3>งานล่าสุด</h3>
       <p className="project-jobs">{latest ? <>
         <button type="button" className="link" onClick={() => select(latest.id)}>{latest.title}</button>
-        <span className={'status ' + latest.status}>{statusLabels[latest.status] || latest.status}</span>
+        <span className={'status ' + getJobStatusBadge(latest).status}>{getJobStatusBadge(latest).label}</span>
         <span>งานทั้งหมด {projectJobs.length} งาน</span>
       </> : 'ยังไม่มีงานในโปรเจกต์นี้'}</p>
     </section>
@@ -2585,7 +2591,7 @@ function ProjectsPage({ projects, jobs, createJob, added, removed, select, updat
                     <strong>{project.name}</strong>
                     <span className="project-row-path" title={project.path}>{pathLabel}</span>
                   </span>
-                  {latest ? <span className={'status ' + latest.status}>{statusLabels[latest.status] || latest.status}</span> : null}
+                  {latest ? <span className={'status ' + getJobStatusBadge(latest).status}>{getJobStatusBadge(latest).label}</span> : null}
                 </button>
               </li>;
             })}

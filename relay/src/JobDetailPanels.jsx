@@ -3,6 +3,8 @@ import {
   Activity, Check, CircleCheck, ClipboardList, Clock, FlaskConical, GitBranch, TriangleAlert, Wrench, X
 } from 'lucide-react';
 
+import { InlineMarkdown, Markdown } from './markdown.js';
+
 // Panels for the job detail page: outcome tiles, the acceptance checklist from the Task Card,
 // the history of review / fix rounds, and a one-line stepper for finished jobs.
 // Everything here works with old jobs (no reviewHistory, diffStat or manualChecks) and new ones.
@@ -314,10 +316,10 @@ export function ReviewHistoryList({ job, renderFinding }) {
             </small> : null}
           </header>
           {entry.userNote ? <p className="review-note"><b>หมายเหตุของคุณ:</b> <span className="preline">{entry.userNote}</span></p> : null}
-          {entry.summary ? <p className="preline review-summary">{entry.summary}</p> : null}
+          {entry.summary ? <Markdown className="review-summary" text={entry.summary} /> : null}
           {findings.length ? <ul className="review-findings">{findings.map((finding, index) => {
             const { owner, text } = findingParts(finding);
-            return <li key={index}>{owner ? <b>{roleLabels[owner] || owner}</b> : null}{owner ? ' · ' : ''}{renderFinding ? renderFinding(text) : text}</li>;
+            return <li key={index}>{owner ? <b>{roleLabels[owner] || owner}</b> : null}{owner ? ' · ' : ''}{renderFinding ? renderFinding(text) : <InlineMarkdown text={text} />}</li>;
           })}</ul> : null}
           {fixedBy.length ? <p className="review-fixed">
             <Wrench size={14} aria-hidden="true" /> แก้โดย {fixedBy.map((item, index) =>
